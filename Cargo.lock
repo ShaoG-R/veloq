@@ -15,6 +15,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "deferred-map"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "150632d91bb8334c0d41f35f5f1749c824f6b9af35fa26a2b123aaf5c5db1b98"
+
+[[package]]
 name = "io-uring"
 version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -32,19 +53,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
+name = "lite-sync"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31a0bd9fd6f507122afeba16f7a873d644effcf1dd65f33ea46e2bf9df013b3b"
+dependencies = [
+ "crossbeam-queue",
+ "smallring",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
-name = "veloq"
+name = "smallring"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "908d0a8ec9c848a35b2343c5b205b936ca1ca7fef15d28a20c14dea4b6da6972"
+
+[[package]]
+name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
  "io-uring",
  "libc",
  "slab",
  "windows-sys",
+]
+
+[[package]]
+name = "veloq-wheel"
+version = "0.1.0"
+dependencies = [
+ "deferred-map",
+ "lite-sync",
 ]
 
 [[package]]
