@@ -4,5 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lite-sync = "0.1.7"
-deferred-map = "0.3.1"
+slotmap = "1.0"

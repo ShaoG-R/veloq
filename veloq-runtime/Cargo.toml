@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 slab = "0.4.11"
+veloq-wheel = { path = "../veloq-wheel" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"

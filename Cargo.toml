@@ -3,3 +3,4 @@ members = [
     "veloq-runtime",
     "veloq-wheel",
 ]
+resolver = "3"
