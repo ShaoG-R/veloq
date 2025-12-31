@@ -3,9 +3,9 @@ mod ops;
 #[cfg(test)]
 mod tests;
 
-use crate::runtime::buffer::{BufferPool, FixedBuf};
-use crate::runtime::driver::op_registry::{OpEntry, OpRegistry};
+// use crate::runtime::buffer::{BufferPool, FixedBuf};
 use crate::runtime::driver::Driver;
+use crate::runtime::driver::op_registry::{OpEntry, OpRegistry};
 use crate::runtime::op::IoResources;
 use ext::Extensions;
 use ops::IocpSubmit;
@@ -53,9 +53,10 @@ impl Ord for TimerEntry {
 pub struct IocpDriver {
     port: HANDLE,
     ops: OpRegistry<Option<Box<OverlappedEntry>>>,
-    buffer_pool: BufferPool,
     extensions: Extensions,
     timers: BinaryHeap<TimerEntry>,
+    registered_files: Vec<Option<HANDLE>>,
+    free_slots: Vec<usize>,
 }
 
 #[repr(C)]
@@ -80,9 +81,10 @@ impl IocpDriver {
         Ok(Self {
             port,
             ops: OpRegistry::with_capacity(entries as usize),
-            buffer_pool: BufferPool::new(),
             extensions,
             timers: BinaryHeap::new(),
+            registered_files: Vec::new(),
+            free_slots: Vec::new(),
         })
     }
 
@@ -284,18 +286,33 @@ impl IocpDriver {
         &mut self,
         files: &[crate::runtime::op::SysRawOp],
     ) -> io::Result<Vec<crate::runtime::op::IoFd>> {
-        Ok(files
-            .iter()
-            .map(|&h| crate::runtime::op::IoFd::Raw(h))
-            .collect())
+        let mut registered = Vec::with_capacity(files.len());
+        for &handle in files {
+            let idx = if let Some(idx) = self.free_slots.pop() {
+                self.registered_files[idx] = Some(handle as HANDLE);
+                idx
+            } else {
+                self.registered_files.push(Some(handle as HANDLE));
+                self.registered_files.len() - 1
+            };
+            registered.push(crate::runtime::op::IoFd::Fixed(idx as u32));
+        }
+        Ok(registered)
     }
 
-    pub fn unregister_files(&mut self, _files: Vec<crate::runtime::op::IoFd>) -> io::Result<()> {
+    pub fn unregister_files(&mut self, files: Vec<crate::runtime::op::IoFd>) -> io::Result<()> {
+        for fd in files {
+            if let crate::runtime::op::IoFd::Fixed(idx) = fd {
+                let idx = idx as usize;
+                if idx < self.registered_files.len() {
+                    if self.registered_files[idx].is_some() {
+                        self.registered_files[idx] = None;
+                        self.free_slots.push(idx);
+                    }
+                }
+            }
+        }
         Ok(())
-    }
-
-    pub fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {
-        self.buffer_pool.alloc()
     }
 }
 
@@ -313,8 +330,14 @@ impl Driver for IocpDriver {
 
         let overlapped_ptr = &mut entry.inner as *mut OVERLAPPED;
 
+        // Pass registered_files to submit
         let (res_err, post_completion) = unsafe {
-            resources.submit(self.port, overlapped_ptr, &self.extensions)
+            resources.submit(
+                self.port,
+                overlapped_ptr,
+                &self.extensions,
+                &self.registered_files,
+            )
         };
 
         if let IoResources::Timeout(op) = &resources {
@@ -368,8 +391,12 @@ impl Driver for IocpDriver {
         if let Some(op) = self.ops.get_mut(user_data) {
             op.cancelled = true;
 
-            // Extract fd from resources
-            let fd = match &op.resources {
+            // Extract fd from resources - this also needs to resolve Fixed fds if we want to cancel!
+            // But CancelIoEx requires the handle.
+            // We need a helper to resolve fd from resources.
+            // Simplified: only try to cancel if we can easily get the handle.
+
+            let handle = match &op.resources {
                 IoResources::ReadFixed(r) => r.fd.raw().map(|h| h as HANDLE),
                 IoResources::WriteFixed(r) => r.fd.raw().map(|h| h as HANDLE),
                 IoResources::Recv(r) => r.fd.raw().map(|h| h as HANDLE),
@@ -381,8 +408,79 @@ impl Driver for IocpDriver {
                 _ => None,
             };
 
+            // If it's Fixed, we need to look it up.
+            let handle = handle.or_else(|| {
+                // If we really need to support cancelling Fixed fds, we need to duplicate the lookup logic here.
+                // For now, let's grab the idx if possible.
+                let idx = match &op.resources {
+                    IoResources::ReadFixed(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    IoResources::WriteFixed(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    IoResources::Recv(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    IoResources::Send(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    IoResources::Accept(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    IoResources::Connect(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    IoResources::SendTo(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    IoResources::RecvFrom(r) => {
+                        if let crate::runtime::op::IoFd::Fixed(i) = r.fd {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(i) = idx {
+                    self.registered_files.get(i as usize).and_then(|x| *x)
+                } else {
+                    None
+                }
+            });
+
             // Call CancelIoEx if we have both fd and overlapped
-            if let (Some(fd), Some(overlapped)) = (fd, &op.platform_data) {
+            if let (Some(fd), Some(overlapped)) = (handle, &op.platform_data) {
                 unsafe {
                     use windows_sys::Win32::System::IO::CancelIoEx;
                     let _ = CancelIoEx(fd, &overlapped.inner as *const _ as *mut _);
@@ -402,8 +500,12 @@ impl Driver for IocpDriver {
         self.unregister_files(files)
     }
 
-    fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {
-        self.buffer_pool.alloc()
+    fn register_buffer_pool(
+        &mut self,
+        _pool: &crate::runtime::buffer::BufferPool,
+    ) -> io::Result<()> {
+        // No-op for Windows currently
+        Ok(())
     }
 }
 

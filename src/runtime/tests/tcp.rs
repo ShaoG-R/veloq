@@ -69,22 +69,22 @@ fn test_tcp_send_recv() {
     exec.block_on(async move {
         // Get driver and allocate buffers inside async context
         let driver_weak = current_driver();
-        let driver_rc = driver_weak.upgrade().unwrap();
+
 
         // Server task
         let server_h = spawn(async move {
-            let driver = current_driver().upgrade().unwrap();
+
             let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
             // Receive data
-            let mut buf = driver.borrow().alloc_fixed_buffer().unwrap();
+            let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
             buf.set_len(buf.capacity());
             let (result, buf) = stream.recv(buf).await;
             let bytes_read = result.expect("Recv failed") as usize;
             println!("Server received {} bytes", bytes_read);
 
             // Echo data back
-            let mut echo_buf = driver.borrow().alloc_fixed_buffer().unwrap();
+            let mut echo_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
             echo_buf.spare_capacity_mut()[..bytes_read]
                 .copy_from_slice(&buf.as_slice()[..bytes_read]);
             echo_buf.set_len(bytes_read);
@@ -100,7 +100,7 @@ fn test_tcp_send_recv() {
             .expect("Failed to connect");
 
         // Prepare data
-        let mut send_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut send_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         let test_data = b"Hello, TCP!";
         send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
         send_buf.set_len(test_data.len());
@@ -111,7 +111,7 @@ fn test_tcp_send_recv() {
         println!("Client sent {} bytes", bytes_sent);
 
         // Receive echo
-        let mut recv_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut recv_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         recv_buf.set_len(recv_buf.capacity());
         let (result, recv_buf) = stream.recv(recv_buf).await;
         let bytes_received = result.expect("Client recv failed") as usize;
@@ -433,8 +433,8 @@ fn test_multithread_tcp_echo() {
         // Accept and echo
         let (stream, _) = Rc::new(listener).accept().await.expect("Accept failed");
 
-        let driver_rc = driver.upgrade().unwrap();
-        let mut buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+
+        let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         buf.set_len(buf.capacity());
 
         let (result, buf) = stream.recv(buf).await;
@@ -442,7 +442,7 @@ fn test_multithread_tcp_echo() {
         println!("Echo server received {} bytes", bytes);
 
         // Echo back
-        let mut echo_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut echo_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         echo_buf.spare_capacity_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
         echo_buf.set_len(bytes);
 
@@ -460,14 +460,14 @@ fn test_multithread_tcp_echo() {
         println!("Client connecting to {}", listen_addr);
 
         let driver = current_driver();
-        let driver_rc = driver.upgrade().unwrap();
+
 
         let stream = TcpStream::connect(listen_addr, driver)
             .await
             .expect("Failed to connect");
 
         // Send data
-        let mut send_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut send_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         let data = b"Hello from worker 2!";
         send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
         send_buf.set_len(data.len());
@@ -477,7 +477,7 @@ fn test_multithread_tcp_echo() {
         println!("Client sent {} bytes", sent);
 
         // Receive echo
-        let mut recv_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut recv_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         recv_buf.set_len(recv_buf.capacity());
         let (result, recv_buf) = stream.recv(recv_buf).await;
         let received = result.expect("Recv failed") as usize;

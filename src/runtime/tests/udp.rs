@@ -104,22 +104,20 @@ fn test_udp_echo() {
     let server_clone = server_rc.clone();
 
     exec.block_on(async move {
-        let driver_weak = current_driver();
-        let driver_inner = driver_weak.upgrade().unwrap();
 
         // Server task: receive and echo back
         let server_h = spawn(async move {
-            let driver = current_driver().upgrade().unwrap();
+
 
             // Receive data
-            let mut buf = driver.borrow().alloc_fixed_buffer().unwrap();
+            let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
             buf.set_len(buf.capacity());
             let (result, buf) = server_clone.recv_from(buf).await;
             let (bytes_read, from_addr) = result.expect("Server recv_from failed");
             println!("Server received {} bytes from {}", bytes_read, from_addr);
 
             // Echo back
-            let mut echo_buf = driver.borrow().alloc_fixed_buffer().unwrap();
+            let mut echo_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
             echo_buf.spare_capacity_mut()[..bytes_read as usize]
                 .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
             echo_buf.set_len(bytes_read as usize);
@@ -130,7 +128,7 @@ fn test_udp_echo() {
         });
 
         // Client: send data to server
-        let mut send_buf = driver_inner.borrow().alloc_fixed_buffer().unwrap();
+        let mut send_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         let test_data = b"Echo this message!";
         send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
         send_buf.set_len(test_data.len());
@@ -140,7 +138,7 @@ fn test_udp_echo() {
         println!("Client sent {} bytes", bytes_sent);
 
         // Receive echo response
-        let mut recv_buf = driver_inner.borrow().alloc_fixed_buffer().unwrap();
+        let mut recv_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         recv_buf.set_len(recv_buf.capacity());
         let (result, recv_buf) = client_rc.recv_from(recv_buf).await;
         let (bytes_received, from_addr) = result.expect("Client recv_from failed");
@@ -316,8 +314,8 @@ fn test_multithread_udp() {
 
             // Receiver task
             let h_recv = spawn(async move {
-                let driver = current_driver().upgrade().unwrap();
-                let mut buf = driver.borrow().alloc_fixed_buffer().unwrap();
+    
+                let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
                 buf.set_len(buf.capacity());
                 let (result, _buf) = socket1_clone.recv_from(buf).await;
                 result.expect("recv_from failed");
@@ -325,8 +323,8 @@ fn test_multithread_udp() {
             });
 
             // Sender
-            let driver_rc = driver.upgrade().unwrap();
-            let mut buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+
+            let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
             let msg = format!("Hello from worker {}", worker_id);
             buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
             buf.set_len(msg.len());
@@ -372,8 +370,7 @@ fn test_multithread_udp_echo() {
         addr_tx.send(server_addr).unwrap();
 
         // Receive and echo
-        let driver_rc = driver.upgrade().unwrap();
-        let mut buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         buf.set_len(buf.capacity());
 
         let (result, buf) = socket.recv_from(buf).await;
@@ -381,7 +378,7 @@ fn test_multithread_udp_echo() {
         println!("Server received {} bytes from {}", bytes, from_addr);
 
         // Echo back
-        let mut echo_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut echo_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         echo_buf.spare_capacity_mut()[..bytes as usize]
             .copy_from_slice(&buf.as_slice()[..bytes as usize]);
         echo_buf.set_len(bytes as usize);
@@ -400,13 +397,12 @@ fn test_multithread_udp_echo() {
         println!("Client connecting to {}", server_addr);
 
         let driver = current_driver();
-        let driver_rc = driver.upgrade().unwrap();
 
         let client =
             UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind client socket");
 
         // Send data
-        let mut send_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut send_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         let data = b"Hello from worker 2!";
         send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
         send_buf.set_len(data.len());
@@ -416,7 +412,7 @@ fn test_multithread_udp_echo() {
         println!("Client sent {} bytes", sent);
 
         // Receive echo
-        let mut recv_buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+        let mut recv_buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
         recv_buf.set_len(recv_buf.capacity());
         let (result, recv_buf) = client.recv_from(recv_buf).await;
         let (received, from) = result.expect("Client recv_from failed");
@@ -457,11 +453,9 @@ fn test_multithread_concurrent_udp_clients() {
             addr_tx.send(server_addr).unwrap();
         }
 
-        let driver_rc = driver.upgrade().unwrap();
-
         // Receive messages from all clients
         for i in 0..NUM_CLIENTS {
-            let mut buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+            let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
             buf.set_len(buf.capacity());
             let (result, _buf) = socket.recv_from(buf).await;
             let (bytes, from) = result.expect("Server recv_from failed");
@@ -487,12 +481,12 @@ fn test_multithread_concurrent_udp_clients() {
             };
 
             let driver = current_driver();
-            let driver_rc = driver.upgrade().unwrap();
+
 
             let client = UdpSocket::bind("127.0.0.1:0", driver.clone())
                 .expect("Failed to bind client socket");
 
-            let mut buf = driver_rc.borrow().alloc_fixed_buffer().unwrap();
+            let mut buf = crate::runtime::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
             let msg = format!("Hello from client {}", client_id);
             buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
             buf.set_len(msg.len());

@@ -16,9 +16,15 @@ pub type SysRawOp = RawHandle;
 use crate::runtime::buffer::FixedBuf;
 
 /// Represents the source of an IO operation: either a raw handle/fd or a registered index.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoFd {
+    /// A raw system handle/fd.
+    /// On Linux: RawFd
+    /// On Windows: HANDLE / SOCKET
     Raw(SysRawOp),
+    /// A registered index.
+    /// On Linux: io_uring fixed file index.
+    /// On Windows: Driver-internal registered handle index.
     Fixed(u32),
 }
 

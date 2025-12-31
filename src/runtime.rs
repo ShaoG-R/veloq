@@ -9,7 +9,7 @@ pub(crate) mod sys;
 pub mod task;
 
 // Re-export key functions for convenient access
-pub use context::{current_driver, spawn, yield_now};
+pub use context::{current_buffer_pool, current_driver, spawn, yield_now};
 pub use executor::LocalExecutor;
 pub use join::JoinHandle;
 

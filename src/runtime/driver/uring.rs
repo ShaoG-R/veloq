@@ -1,4 +1,4 @@
-use crate::runtime::buffer::{BufferPool, FixedBuf};
+// use crate::runtime::buffer::{BufferPool, FixedBuf};
 use crate::runtime::driver::op_registry::{OpEntry, OpRegistry};
 use crate::runtime::op::IoResources;
 use io_uring::{IoUring, opcode, squeue};
@@ -19,8 +19,6 @@ pub struct UringDriver {
     /// Store for in-flight operations.
     /// The key (usize) is used as the io_uring user_data.
     ops: OpRegistry<()>,
-    /// Managed buffer pool
-    buffer_pool: BufferPool,
 }
 
 impl UringDriver {
@@ -39,24 +37,13 @@ impl UringDriver {
                 }
             })?;
 
-        let buffer_pool = BufferPool::new();
-
-        // Register buffers immediately
+        // Operations registry
         let ops = OpRegistry::with_capacity(entries as usize);
 
         let driver = Self {
             ring,
             ops,
-            buffer_pool,
         };
-
-        // We need to register buffers.
-        // Note: Driver::register_buffers requires &mut self, but we are constructing it.
-        // We can do it on the ring directly or helper.
-        // Let's use the helper we have, but we need to structure it so we can access `buffer_pool`
-
-        let iovecs = driver.buffer_pool.get_all_ptrs();
-        unsafe { driver.ring.submitter().register_buffers(&iovecs) }?;
 
         Ok(driver)
     }
@@ -195,9 +182,7 @@ impl UringDriver {
         }
     }
 
-    pub fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {
-        self.buffer_pool.alloc()
-    }
+
 
     pub fn register_files(&mut self, files: &[crate::runtime::op::SysRawOp]) -> io::Result<Vec<crate::runtime::op::IoFd>> {
         // Note: this replaces the entire file table in io_uring currently.
@@ -256,8 +241,9 @@ impl Driver for UringDriver {
         self.cancel_op(user_data);
     }
 
-    fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {
-        self.alloc_fixed_buffer()
+    fn register_buffer_pool(&mut self, pool: &crate::runtime::buffer::BufferPool) -> io::Result<()> {
+        let iovecs = pool.get_all_ptrs();
+        self.register_buffers(iovecs)
     }
 
     fn register_files(&mut self, files: &[crate::runtime::op::SysRawOp]) -> io::Result<Vec<crate::runtime::op::IoFd>> {

@@ -8,9 +8,12 @@ use crate::runtime::driver::{Driver, PlatformDriver};
 use crate::runtime::join::JoinHandle;
 use crate::runtime::task::Task;
 
+use crate::runtime::buffer::BufferPool;
+
 pub struct LocalExecutor {
     driver: Rc<RefCell<PlatformDriver>>,
     queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
+    buffer_pool: Rc<BufferPool>,
 }
 
 impl LocalExecutor {
@@ -20,13 +23,16 @@ impl LocalExecutor {
 
     pub fn new() -> Self {
         // Initialize Driver with 1024 entries
-        // Driver now initializes and registers its own BufferPool
         let driver = Rc::new(RefCell::new(
             PlatformDriver::new(1024).expect("Failed to create driver"),
         ));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let buffer_pool = Rc::new(BufferPool::new());
 
-        Self { driver, queue }
+        // Register buffer pool with driver
+        driver.borrow_mut().register_buffer_pool(&buffer_pool).expect("Failed to register buffer pool");
+
+        Self { driver, queue, buffer_pool }
     }
 
     pub fn spawn<F, T>(&self, future: F) -> JoinHandle<T>
@@ -51,6 +57,7 @@ impl LocalExecutor {
         let _guard = crate::runtime::context::enter(
             Rc::downgrade(&self.driver),
             Rc::downgrade(&self.queue),
+            Rc::downgrade(&self.buffer_pool),
         );
 
         let mut pinned_future = Box::pin(future);

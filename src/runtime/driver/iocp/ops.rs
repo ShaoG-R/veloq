@@ -18,16 +18,23 @@ pub(crate) trait IocpSubmit {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool);
 }
 
-fn resolve_fd(fd: IoFd) -> io::Result<HANDLE> {
+fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::Result<HANDLE> {
     match fd {
         IoFd::Raw(h) => Ok(h as HANDLE),
-        IoFd::Fixed(_) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Fixed file descriptors are not supported on Windows IOCP",
-        )),
+        IoFd::Fixed(idx) => {
+            if let Some(Some(h)) = registered_files.get(idx as usize) {
+                Ok(*h)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invalid registered file descriptor",
+                ))
+            }
+        }
     }
 }
 
@@ -37,12 +44,13 @@ impl IocpSubmit for ReadFixed {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = self.offset as u32;
         entry_ext.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
 
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -76,12 +84,13 @@ impl IocpSubmit for WriteFixed {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = self.offset as u32;
         entry_ext.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
 
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -115,12 +124,13 @@ impl IocpSubmit for Recv {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = 0;
         entry_ext.Anonymous.Anonymous.OffsetHigh = 0;
 
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -154,12 +164,13 @@ impl IocpSubmit for Send {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = 0;
         entry_ext.Anonymous.Anonymous.OffsetHigh = 0;
 
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -193,6 +204,7 @@ impl IocpSubmit for Accept {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
         let accept_socket = self.accept_socket;
 
@@ -209,7 +221,7 @@ impl IocpSubmit for Accept {
             );
         }
 
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -249,8 +261,9 @@ impl IocpSubmit for Connect {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -343,8 +356,9 @@ impl IocpSubmit for SendTo {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -384,8 +398,9 @@ impl IocpSubmit for RecvFrom {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
-        let handle = match resolve_fd(self.fd) {
+        let handle = match resolve_fd(self.fd, registered_files) {
             Ok(h) => h,
             Err(e) => return (Some(e), true),
         };
@@ -425,18 +440,19 @@ impl IocpSubmit for IoResources {
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
         match self {
-            IoResources::ReadFixed(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::WriteFixed(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::Recv(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::Send(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::Accept(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::Connect(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::SendTo(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::RecvFrom(op) => unsafe { op.submit(port, overlapped, ext) },
-            IoResources::None => (None, true), // Treat None as immediate completion or error? Original code did (None, true).
-            IoResources::Timeout(_) => (None, false), // Timeout is handled by driver logic, not submitting to port instantly via this trait
+            IoResources::ReadFixed(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::WriteFixed(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::Recv(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::Send(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::Accept(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::Connect(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::SendTo(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::RecvFrom(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::None => (None, true), 
+            IoResources::Timeout(_) => (None, false),
         }
     }
 }

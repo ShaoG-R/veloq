@@ -108,9 +108,9 @@ fn test_current_driver() {
         let driver = current_driver();
         assert!(driver.upgrade().is_some(), "Driver should be valid");
 
-        // Can allocate a buffer through the driver
-        let driver_rc = driver.upgrade().unwrap();
-        let buf = driver_rc.borrow().alloc_fixed_buffer();
+        // Can allocate a buffer through the pool
+        let pool = crate::runtime::current_buffer_pool();
+        let buf = pool.upgrade().unwrap().alloc();
         assert!(buf.is_some(), "Should be able to allocate buffer");
     });
 }

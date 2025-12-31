@@ -12,6 +12,8 @@ use crate::runtime::driver::PlatformDriver;
 use crate::runtime::join::JoinHandle;
 use crate::runtime::task::Task;
 
+use crate::runtime::buffer::BufferPool;
+
 // Thread-local storage for the current executor context.
 thread_local! {
     static CONTEXT: RefCell<Option<ExecutorContext>> = const { RefCell::new(None) };
@@ -22,6 +24,7 @@ thread_local! {
 struct ExecutorContext {
     driver: Weak<RefCell<PlatformDriver>>,
     queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+    buffer_pool: Weak<BufferPool>,
 }
 
 /// RAII guard that sets the context on creation and clears it on drop.
@@ -41,9 +44,10 @@ impl Drop for ContextGuard {
 pub(crate) fn enter(
     driver: Weak<RefCell<PlatformDriver>>,
     queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+    buffer_pool: Weak<BufferPool>,
 ) -> ContextGuard {
     CONTEXT.with(|ctx| {
-        *ctx.borrow_mut() = Some(ExecutorContext { driver, queue });
+        *ctx.borrow_mut() = Some(ExecutorContext { driver, queue, buffer_pool });
     });
     ContextGuard { _private: () }
 }
@@ -103,6 +107,18 @@ pub fn current_driver() -> Weak<RefCell<PlatformDriver>> {
             .expect("current_driver() called outside of runtime context");
 
         ctx.driver.clone()
+    })
+}
+
+/// Get a weak reference to the current buffer pool.
+pub fn current_buffer_pool() -> Weak<BufferPool> {
+    CONTEXT.with(|ctx| {
+        let ctx = ctx.borrow();
+        let ctx = ctx
+            .as_ref()
+            .expect("current_buffer_pool() called outside of runtime context");
+
+        ctx.buffer_pool.clone()
     })
 }
 

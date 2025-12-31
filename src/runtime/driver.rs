@@ -1,4 +1,4 @@
-use crate::runtime::buffer::FixedBuf;
+// use crate::runtime::buffer::FixedBuf;
 use crate::runtime::op::IoResources;
 
 pub(crate) mod op_registry;
@@ -31,8 +31,9 @@ pub trait Driver {
     /// Cancel an operation.
     fn cancel_op(&mut self, user_data: usize);
 
-    /// Allocate a fixed buffer from the driver's pool.
-    fn alloc_fixed_buffer(&self) -> Option<FixedBuf>;
+    /// Register a buffer pool with the driver.
+    /// This allows the driver to optimize buffer access (e.g. fixed buffers in io_uring).
+    fn register_buffer_pool(&mut self, pool: &crate::runtime::buffer::BufferPool) -> io::Result<()>;
 
     /// Register a set of file descriptors/handles.
     /// Returns a list of `IoFd` that can be used in subsequent operations.
