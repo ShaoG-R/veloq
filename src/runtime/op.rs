@@ -15,6 +15,22 @@ pub type SysRawOp = RawHandle;
 
 use crate::runtime::buffer::FixedBuf;
 
+/// Represents the source of an IO operation: either a raw handle/fd or a registered index.
+#[derive(Debug, Clone, Copy)]
+pub enum IoFd {
+    Raw(SysRawOp),
+    Fixed(u32),
+}
+
+impl IoFd {
+    pub fn raw(&self) -> Option<SysRawOp> {
+        match self {
+            Self::Raw(fd) => Some(*fd),
+            Self::Fixed(_) => None,
+        }
+    }
+}
+
 pub enum IoResources {
     ReadFixed(ReadFixed),
     WriteFixed(WriteFixed),
@@ -136,7 +152,7 @@ impl<T: IoOp + 'static> Drop for Op<T> {
 }
 
 pub struct ReadFixed {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
 }
@@ -155,7 +171,7 @@ impl IoOp for ReadFixed {
 }
 
 pub struct WriteFixed {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
 }
@@ -174,7 +190,7 @@ impl IoOp for WriteFixed {
 }
 
 pub struct Recv {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
 }
 
@@ -192,7 +208,7 @@ impl IoOp for Recv {
 }
 
 pub struct Send {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
 }
 
@@ -229,7 +245,7 @@ impl IoOp for Timeout {
 }
 
 pub struct Accept {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     /// Buffer to hold the address.
     /// On Linux: sockaddr_storage
     /// On Windows: Output buffer for AcceptEx (addresses)
@@ -275,7 +291,7 @@ impl OpLifecycle for Accept {
         let addr_len = Box::new(buf_size as u32);
 
         Self {
-            fd,
+            fd: IoFd::Raw(fd),
             addr: addr_buf,
             addr_len,
             #[cfg(windows)]
@@ -319,7 +335,7 @@ impl IoOp for Accept {
 }
 
 pub struct Connect {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub addr: Box<[u8]>,
     pub addr_len: u32,
 }
@@ -339,7 +355,7 @@ impl IoOp for Connect {
 
 #[cfg(target_os = "linux")]
 pub struct SendTo {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub addr: Box<[u8]>,
     pub addr_len: u32,
@@ -349,7 +365,7 @@ pub struct SendTo {
 
 #[cfg(target_os = "windows")]
 pub struct SendTo {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub addr: Box<[u8]>,
     pub addr_len: u32,
@@ -378,7 +394,7 @@ impl SendTo {
             msghdr.msg_iovlen = 1;
 
             Self {
-                fd,
+                fd: IoFd::Raw(fd),
                 buf,
                 addr,
                 addr_len,
@@ -395,7 +411,7 @@ impl SendTo {
                 buf: buf.as_slice().as_ptr() as *mut u8,
             });
             Self {
-                fd,
+                fd: IoFd::Raw(fd),
                 buf,
                 addr,
                 addr_len,
@@ -420,7 +436,7 @@ impl IoOp for SendTo {
 
 #[cfg(target_os = "linux")]
 pub struct RecvFrom {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub addr: Box<[u8]>,
     pub addr_len: Box<u32>,
@@ -430,7 +446,7 @@ pub struct RecvFrom {
 
 #[cfg(target_os = "windows")]
 pub struct RecvFrom {
-    pub fd: SysRawOp,
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub addr: Box<[u8]>,
     /// WSARecvFrom uses i32 for address length (in/out parameter)
@@ -466,7 +482,7 @@ impl RecvFrom {
             msghdr.msg_iovlen = 1;
 
             Self {
-                fd,
+                fd: IoFd::Raw(fd),
                 buf,
                 addr,
                 addr_len,
@@ -485,7 +501,7 @@ impl RecvFrom {
             });
             let flags = Box::new(0u32);
             Self {
-                fd,
+                fd: IoFd::Raw(fd),
                 buf,
                 addr,
                 addr_len,

@@ -38,7 +38,20 @@ struct OperationLifecycle {
 
 impl UringDriver {
     pub fn new(entries: u32) -> io::Result<Self> {
-        let ring = IoUring::new(entries)?;
+        let ring = IoUring::builder()
+            .setup_coop_taskrun() // Reduce IPIs
+            .setup_single_issuer() // Optimized for single-threaded submission
+            .setup_defer_taskrun() // Defer work until enter
+            .build(entries)
+            .or_else(|e| {
+                // Fallback for older kernels if flags are unsupported (EINVAL)
+                if e.raw_os_error() == Some(libc::EINVAL) {
+                    IoUring::new(entries)
+                } else {
+                    Err(e)
+                }
+            })?;
+
         let buffer_pool = BufferPool::new();
 
         // Register buffers immediately
@@ -68,13 +81,17 @@ impl UringDriver {
 
     /// Wait for completions.
     pub fn wait(&mut self) -> io::Result<()> {
-        // If we have no ops, we shouldn't block indefinitely in a real app if we have other things (timers).
-        // But for now, let's wait for at least one event if we have ops in flight.
-        // Or blindly enter.
-        // Phase 1 had a dummy waker; now we can block properly.
         if self.ops.is_empty() {
             return Ok(());
         }
+
+        // Optimization: check if we have completions available in userspace queue
+        // before issuing a syscall to wait.
+        if !self.ring.completion().is_empty() {
+            self.process_completions();
+            return Ok(());
+        }
+
         self.ring.submit_and_wait(1)?;
         self.process_completions();
         Ok(())
@@ -217,6 +234,27 @@ impl UringDriver {
     pub fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {
         self.buffer_pool.alloc()
     }
+
+    pub fn register_files(&mut self, files: &[crate::runtime::op::SysRawOp]) -> io::Result<Vec<crate::runtime::op::IoFd>> {
+        // Note: this replaces the entire file table in io_uring currently.
+        // A more advanced implementation would use IORING_REGISTER_FILES_UPDATE
+        // to incrementally add files, or manage a sparse table.
+        // For now, we assume this is called once or manages the full set.
+        self.ring.submitter().register_files(files)?;
+        
+        let mut fixed_fds = Vec::with_capacity(files.len());
+        for i in 0..files.len() {
+            fixed_fds.push(crate::runtime::op::IoFd::Fixed(i as u32));
+        }
+        Ok(fixed_fds)
+    }
+
+    pub fn unregister_files(&mut self, _files: Vec<crate::runtime::op::IoFd>) -> io::Result<()> {
+        // specific file unregistration not strictly supported by raw unregister_files (which kills all)
+        // unless we use update with -1.
+        // For now, unregister all.
+        self.ring.submitter().unregister_files()
+    }
 }
 
 use crate::runtime::driver::Driver;
@@ -256,5 +294,13 @@ impl Driver for UringDriver {
 
     fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {
         self.alloc_fixed_buffer()
+    }
+
+    fn register_files(&mut self, files: &[crate::runtime::op::SysRawOp]) -> io::Result<Vec<crate::runtime::op::IoFd>> {
+        self.register_files(files)
+    }
+
+    fn unregister_files(&mut self, files: Vec<crate::runtime::op::IoFd>) -> io::Result<()> {
+        self.unregister_files(files)
     }
 }

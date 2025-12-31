@@ -1,6 +1,6 @@
 use crate::runtime::buffer::FixedBuf;
 use crate::runtime::driver::PlatformDriver;
-use crate::runtime::op::{Accept, Connect, Op, Recv, Send, SysRawOp};
+use crate::runtime::op::{Accept, Connect, IoFd, Op, Recv, Send, SysRawOp};
 use crate::runtime::sys::socket::Socket;
 use std::cell::RefCell;
 use std::io;
@@ -64,6 +64,7 @@ impl TcpListener {
         let pre_alloc = Accept::pre_alloc(self.fd)?;
 
         // 2. Create the Op
+        // Use IoFd::Raw
         let op = Accept::into_op(self.fd, pre_alloc);
 
         // 3. Submit and Await
@@ -104,7 +105,7 @@ impl TcpStream {
 
         let (raw_addr, raw_addr_len) = crate::runtime::sys::socket::socket_addr_trans(addr);
         let op = Connect {
-            fd,
+            fd: IoFd::Raw(fd),
             addr: raw_addr.into_boxed_slice(),
             addr_len: raw_addr_len as u32,
         };
@@ -117,14 +118,20 @@ impl TcpStream {
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<u32>, FixedBuf) {
-        let op = Recv { fd: self.fd, buf };
+        let op = Recv {
+            fd: IoFd::Raw(self.fd),
+            buf,
+        };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<u32>, FixedBuf) {
-        let op = Send { fd: self.fd, buf };
+        let op = Send {
+            fd: IoFd::Raw(self.fd),
+            buf,
+        };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;
         (res, op_back.buf)

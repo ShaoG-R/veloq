@@ -1,4 +1,6 @@
-use crate::runtime::op::{Accept, Connect, ReadFixed, Recv, RecvFrom, Send, SendTo, WriteFixed};
+use crate::runtime::op::{
+    Accept, Connect, IoFd, ReadFixed, Recv, RecvFrom, Send, SendTo, WriteFixed,
+};
 use std::io;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
@@ -10,6 +12,16 @@ use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
 
 use super::ext::Extensions;
 
+fn resolve_fd(fd: IoFd) -> io::Result<HANDLE> {
+    match fd {
+        IoFd::Raw(h) => Ok(h as HANDLE),
+        IoFd::Fixed(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Fixed file descriptors are not supported on Windows IOCP",
+        )),
+    }
+}
+
 pub(crate) unsafe fn submit_read(
     op: &mut ReadFixed,
     port: HANDLE,
@@ -19,12 +31,17 @@ pub(crate) unsafe fn submit_read(
     entry_ext.Anonymous.Anonymous.Offset = op.offset as u32;
     entry_ext.Anonymous.Anonymous.OffsetHigh = (op.offset >> 32) as u32;
 
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
     let mut bytes_read = 0;
     let ret = unsafe {
         ReadFile(
-            op.fd as HANDLE,
+            handle,
             op.buf.as_mut_ptr() as *mut _,
             op.buf.capacity() as u32,
             &mut bytes_read,
@@ -50,12 +67,17 @@ pub(crate) unsafe fn submit_write(
     entry_ext.Anonymous.Anonymous.Offset = op.offset as u32;
     entry_ext.Anonymous.Anonymous.OffsetHigh = (op.offset >> 32) as u32;
 
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
     let mut bytes_written = 0;
     let ret = unsafe {
         WriteFile(
-            op.fd as HANDLE,
+            handle,
             op.buf.as_slice().as_ptr() as *const _,
             op.buf.len() as u32,
             &mut bytes_written,
@@ -81,12 +103,17 @@ pub(crate) unsafe fn submit_recv(
     entry_ext.Anonymous.Anonymous.Offset = 0;
     entry_ext.Anonymous.Anonymous.OffsetHigh = 0;
 
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
     let mut bytes_read = 0;
     let ret = unsafe {
         ReadFile(
-            op.fd as HANDLE,
+            handle,
             op.buf.as_mut_ptr() as *mut _,
             op.buf.capacity() as u32,
             &mut bytes_read,
@@ -112,12 +139,17 @@ pub(crate) unsafe fn submit_send(
     entry_ext.Anonymous.Anonymous.Offset = 0;
     entry_ext.Anonymous.Anonymous.OffsetHigh = 0;
 
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
     let mut bytes_written = 0;
     let ret = unsafe {
         WriteFile(
-            op.fd as HANDLE,
+            handle,
             op.buf.as_slice().as_ptr() as *const _,
             op.buf.len() as u32,
             &mut bytes_written,
@@ -155,7 +187,12 @@ pub(crate) unsafe fn submit_accept(
         );
     }
 
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
     unsafe { CreateIoCompletionPort(accept_socket as HANDLE, port, 0, 0) };
 
     let split = MIN_ADDR_LEN;
@@ -163,7 +200,7 @@ pub(crate) unsafe fn submit_accept(
 
     let ret = unsafe {
         (ext.accept_ex)(
-            op.fd as SOCKET,
+            handle as SOCKET,
             accept_socket as SOCKET,
             op.addr.as_mut_ptr() as *mut _,
             0,            // dwReceiveDataLength
@@ -189,7 +226,12 @@ pub(crate) unsafe fn submit_connect(
     overlapped: *mut OVERLAPPED,
     ext: &Extensions,
 ) -> (Option<io::Error>, bool) {
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
     // ConnectEx requires the socket to be bound.
     // We check if it is already bound using getsockname.
@@ -199,7 +241,7 @@ pub(crate) unsafe fn submit_connect(
 
     if unsafe {
         getsockname(
-            op.fd as SOCKET,
+            handle as SOCKET,
             &mut name as *mut _ as *mut SOCKADDR,
             &mut namelen,
         )
@@ -248,13 +290,13 @@ pub(crate) unsafe fn submit_connect(
             )
         };
 
-        let _ = unsafe { bind(op.fd as SOCKET, ptr, len) };
+        let _ = unsafe { bind(handle as SOCKET, ptr, len) };
     }
 
     let mut bytes_sent = 0;
     let ret = unsafe {
         (ext.connect_ex)(
-            op.fd as SOCKET,
+            handle as SOCKET,
             op.addr.as_ptr() as *const SOCKADDR,
             op.addr_len as i32,
             std::ptr::null(), // Send buffer
@@ -286,7 +328,11 @@ pub(crate) unsafe fn submit_send_to(
     overlapped: *mut OVERLAPPED,
 ) -> (Option<io::Error>, bool) {
     // Associate socket with IOCP
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
     // Update WSABUF to point to current buffer data
     // This is safe because both wsabuf and buf are owned by op
@@ -296,7 +342,7 @@ pub(crate) unsafe fn submit_send_to(
     let mut bytes_sent = 0u32;
     let ret = unsafe {
         WSASendTo(
-            op.fd as SOCKET,
+            handle as SOCKET,
             op.wsabuf.as_ref(),
             1, // dwBufferCount
             &mut bytes_sent,
@@ -331,7 +377,12 @@ pub(crate) unsafe fn submit_recv_from(
     overlapped: *mut OVERLAPPED,
 ) -> (Option<io::Error>, bool) {
     // Associate socket with IOCP
-    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+    // Associate socket with IOCP
+    let handle = match resolve_fd(op.fd) {
+        Ok(h) => h,
+        Err(e) => return (Some(e), true),
+    };
+    unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
     // Update WSABUF to point to current buffer data
     op.wsabuf.len = op.buf.capacity() as u32;
@@ -340,7 +391,7 @@ pub(crate) unsafe fn submit_recv_from(
     let mut bytes_received = 0u32;
     let ret = unsafe {
         WSARecvFrom(
-            op.fd as SOCKET,
+            handle as SOCKET,
             op.wsabuf.as_ref(),
             1, // dwBufferCount
             &mut bytes_received,

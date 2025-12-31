@@ -188,90 +188,112 @@ impl IocpDriver {
                     match &mut op.resources {
                         IoResources::Accept(accept_op) => {
                             // Update Accept Context
-                            let accept_socket = accept_op.accept_socket;
-                            let listen_socket = accept_op.fd as SOCKET;
-                            // The value passed to setsockopt for SO_UPDATE_ACCEPT_CONTEXT is the listening socket handle
-                            let ret = unsafe {
-                                setsockopt(
-                                    accept_socket as SOCKET,
-                                    SOL_SOCKET,
-                                    SO_UPDATE_ACCEPT_CONTEXT,
-                                    &listen_socket as *const _ as *const _,
-                                    std::mem::size_of_val(&listen_socket) as i32,
-                                )
-                            };
-                            if ret != 0 {
-                                op.result = Some(Err(io::Error::last_os_error()));
-                            } else {
-                                // Parse addresses and backfill
-                                // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
-                                // LocalAddr/RemoteAddr max safe size is SOCKADDR_STORAGE (128).
-                                // So we need 128 + 16 = 144 bytes per address.
-                                const MIN_ADDR_LEN: usize =
-                                    std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-                                let split = MIN_ADDR_LEN;
+                            // We need access to the handle here.
+                            // op.fd is likely Raw, so we can extract it.
+                            if let Some(fd) = accept_op.fd.raw() {
+                                let accept_socket = accept_op.accept_socket;
+                                let listen_socket = fd as SOCKET;
+                                // The value passed to setsockopt for SO_UPDATE_ACCEPT_CONTEXT is the listening socket handle
+                                let ret = unsafe {
+                                    setsockopt(
+                                        accept_socket as SOCKET,
+                                        SOL_SOCKET,
+                                        SO_UPDATE_ACCEPT_CONTEXT,
+                                        &listen_socket as *const _ as *const _,
+                                        std::mem::size_of_val(&listen_socket) as i32,
+                                    )
+                                };
+                                if ret != 0 {
+                                    op.result = Some(Err(io::Error::last_os_error()));
+                                } else {
+                                    // Parse addresses and backfill
+                                    // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
+                                    // LocalAddr/RemoteAddr max safe size is SOCKADDR_STORAGE (128).
+                                    // So we need 128 + 16 = 144 bytes per address.
+                                    const MIN_ADDR_LEN: usize =
+                                        std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
+                                    let split = MIN_ADDR_LEN;
 
-                                let mut local_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
-                                let mut remote_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
-                                let mut local_len: i32 = 0;
-                                let mut remote_len: i32 = 0;
+                                    let mut local_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
+                                    let mut remote_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
+                                    let mut local_len: i32 = 0;
+                                    let mut remote_len: i32 = 0;
 
-                                unsafe {
-                                    (self.extensions.get_accept_ex_sockaddrs)(
-                                        accept_op.addr.as_ptr() as *const _,
-                                        0, // received data length (we didn't ask for data)
-                                        split as u32,
-                                        split as u32,
-                                        &mut local_sockaddr,
-                                        &mut local_len,
-                                        &mut remote_sockaddr,
-                                        &mut remote_len,
-                                    );
-                                }
-
-                                if !remote_sockaddr.is_null() && remote_len > 0 {
                                     unsafe {
-                                        let family = (*remote_sockaddr).sa_family;
-                                        if family == AF_INET as u16 {
-                                            let addr_in = &*(remote_sockaddr as *const SOCKADDR_IN);
-                                            let ip = std::net::Ipv4Addr::from(
-                                                addr_in.sin_addr.S_un.S_addr.to_ne_bytes(),
-                                            );
-                                            let port = u16::from_be(addr_in.sin_port);
-                                            accept_op.remote_addr = Some(std::net::SocketAddr::V4(
-                                                std::net::SocketAddrV4::new(ip, port),
-                                            ));
-                                        } else if family == AF_INET6 as u16 {
-                                            let addr_in6 =
-                                                &*(remote_sockaddr as *const SOCKADDR_IN6);
-                                            let ip =
-                                                std::net::Ipv6Addr::from(addr_in6.sin6_addr.u.Byte);
-                                            let port = u16::from_be(addr_in6.sin6_port);
-                                            let flowinfo = addr_in6.sin6_flowinfo;
-                                            let scope_id = addr_in6.Anonymous.sin6_scope_id;
-                                            accept_op.remote_addr = Some(std::net::SocketAddr::V6(
-                                                std::net::SocketAddrV6::new(
-                                                    ip, port, flowinfo, scope_id,
-                                                ),
-                                            ));
+                                        (self.extensions.get_accept_ex_sockaddrs)(
+                                            accept_op.addr.as_ptr() as *const _,
+                                            0, // received data length (we didn't ask for data)
+                                            split as u32,
+                                            split as u32,
+                                            &mut local_sockaddr,
+                                            &mut local_len,
+                                            &mut remote_sockaddr,
+                                            &mut remote_len,
+                                        );
+                                    }
+
+                                    if !remote_sockaddr.is_null() && remote_len > 0 {
+                                        unsafe {
+                                            let family = (*remote_sockaddr).sa_family;
+                                            if family == AF_INET as u16 {
+                                                let addr_in =
+                                                    &*(remote_sockaddr as *const SOCKADDR_IN);
+                                                let ip = std::net::Ipv4Addr::from(
+                                                    addr_in.sin_addr.S_un.S_addr.to_ne_bytes(),
+                                                );
+                                                let port = u16::from_be(addr_in.sin_port);
+                                                accept_op.remote_addr =
+                                                    Some(std::net::SocketAddr::V4(
+                                                        std::net::SocketAddrV4::new(ip, port),
+                                                    ));
+                                            } else if family == AF_INET6 as u16 {
+                                                let addr_in6 =
+                                                    &*(remote_sockaddr as *const SOCKADDR_IN6);
+                                                let ip = std::net::Ipv6Addr::from(
+                                                    addr_in6.sin6_addr.u.Byte,
+                                                );
+                                                let port = u16::from_be(addr_in6.sin6_port);
+                                                let flowinfo = addr_in6.sin6_flowinfo;
+                                                let scope_id = addr_in6.Anonymous.sin6_scope_id;
+                                                accept_op.remote_addr =
+                                                    Some(std::net::SocketAddr::V6(
+                                                        std::net::SocketAddrV6::new(
+                                                            ip, port, flowinfo, scope_id,
+                                                        ),
+                                                    ));
+                                            }
                                         }
                                     }
                                 }
+                            } else {
+                                // Should not happen if we passed validation
+                                op.result = Some(Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    "Invalid listen socket fd",
+                                )));
                             }
                         }
                         IoResources::Connect(connect_op) => {
                             // Update Connect Context
-                            let ret = unsafe {
-                                setsockopt(
-                                    connect_op.fd as SOCKET,
-                                    SOL_SOCKET,
-                                    SO_UPDATE_CONNECT_CONTEXT,
-                                    std::ptr::null(),
-                                    0,
-                                )
-                            };
-                            if ret != 0 {
-                                op.result = Some(Err(io::Error::last_os_error()));
+                            // Update Connect Context
+                            if let Some(fd) = connect_op.fd.raw() {
+                                let ret = unsafe {
+                                    setsockopt(
+                                        fd as SOCKET,
+                                        SOL_SOCKET,
+                                        SO_UPDATE_CONNECT_CONTEXT,
+                                        std::ptr::null(),
+                                        0,
+                                    )
+                                };
+                                if ret != 0 {
+                                    op.result = Some(Err(io::Error::last_os_error()));
+                                }
+                            } else {
+                                op.result = Some(Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    "Invalid socket fd",
+                                )));
                             }
                         }
                         _ => {}
@@ -288,6 +310,23 @@ impl IocpDriver {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn register_files(
+        &mut self,
+        files: &[crate::runtime::op::SysRawOp],
+    ) -> io::Result<Vec<crate::runtime::op::IoFd>> {
+        // Windows IOCP doesn't require pre-registration.
+        // We simply return the handles wrapped in IoFd::Raw.
+        Ok(files
+            .iter()
+            .map(|&h| crate::runtime::op::IoFd::Raw(h))
+            .collect())
+    }
+
+    pub fn unregister_files(&mut self, _files: Vec<crate::runtime::op::IoFd>) -> io::Result<()> {
+        // No-op on Windows
         Ok(())
     }
 
@@ -407,15 +446,16 @@ impl Driver for IocpDriver {
             op.cancelled = true;
 
             // Extract fd from resources
+            // Extract fd from resources
             let fd = match &op.resources {
-                IoResources::ReadFixed(r) => Some(r.fd as HANDLE),
-                IoResources::WriteFixed(r) => Some(r.fd as HANDLE),
-                IoResources::Recv(r) => Some(r.fd as HANDLE),
-                IoResources::Send(r) => Some(r.fd as HANDLE),
-                IoResources::Accept(r) => Some(r.fd as HANDLE),
-                IoResources::Connect(r) => Some(r.fd as HANDLE),
-                IoResources::SendTo(r) => Some(r.fd as HANDLE),
-                IoResources::RecvFrom(r) => Some(r.fd as HANDLE),
+                IoResources::ReadFixed(r) => r.fd.raw().map(|h| h as HANDLE),
+                IoResources::WriteFixed(r) => r.fd.raw().map(|h| h as HANDLE),
+                IoResources::Recv(r) => r.fd.raw().map(|h| h as HANDLE),
+                IoResources::Send(r) => r.fd.raw().map(|h| h as HANDLE),
+                IoResources::Accept(r) => r.fd.raw().map(|h| h as HANDLE),
+                IoResources::Connect(r) => r.fd.raw().map(|h| h as HANDLE),
+                IoResources::SendTo(r) => r.fd.raw().map(|h| h as HANDLE),
+                IoResources::RecvFrom(r) => r.fd.raw().map(|h| h as HANDLE),
                 _ => None,
             };
 
@@ -431,6 +471,17 @@ impl Driver for IocpDriver {
                 }
             }
         }
+    }
+
+    fn register_files(
+        &mut self,
+        files: &[crate::runtime::op::SysRawOp],
+    ) -> io::Result<Vec<crate::runtime::op::IoFd>> {
+        self.register_files(files)
+    }
+
+    fn unregister_files(&mut self, files: Vec<crate::runtime::op::IoFd>) -> io::Result<()> {
+        self.unregister_files(files)
     }
 
     fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {

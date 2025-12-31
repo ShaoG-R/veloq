@@ -43,8 +43,8 @@ fn test_iocp_accept() {
     let acceptor_handle = acceptor.into_raw();
 
     // Prepare Accept Op
-    // Accept::into_op expects pre-alloc (accept_socket)
-    let accept_op = Accept::into_op(listener_handle, acceptor_handle as usize as _);
+    // Accept::into_op expects pre-alloc (accept_socket) which is SysRawOp (*mut c_void)
+    let accept_op = Accept::into_op(listener_handle as _, acceptor_handle as usize as _);
     let resources = IoResources::Accept(accept_op);
     let user_data = driver.reserve_op();
     driver.submit_op_resources(user_data, resources);
@@ -74,7 +74,9 @@ fn test_iocp_accept() {
                     IoResources::Accept(op) => {
                         assert!(op.remote_addr.is_some(), "Remote addr should be populated");
                         unsafe {
-                            windows_sys::Win32::Foundation::CloseHandle(op.fd as _);
+                            if let Some(fd) = op.fd.raw() {
+                                windows_sys::Win32::Foundation::CloseHandle(fd as _);
+                            }
                             windows_sys::Win32::Foundation::CloseHandle(op.accept_socket as _);
                         }
                         break;
@@ -106,7 +108,7 @@ fn test_iocp_connect() {
     let (addr_buf, addr_len) = socket_addr_trans(addr);
 
     let connect_op = Connect {
-        fd: client_handle,
+        fd: crate::runtime::op::IoFd::Raw(client_handle),
         addr: addr_buf.into_boxed_slice(),
         addr_len: addr_len as u32,
     };

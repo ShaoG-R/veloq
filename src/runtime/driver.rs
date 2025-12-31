@@ -31,6 +31,13 @@ pub trait Driver {
 
     /// Allocate a fixed buffer from the driver's pool.
     fn alloc_fixed_buffer(&self) -> Option<FixedBuf>;
+
+    /// Register a set of file descriptors/handles.
+    /// Returns a list of `IoFd` that can be used in subsequent operations.
+    fn register_files(&mut self, files: &[crate::runtime::op::SysRawOp]) -> io::Result<Vec<crate::runtime::op::IoFd>>;
+
+    /// Unregister a set of file descriptors/handles.
+    fn unregister_files(&mut self, files: Vec<crate::runtime::op::IoFd>) -> io::Result<()>;
 }
 
 // Platform-specific driver implementations
