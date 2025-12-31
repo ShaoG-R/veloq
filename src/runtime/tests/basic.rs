@@ -1,7 +1,6 @@
 //! Basic runtime tests for executor, context, and spawn functionality.
 
 use crate::runtime::buffer::BufferPool;
-use crate::runtime::driver::Driver;
 use crate::runtime::executor::{LocalExecutor, Runtime};
 use crate::runtime::op::{IoOp, IoResources, Op};
 use crate::runtime::{current_driver, spawn, yield_now};

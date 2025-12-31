@@ -1,6 +1,6 @@
 use crate::runtime::buffer::{BufferPool, FixedBuf};
 use crate::runtime::op::IoResources;
-use io_uring::{IoUring, squeue};
+use io_uring::{IoUring, opcode, squeue};
 use slab::Slab;
 use std::io;
 use std::task::{Context, Poll, Waker};
@@ -8,6 +8,11 @@ use std::task::{Context, Poll, Waker};
 
 mod ops;
 use ops::UringOp;
+
+/// Special user_data value for cancel operations.
+/// We use u64::MAX - 1 because u64::MAX is already reserved.
+/// CQEs with this user_data are ignored (they're just confirmations that cancel was submitted).
+const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 
 pub struct UringDriver {
     /// The actual io_uring instance
@@ -83,8 +88,10 @@ impl UringDriver {
         for cqe in cqe_kicker {
             let user_data = cqe.user_data() as usize;
 
-            if user_data == u64::MAX as usize {
-                // Special value?
+            // Skip special user_data values:
+            // - u64::MAX: reserved/special
+            // - CANCEL_USER_DATA: completion of our cancel requests (we don't need to handle these)
+            if user_data == u64::MAX as usize || user_data == CANCEL_USER_DATA as usize {
                 continue;
             }
 
@@ -195,8 +202,15 @@ impl UringDriver {
             op.cancelled = true;
             op.waker = None;
 
-            // Optionally: submit a cancel SQE to kernel to speed things up.
-            // For now, let's just detach.
+            // Submit a cancel SQE to kernel to speed up cancellation.
+            // This tells the kernel to try to cancel the operation identified by user_data.
+            // Note: Cancellation is best-effort; the operation might complete before
+            // the cancel request is processed. Either way, we'll get a CQE for the
+            // original operation (possibly with -ECANCELED) and can clean up then.
+            let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
+                .build()
+                .user_data(CANCEL_USER_DATA);
+            self.push_entry(cancel_sqe);
         }
     }
 

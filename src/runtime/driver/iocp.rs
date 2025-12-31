@@ -290,6 +290,10 @@ impl IocpDriver {
 
         Ok(())
     }
+
+    pub fn alloc_fixed_buffer(&self) -> Option<FixedBuf> {
+        self.buffer_pool.alloc()
+    }
 }
 
 impl Driver for IocpDriver {

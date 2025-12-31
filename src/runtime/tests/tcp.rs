@@ -1,7 +1,6 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
 use crate::runtime::buffer::{BufferPool, FixedBuf};
-use crate::runtime::driver::Driver;
 use crate::runtime::executor::{LocalExecutor, Runtime};
 use crate::runtime::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::{current_driver, spawn};
