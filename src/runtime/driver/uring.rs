@@ -1,10 +1,9 @@
 use crate::runtime::buffer::{BufferPool, FixedBuf};
+use crate::runtime::driver::op_registry::{OpEntry, OpRegistry};
 use crate::runtime::op::IoResources;
 use io_uring::{IoUring, opcode, squeue};
-use slab::Slab;
 use std::io;
-use std::task::{Context, Poll, Waker};
-
+use std::task::{Context, Poll};
 
 mod ops;
 use ops::UringOp;
@@ -19,21 +18,9 @@ pub struct UringDriver {
     ring: IoUring,
     /// Store for in-flight operations.
     /// The key (usize) is used as the io_uring user_data.
-    ops: Slab<OperationLifecycle>,
+    ops: OpRegistry<()>,
     /// Managed buffer pool
     buffer_pool: BufferPool,
-}
-
-struct OperationLifecycle {
-    waker: Option<Waker>,
-    /// If the operation completes but the future hasn't polled it yet.
-    result: Option<io::Result<u32>>,
-    /// Resources held by the kernel (e.g., buffers).
-    /// Kept here to ensure they live as long as the kernel needs them.
-    /// When the operation completes, these are returned to the user or dropped.
-    resources: IoResources,
-    /// If true, the Future has been dropped, so we should discard resources upon completion.
-    cancelled: bool,
 }
 
 impl UringDriver {
@@ -55,7 +42,7 @@ impl UringDriver {
         let buffer_pool = BufferPool::new();
 
         // Register buffers immediately
-        let ops = Slab::with_capacity(entries as usize);
+        let ops = OpRegistry::with_capacity(entries as usize);
 
         let driver = Self {
             ring,
@@ -140,12 +127,7 @@ impl UringDriver {
     /// `resources` are the moved-in buffers/fds that must live until completion.
     /// Reserve a slot for an operation.
     pub fn reserve_op_internal(&mut self) -> usize {
-        self.ops.insert(OperationLifecycle {
-            waker: None,
-            result: None,
-            resources: IoResources::None, // Default to None
-            cancelled: false,
-        })
+        self.ops.insert(OpEntry::new(IoResources::None, ()))
     }
 
     /// Store resources for a reserved operation.
@@ -190,25 +172,7 @@ impl UringDriver {
         user_data: usize,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<(io::Result<u32>, IoResources)> {
-        if let Some(op) = self.ops.get_mut(user_data) {
-            if let Some(res) = op.result.take() {
-                // Operation complete.
-                // We remove it from Slab and take resources
-                let op_lifecycle = self.ops.remove(user_data);
-                // Return resources
-                Poll::Ready((res, op_lifecycle.resources))
-            } else {
-                // Still pending. Update waker.
-                op.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        } else {
-            // Should not happen unless logic error
-            Poll::Ready((
-                Err(io::Error::new(io::ErrorKind::Other, "Op not found")),
-                IoResources::None,
-            ))
-        }
+        self.ops.poll_op(user_data, cx)
     }
 
     /// Called when the Future is dropped.

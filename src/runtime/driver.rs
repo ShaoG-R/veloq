@@ -1,5 +1,7 @@
 use crate::runtime::buffer::FixedBuf;
 use crate::runtime::op::IoResources;
+
+pub(crate) mod op_registry;
 use std::io;
 use std::task::{Context, Poll};
 

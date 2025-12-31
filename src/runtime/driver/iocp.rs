@@ -4,14 +4,15 @@ mod ops;
 mod tests;
 
 use crate::runtime::buffer::{BufferPool, FixedBuf};
+use crate::runtime::driver::op_registry::{OpEntry, OpRegistry};
 use crate::runtime::driver::Driver;
 use crate::runtime::op::IoResources;
 use ext::Extensions;
-use slab::Slab;
+use ops::IocpSubmit;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{
     ERROR_HANDLE_EOF, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
@@ -51,34 +52,21 @@ impl Ord for TimerEntry {
 
 pub struct IocpDriver {
     port: HANDLE,
-    ops: Slab<OperationLifecycle>,
+    ops: OpRegistry<Option<Box<OverlappedEntry>>>,
     buffer_pool: BufferPool,
     extensions: Extensions,
     timers: BinaryHeap<TimerEntry>,
 }
 
 #[repr(C)]
-struct OverlappedEntry {
+pub struct OverlappedEntry {
     inner: OVERLAPPED,
     user_data: usize,
-}
-
-struct OperationLifecycle {
-    waker: Option<Waker>,
-    result: Option<io::Result<u32>>,
-    resources: IoResources,
-    #[allow(dead_code)] // Kept alive by this box
-    overlapped: Option<Box<OverlappedEntry>>,
-    cancelled: bool,
 }
 
 impl IocpDriver {
     pub fn new(entries: u32) -> io::Result<Self> {
         // Create a new completion port.
-        // FileHandle = INVALID_HANDLE_VALUE
-        // ExistingCompletionPort = NULL
-        // CompletionKey = 0 (ignored)
-        // NumberOfConcurrentThreads = 0 (default to num processors)
         let port =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
 
@@ -91,7 +79,7 @@ impl IocpDriver {
 
         Ok(Self {
             port,
-            ops: Slab::with_capacity(entries as usize),
+            ops: OpRegistry::with_capacity(entries as usize),
             buffer_pool: BufferPool::new(),
             extensions,
             timers: BinaryHeap::new(),
@@ -116,8 +104,6 @@ impl IocpDriver {
             wait_ms = std::cmp::min(wait_ms, delay);
         }
 
-        // Single event retrieval for now.
-        // In a real high-perf driver, we would use GetQueuedCompletionStatusEx to get multiple.
         let res = unsafe {
             GetQueuedCompletionStatus(
                 self.port,
@@ -147,8 +133,6 @@ impl IocpDriver {
         }
 
         if overlapped.is_null() {
-            // If overlapped is null, the failure is related to dequeuing itself (e.g. timeout)
-            // or the port itself.
             if res == 0 {
                 let err = unsafe { GetLastError() };
                 if err == WAIT_TIMEOUT {
@@ -156,21 +140,15 @@ impl IocpDriver {
                 }
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
-            // If res != 0 but overlapped is null, it's a successful dequeue of something custom?
-            // Or maybe a "notification" (PostQueuedCompletionStatus).
-            // We assume we only use it for IO here.
             return Ok(());
         }
 
-        // We have a valid overlapped pointer, pointing to our OverlappedEntry
         let entry = unsafe { &*(overlapped as *const OverlappedEntry) };
         let user_data = entry.user_data;
 
         if self.ops.contains(user_data) {
             let op = &mut self.ops[user_data];
 
-            // If we already have a result (e.g. invalid submission), keep it.
-            // Otherwise use the IOCP result.
             if op.result.is_none() {
                 let result = if res == 0 {
                     let err = unsafe { GetLastError() };
@@ -183,17 +161,12 @@ impl IocpDriver {
                     Ok(bytes_transferred)
                 };
 
-                // Post-completion handling for Accept/Connect
                 if result.is_ok() {
                     match &mut op.resources {
                         IoResources::Accept(accept_op) => {
-                            // Update Accept Context
-                            // We need access to the handle here.
-                            // op.fd is likely Raw, so we can extract it.
                             if let Some(fd) = accept_op.fd.raw() {
                                 let accept_socket = accept_op.accept_socket;
                                 let listen_socket = fd as SOCKET;
-                                // The value passed to setsockopt for SO_UPDATE_ACCEPT_CONTEXT is the listening socket handle
                                 let ret = unsafe {
                                     setsockopt(
                                         accept_socket as SOCKET,
@@ -207,9 +180,6 @@ impl IocpDriver {
                                     op.result = Some(Err(io::Error::last_os_error()));
                                 } else {
                                     // Parse addresses and backfill
-                                    // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
-                                    // LocalAddr/RemoteAddr max safe size is SOCKADDR_STORAGE (128).
-                                    // So we need 128 + 16 = 144 bytes per address.
                                     const MIN_ADDR_LEN: usize =
                                         std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
                                     let split = MIN_ADDR_LEN;
@@ -222,7 +192,7 @@ impl IocpDriver {
                                     unsafe {
                                         (self.extensions.get_accept_ex_sockaddrs)(
                                             accept_op.addr.as_ptr() as *const _,
-                                            0, // received data length (we didn't ask for data)
+                                            0,
                                             split as u32,
                                             split as u32,
                                             &mut local_sockaddr,
@@ -266,7 +236,6 @@ impl IocpDriver {
                                     }
                                 }
                             } else {
-                                // Should not happen if we passed validation
                                 op.result = Some(Err(io::Error::new(
                                     io::ErrorKind::Other,
                                     "Invalid listen socket fd",
@@ -274,8 +243,6 @@ impl IocpDriver {
                             }
                         }
                         IoResources::Connect(connect_op) => {
-                            // Update Connect Context
-                            // Update Connect Context
                             if let Some(fd) = connect_op.fd.raw() {
                                 let ret = unsafe {
                                     setsockopt(
@@ -317,8 +284,6 @@ impl IocpDriver {
         &mut self,
         files: &[crate::runtime::op::SysRawOp],
     ) -> io::Result<Vec<crate::runtime::op::IoFd>> {
-        // Windows IOCP doesn't require pre-registration.
-        // We simply return the handles wrapped in IoFd::Raw.
         Ok(files
             .iter()
             .map(|&h| crate::runtime::op::IoFd::Raw(h))
@@ -326,7 +291,6 @@ impl IocpDriver {
     }
 
     pub fn unregister_files(&mut self, _files: Vec<crate::runtime::op::IoFd>) -> io::Result<()> {
-        // No-op on Windows
         Ok(())
     }
 
@@ -337,13 +301,7 @@ impl IocpDriver {
 
 impl Driver for IocpDriver {
     fn reserve_op(&mut self) -> usize {
-        self.ops.insert(OperationLifecycle {
-            waker: None,
-            result: None,
-            resources: IoResources::None,
-            overlapped: None,
-            cancelled: false,
-        })
+        self.ops.insert(OpEntry::new(IoResources::None, None))
     }
 
     fn submit_op_resources(&mut self, user_data: usize, mut resources: IoResources) {
@@ -354,49 +312,28 @@ impl Driver for IocpDriver {
         });
 
         let overlapped_ptr = &mut entry.inner as *mut OVERLAPPED;
-        let (res_err, post_completion) = match &mut resources {
-            IoResources::ReadFixed(op) => unsafe {
-                ops::submit_read(op, self.port, overlapped_ptr)
-            },
-            IoResources::WriteFixed(op) => unsafe {
-                ops::submit_write(op, self.port, overlapped_ptr)
-            },
-            IoResources::Recv(op) => unsafe { ops::submit_recv(op, self.port, overlapped_ptr) },
-            IoResources::Send(op) => unsafe { ops::submit_send(op, self.port, overlapped_ptr) },
-            IoResources::Accept(op) => unsafe {
-                ops::submit_accept(op, self.port, overlapped_ptr, &self.extensions)
-            },
-            IoResources::Connect(op) => unsafe {
-                ops::submit_connect(op, self.port, overlapped_ptr, &self.extensions)
-            },
-            IoResources::None => (None, true),
-            IoResources::Timeout(op) => {
-                let deadline = Instant::now() + op.duration;
-                self.timers.push(TimerEntry {
-                    deadline,
-                    user_data,
-                });
-                (None, false)
-            }
-            IoResources::SendTo(op) => unsafe {
-                ops::submit_send_to(op, self.port, overlapped_ptr)
-            },
-            IoResources::RecvFrom(op) => unsafe {
-                ops::submit_recv_from(op, self.port, overlapped_ptr)
-            },
+
+        let (res_err, post_completion) = unsafe {
+            resources.submit(self.port, overlapped_ptr, &self.extensions)
         };
+
+        if let IoResources::Timeout(op) = &resources {
+            let deadline = Instant::now() + op.duration;
+            self.timers.push(TimerEntry {
+                deadline,
+                user_data,
+            });
+        }
 
         if let Some(op) = self.ops.get_mut(user_data) {
             op.resources = resources;
-            op.overlapped = Some(entry);
+            op.platform_data = Some(entry);
 
             if let Some(err) = res_err {
                 op.result = Some(Err(err));
             }
 
             if post_completion {
-                // Post a completion packet to wake up the loop
-                // We use 0 bytes transferred.
                 unsafe {
                     PostQueuedCompletionStatus(self.port, 0, 0, overlapped_ptr);
                 }
@@ -409,24 +346,10 @@ impl Driver for IocpDriver {
         user_data: usize,
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<u32>, IoResources)> {
-        if let Some(op) = self.ops.get_mut(user_data) {
-            if let Some(res) = op.result.take() {
-                let op_lifecycle = self.ops.remove(user_data);
-                Poll::Ready((res, op_lifecycle.resources))
-            } else {
-                op.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        } else {
-            Poll::Ready((
-                Err(io::Error::new(io::ErrorKind::Other, "Op not found")),
-                IoResources::None,
-            ))
-        }
+        self.ops.poll_op(user_data, cx)
     }
 
     fn submit(&mut self) -> io::Result<()> {
-        // IOCP submits immediately on syscall
         Ok(())
     }
 
@@ -446,7 +369,6 @@ impl Driver for IocpDriver {
             op.cancelled = true;
 
             // Extract fd from resources
-            // Extract fd from resources
             let fd = match &op.resources {
                 IoResources::ReadFixed(r) => r.fd.raw().map(|h| h as HANDLE),
                 IoResources::WriteFixed(r) => r.fd.raw().map(|h| h as HANDLE),
@@ -460,14 +382,10 @@ impl Driver for IocpDriver {
             };
 
             // Call CancelIoEx if we have both fd and overlapped
-            if let (Some(fd), Some(overlapped)) = (fd, &op.overlapped) {
+            if let (Some(fd), Some(overlapped)) = (fd, &op.platform_data) {
                 unsafe {
                     use windows_sys::Win32::System::IO::CancelIoEx;
                     let _ = CancelIoEx(fd, &overlapped.inner as *const _ as *mut _);
-                    // We ignore the result because:
-                    // 1. The operation might have already completed
-                    // 2. The handle might be invalid
-                    // 3. We've already marked it as cancelled
                 }
             }
         }
