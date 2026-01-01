@@ -473,10 +473,7 @@ impl IocpSubmit for crate::io::op::Open {
             };
 
             // self.path is Vec<u16> on Windows
-            #[cfg(windows)]
             let path_ptr = path.as_ptr();
-            #[cfg(not(windows))]
-            let path_ptr = std::ptr::null(); // Should not happen
 
             let handle = unsafe {
                 CreateFileW(

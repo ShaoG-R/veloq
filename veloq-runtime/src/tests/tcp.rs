@@ -1,8 +1,8 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
 use crate::io::buffer::{BufferPool, FixedBuf};
-use crate::runtime::executor::{LocalExecutor, Runtime};
 use crate::net::tcp::{TcpListener, TcpStream};
+use crate::runtime::executor::{LocalExecutor, Runtime};
 use crate::{current_driver, spawn_local as spawn};
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -11,9 +11,12 @@ use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
 
+use crate::io::buffer::BufferSize;
+
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &BufferPool) -> FixedBuf {
-    pool.alloc().expect("Failed to allocate buffer from pool")
+fn alloc_buf(pool: &BufferPool, size: BufferSize) -> FixedBuf {
+    pool.alloc(size)
+        .expect("Failed to allocate buffer from pool")
 }
 
 // ============ Single-Thread TCP Tests ============
@@ -48,7 +51,7 @@ fn test_tcp_connect_with_global_api() {
             .expect("Failed to connect");
         println!("Connected successfully");
         drop(stream);
-        
+
         server_h.await;
     });
 }
@@ -56,75 +59,92 @@ fn test_tcp_connect_with_global_api() {
 /// Test TCP data send and receive (echo)
 #[test]
 fn test_tcp_send_recv() {
-    let exec = LocalExecutor::new();
-    let driver = exec.driver_handle();
+    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+        println!("Testing with BufferSize: {:?}", size);
+        let exec = LocalExecutor::new();
+        let driver = exec.driver_handle();
 
-    let listener =
-        TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-    let listen_addr = listener.local_addr().expect("Failed to get local address");
+        let listener =
+            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-    let listener_rc = Rc::new(listener);
-    let listener_clone = listener_rc.clone();
+        let listener_rc = Rc::new(listener);
+        let listener_clone = listener_rc.clone();
 
-    exec.block_on(async move {
-        // Get driver and allocate buffers inside async context
-        let driver_weak = current_driver();
+        exec.block_on(async move {
+            // Get driver and allocate buffers inside async context
+            let driver_weak = current_driver();
 
+            // Server task
+            let server_h = spawn(async move {
+                let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
-        // Server task
-        let server_h = spawn(async move {
+                // Receive data
+                let mut buf = crate::current_buffer_pool()
+                    .upgrade()
+                    .unwrap()
+                    .alloc(size)
+                    .unwrap();
+                buf.set_len(buf.capacity());
+                let (result, buf) = stream.recv(buf).await;
+                let bytes_read = result.expect("Recv failed") as usize;
+                println!("Server received {} bytes", bytes_read);
 
-            let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+                // Echo data back
+                let mut echo_buf = crate::current_buffer_pool()
+                    .upgrade()
+                    .unwrap()
+                    .alloc(size)
+                    .unwrap();
+                echo_buf.spare_capacity_mut()[..bytes_read]
+                    .copy_from_slice(&buf.as_slice()[..bytes_read]);
+                echo_buf.set_len(bytes_read);
 
-            // Receive data
-            let mut buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-            buf.set_len(buf.capacity());
-            let (result, buf) = stream.recv(buf).await;
-            let bytes_read = result.expect("Recv failed") as usize;
-            println!("Server received {} bytes", bytes_read);
+                let (result, _) = stream.send(echo_buf).await;
+                result.expect("Send failed");
+                println!("Server echoed data");
+            });
 
-            // Echo data back
-            let mut echo_buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-            echo_buf.spare_capacity_mut()[..bytes_read]
-                .copy_from_slice(&buf.as_slice()[..bytes_read]);
-            echo_buf.set_len(bytes_read);
+            // Client
+            let stream = TcpStream::connect(listen_addr, driver_weak)
+                .await
+                .expect("Failed to connect");
 
-            let (result, _) = stream.send(echo_buf).await;
-            result.expect("Send failed");
-            println!("Server echoed data");
+            // Prepare data
+            let mut send_buf = crate::current_buffer_pool()
+                .upgrade()
+                .unwrap()
+                .alloc(size)
+                .unwrap();
+            let test_data = b"Hello, TCP!";
+            send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+            send_buf.set_len(test_data.len());
+
+            // Send data
+            let (result, _) = stream.send(send_buf).await;
+            let bytes_sent = result.expect("Client send failed");
+            println!("Client sent {} bytes", bytes_sent);
+
+            // Receive echo
+            let mut recv_buf = crate::current_buffer_pool()
+                .upgrade()
+                .unwrap()
+                .alloc(size)
+                .unwrap();
+            recv_buf.set_len(recv_buf.capacity());
+            let (result, recv_buf) = stream.recv(recv_buf).await;
+            let bytes_received = result.expect("Client recv failed") as usize;
+
+            println!("Client received {} bytes", bytes_received);
+
+            // Verify
+            assert_eq!(bytes_sent as usize, bytes_received);
+            assert_eq!(&recv_buf.as_slice()[..bytes_received], test_data);
+            println!("Data verification successful!");
+
+            server_h.await;
         });
-
-        // Client
-        let stream = TcpStream::connect(listen_addr, driver_weak)
-            .await
-            .expect("Failed to connect");
-
-        // Prepare data
-        let mut send_buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-        let test_data = b"Hello, TCP!";
-        send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-        send_buf.set_len(test_data.len());
-
-        // Send data
-        let (result, _) = stream.send(send_buf).await;
-        let bytes_sent = result.expect("Client send failed");
-        println!("Client sent {} bytes", bytes_sent);
-
-        // Receive echo
-        let mut recv_buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-        recv_buf.set_len(recv_buf.capacity());
-        let (result, recv_buf) = stream.recv(recv_buf).await;
-        let bytes_received = result.expect("Client recv failed") as usize;
-
-        println!("Client received {} bytes", bytes_received);
-
-        // Verify
-        assert_eq!(bytes_sent as usize, bytes_received);
-        assert_eq!(&recv_buf.as_slice()[..bytes_received], test_data);
-        println!("Data verification successful!");
-        
-        server_h.await;
-    });
+    }
 }
 
 /// Test multiple concurrent connections on single thread
@@ -163,7 +183,7 @@ fn test_tcp_multiple_connections() {
             drop(stream);
         }
         println!("All {} connections completed", NUM_CONNECTIONS);
-        
+
         server_h.await;
     });
 }
@@ -171,73 +191,77 @@ fn test_tcp_multiple_connections() {
 /// Test large data transfer
 #[test]
 fn test_tcp_large_data_transfer() {
-    let exec = LocalExecutor::new();
-    let driver = exec.driver_handle();
-    let pool = Rc::new(BufferPool::new());
+    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+        let exec = LocalExecutor::new();
+        let driver = exec.driver_handle();
+        let pool = Rc::new(BufferPool::new());
 
-    let listener =
-        TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-    let listen_addr = listener.local_addr().expect("Failed to get local address");
+        let listener =
+            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-    const DATA_SIZE: usize = 8192; // 8KB
-    const CHUNK_SIZE: usize = 4096;
+        const DATA_SIZE: usize = 8192; // 8KB
+        const CHUNK_SIZE: usize = 4096;
 
-    let listener_rc = Rc::new(listener);
-    let listener_clone = listener_rc.clone();
-    let pool_clone = pool.clone();
+        let listener_rc = Rc::new(listener);
+        let listener_clone = listener_rc.clone();
+        let pool_clone = pool.clone();
 
-    exec.block_on(async move {
-        // Server task
-        let server_h = spawn(async move {
-            let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+        exec.block_on(async move {
+            // Server task
+            let server_h = spawn(async move {
+                let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
-            let mut total_received = 0;
-            while total_received < DATA_SIZE {
-                let mut buf = alloc_buf(&pool_clone);
-                buf.set_len(buf.capacity());
-                let (result, _buf) = stream.recv(buf).await;
-                let bytes = result.expect("Recv failed") as usize;
-                if bytes == 0 {
-                    break;
+                let mut total_received = 0;
+                while total_received < DATA_SIZE {
+                    let mut buf = alloc_buf(&pool_clone, size);
+                    buf.set_len(buf.capacity());
+                    let (result, _buf) = stream.recv(buf).await;
+                    let bytes = result.expect("Recv failed") as usize;
+                    if bytes == 0 {
+                        break;
+                    }
+                    total_received += bytes;
+                    println!(
+                        "Server received {} bytes (total: {})",
+                        bytes, total_received
+                    );
                 }
-                total_received += bytes;
-                println!(
-                    "Server received {} bytes (total: {})",
-                    bytes, total_received
-                );
+
+                assert_eq!(total_received, DATA_SIZE);
+                println!("Server received all {} bytes", DATA_SIZE);
+            });
+
+            // Client
+            let driver = current_driver();
+            let stream = TcpStream::connect(listen_addr, driver)
+                .await
+                .expect("Failed to connect");
+
+            let mut total_sent = 0;
+            while total_sent < DATA_SIZE {
+                let chunk_size = std::cmp::min(CHUNK_SIZE, DATA_SIZE - total_sent);
+                // Ensure chunk size <= buffer size, but since chunks are <= 4096 and min buf is 4096, it's fine
+
+                let mut buf = alloc_buf(&pool, size);
+
+                for i in 0..chunk_size {
+                    buf.spare_capacity_mut()[i] = (i % 256) as u8;
+                }
+                buf.set_len(chunk_size);
+
+                let (result, _buf) = stream.send(buf).await;
+                let bytes = result.expect("Send failed") as usize;
+                total_sent += bytes;
+                println!("Client sent {} bytes (total: {})", bytes, total_sent);
             }
 
-            assert_eq!(total_received, DATA_SIZE);
-            println!("Server received all {} bytes", DATA_SIZE);
+            assert_eq!(total_sent, DATA_SIZE);
+            println!("Client sent all {} bytes", DATA_SIZE);
+
+            server_h.await;
         });
-
-        // Client
-        let driver = current_driver();
-        let stream = TcpStream::connect(listen_addr, driver)
-            .await
-            .expect("Failed to connect");
-
-        let mut total_sent = 0;
-        while total_sent < DATA_SIZE {
-            let chunk_size = std::cmp::min(CHUNK_SIZE, DATA_SIZE - total_sent);
-            let mut buf = alloc_buf(&pool);
-
-            for i in 0..chunk_size {
-                buf.spare_capacity_mut()[i] = (i % 256) as u8;
-            }
-            buf.set_len(chunk_size);
-
-            let (result, _buf) = stream.send(buf).await;
-            let bytes = result.expect("Send failed") as usize;
-            total_sent += bytes;
-            println!("Client sent {} bytes (total: {})", bytes, total_sent);
-        }
-
-        assert_eq!(total_sent, DATA_SIZE);
-        println!("Client sent all {} bytes", DATA_SIZE);
-        
-        server_h.await;
-    });
+    }
 }
 
 /// Test listener local_addr
@@ -278,44 +302,46 @@ fn test_tcp_connect_refused() {
 /// Test receiving zero bytes (EOF)
 #[test]
 fn test_tcp_recv_zero_bytes() {
-    let exec = LocalExecutor::new();
-    let driver = exec.driver_handle();
-    let pool = Rc::new(BufferPool::new());
+    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+        let exec = LocalExecutor::new();
+        let driver = exec.driver_handle();
+        let pool = Rc::new(BufferPool::new());
 
-    let listener =
-        TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-    let listen_addr = listener.local_addr().expect("Failed to get local address");
+        let listener =
+            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-    let listener_rc = Rc::new(listener);
-    let listener_clone = listener_rc.clone();
+        let listener_rc = Rc::new(listener);
+        let listener_clone = listener_rc.clone();
 
-    exec.block_on(async move {
-        // Server: accept and immediately close
-        let server_h = spawn(async move {
-            let (stream, _) = listener_clone.accept().await.expect("Accept failed");
-            println!("Server accepted and closing connection");
-            drop(stream);
+        exec.block_on(async move {
+            // Server: accept and immediately close
+            let server_h = spawn(async move {
+                let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+                println!("Server accepted and closing connection");
+                drop(stream);
+            });
+
+            // Client
+            let driver = current_driver();
+            let stream = TcpStream::connect(listen_addr, driver)
+                .await
+                .expect("Failed to connect");
+
+            let mut buf = alloc_buf(&pool, size);
+            buf.set_len(buf.capacity());
+            let (result, _buf) = stream.recv(buf).await;
+
+            if let Ok(bytes) = result {
+                assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
+                println!("Correctly received 0 bytes (EOF)");
+            } else {
+                println!("Received error on closed connection: {:?}", result.err());
+            }
+
+            server_h.await;
         });
-
-        // Client
-        let driver = current_driver();
-        let stream = TcpStream::connect(listen_addr, driver)
-            .await
-            .expect("Failed to connect");
-
-        let mut buf = alloc_buf(&pool);
-        buf.set_len(buf.capacity());
-        let (result, _buf) = stream.recv(buf).await;
-
-        if let Ok(bytes) = result {
-            assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
-            println!("Correctly received 0 bytes (EOF)");
-        } else {
-            println!("Received error on closed connection: {:?}", result.err());
-        }
-        
-        server_h.await;
-    });
+    }
 }
 
 /// Test IPv6 connection
@@ -354,7 +380,7 @@ fn test_tcp_ipv6() {
 
         println!("IPv6 connection successful");
         drop(stream);
-        
+
         server_h.await;
     });
 }
@@ -396,7 +422,7 @@ fn test_multithread_tcp_connections() {
                 .expect("Failed to connect");
             println!("Worker {} connected to self", worker_id);
             drop(stream);
-            
+
             server_h.await;
 
             counter.fetch_add(1, Ordering::SeqCst);
@@ -415,79 +441,95 @@ fn test_multithread_tcp_echo() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let (addr_tx, addr_rx) = mpsc::channel();
-    let mut runtime = Runtime::new();
+    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let mut runtime = Runtime::new();
 
-    // Worker 1: Echo server
-    runtime.spawn_worker(move || async move {
-        let driver = current_driver();
+        // Worker 1: Echo server
+        runtime.spawn_worker(move || async move {
+            let driver = current_driver();
 
-        let listener =
-            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
-        println!("Echo server listening on {}", listen_addr);
+            let listener =
+                TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
+            println!("Echo server listening on {}", listen_addr);
 
-        // Send address to client worker
-        addr_tx.send(listen_addr).unwrap();
+            // Send address to client worker
+            addr_tx.send(listen_addr).unwrap();
 
-        // Accept and echo
-        let (stream, _) = Rc::new(listener).accept().await.expect("Accept failed");
+            // Accept and echo
+            let (stream, _) = Rc::new(listener).accept().await.expect("Accept failed");
 
+            let mut buf = crate::current_buffer_pool()
+                .upgrade()
+                .unwrap()
+                .alloc(size)
+                .unwrap();
+            buf.set_len(buf.capacity());
 
-        let mut buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-        buf.set_len(buf.capacity());
+            let (result, buf) = stream.recv(buf).await;
+            let bytes = result.expect("Recv failed") as usize;
+            println!("Echo server received {} bytes", bytes);
 
-        let (result, buf) = stream.recv(buf).await;
-        let bytes = result.expect("Recv failed") as usize;
-        println!("Echo server received {} bytes", bytes);
+            // Echo back
+            let mut echo_buf = crate::current_buffer_pool()
+                .upgrade()
+                .unwrap()
+                .alloc(size)
+                .unwrap();
+            echo_buf.spare_capacity_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
+            echo_buf.set_len(bytes);
 
-        // Echo back
-        let mut echo_buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-        echo_buf.spare_capacity_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
-        echo_buf.set_len(bytes);
+            let (result, _) = stream.send(echo_buf).await;
+            result.expect("Send failed");
+            println!("Echo server sent response");
+        });
 
-        let (result, _) = stream.send(echo_buf).await;
-        result.expect("Send failed");
-        println!("Echo server sent response");
-    });
+        // Worker 2: Client
+        runtime.spawn_worker(move || async move {
+            // Wait for server address
+            let listen_addr = addr_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Timeout waiting for server address");
+            println!("Client connecting to {}", listen_addr);
 
-    // Worker 2: Client
-    runtime.spawn_worker(move || async move {
-        // Wait for server address
-        let listen_addr = addr_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("Timeout waiting for server address");
-        println!("Client connecting to {}", listen_addr);
+            let driver = current_driver();
 
-        let driver = current_driver();
+            let stream = TcpStream::connect(listen_addr, driver)
+                .await
+                .expect("Failed to connect");
 
+            // Send data
+            let mut send_buf = crate::current_buffer_pool()
+                .upgrade()
+                .unwrap()
+                .alloc(size)
+                .unwrap();
+            let data = b"Hello from worker 2!";
+            send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+            send_buf.set_len(data.len());
 
-        let stream = TcpStream::connect(listen_addr, driver)
-            .await
-            .expect("Failed to connect");
+            let (result, _) = stream.send(send_buf).await;
+            let sent = result.expect("Send failed");
+            println!("Client sent {} bytes", sent);
 
-        // Send data
-        let mut send_buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-        let data = b"Hello from worker 2!";
-        send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-        send_buf.set_len(data.len());
+            // Receive echo
+            let mut recv_buf = crate::current_buffer_pool()
+                .upgrade()
+                .unwrap()
+                .alloc(size)
+                .unwrap();
+            recv_buf.set_len(recv_buf.capacity());
+            let (result, recv_buf) = stream.recv(recv_buf).await;
+            let received = result.expect("Recv failed") as usize;
 
-        let (result, _) = stream.send(send_buf).await;
-        let sent = result.expect("Send failed");
-        println!("Client sent {} bytes", sent);
+            assert_eq!(&recv_buf.as_slice()[..received], data);
+            println!("Client received correct echo");
+        });
 
-        // Receive echo
-        let mut recv_buf = crate::current_buffer_pool().upgrade().unwrap().alloc().unwrap();
-        recv_buf.set_len(recv_buf.capacity());
-        let (result, recv_buf) = stream.recv(recv_buf).await;
-        let received = result.expect("Recv failed") as usize;
-
-        assert_eq!(&recv_buf.as_slice()[..received], data);
-        println!("Client received correct echo");
-    });
-
-    runtime.block_on_all();
-    println!("Multi-thread echo test completed");
+        runtime.block_on_all();
+        println!("Multi-thread echo test completed");
+    }
 }
 
 /// Test concurrent connections from multiple workers to shared server

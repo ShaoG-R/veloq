@@ -2,13 +2,57 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-// Simple constant size chunk for now: 4KB
-const CHUNK_SIZE: usize = 4096;
-const POOL_SIZE: usize = 1024; // 1024 * 4KB = 4MB
+// Slab configuration definition
+struct SlabConfig {
+    block_size: usize,
+    count: usize,
+}
 
-struct PoolInner {
+// Define 3 classes of buffer sizes
+// Class 0: 4KB, 1024 count -> 4MB
+// Class 1: 16KB, 128 count -> 2MB
+// Class 2: 64KB, 32 count -> 2MB
+// Total memory: ~8MB
+const SLABS: [SlabConfig; 3] = [
+    SlabConfig {
+        block_size: 4096,
+        count: 1024,
+    },
+    SlabConfig {
+        block_size: 16384,
+        count: 128,
+    },
+    SlabConfig {
+        block_size: 65536,
+        count: 32,
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferSize {
+    /// 4KB
+    Size4K = 0,
+    /// 16KB
+    Size16K = 1,
+    /// 64KB
+    Size64K = 2,
+}
+
+impl BufferSize {
+    pub fn size(&self) -> usize {
+        SLABS[*self as usize].block_size
+    }
+}
+
+struct Slab {
+    config: SlabConfig,
     memory: Vec<u8>,
     free_indices: Vec<usize>,
+    global_index_offset: u16,
+}
+
+struct PoolInner {
+    slabs: Vec<Slab>,
 }
 
 pub struct BufferPool {
@@ -17,32 +61,54 @@ pub struct BufferPool {
 
 impl BufferPool {
     pub fn new() -> Self {
-        let total_size = CHUNK_SIZE * POOL_SIZE;
-        // Align memory to page size if possible, but Vec usually aligns well enough for simple testing.
-        // For production, use explicit allocation.
-        let mut memory = Vec::with_capacity(total_size);
-        memory.resize(total_size, 0); // zero init
+        let mut slabs = Vec::with_capacity(SLABS.len());
+        let mut current_global_offset = 0;
 
-        let free_indices = (0..POOL_SIZE).collect();
+        for config in SLABS.iter() {
+            let total_size = config.block_size * config.count;
+            let mut memory = Vec::with_capacity(total_size);
+            memory.resize(total_size, 0); // zero init
 
-        Self {
-            inner: Rc::new(RefCell::new(PoolInner {
+            // Free indices stack: initially all indices 0..count
+            let free_indices: Vec<usize> = (0..config.count).collect();
+
+            slabs.push(Slab {
+                config: SlabConfig {
+                    block_size: config.block_size,
+                    count: config.count,
+                },
                 memory,
                 free_indices,
-            })),
+                global_index_offset: current_global_offset,
+            });
+
+            current_global_offset += config.count as u16;
+        }
+
+        Self {
+            inner: Rc::new(RefCell::new(PoolInner { slabs })),
         }
     }
 
-    pub fn alloc(&self) -> Option<FixedBuf> {
+    /// Allocate a buffer from the specified size class.
+    pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf> {
         let mut inner = self.inner.borrow_mut();
-        if let Some(index) = inner.free_indices.pop() {
-            let ptr = unsafe { inner.memory.as_mut_ptr().add(index * CHUNK_SIZE) };
+        let slab_idx = size as usize;
+
+        // Safety: BufferSize variants match SLABS indices exactly
+        let slab = &mut inner.slabs[slab_idx];
+
+        if let Some(index) = slab.free_indices.pop() {
+            let ptr = unsafe { slab.memory.as_mut_ptr().add(index * slab.config.block_size) };
+
             Some(FixedBuf {
+                slab_index: slab_idx as u8,
                 index,
+                global_index: slab.global_index_offset + index as u16,
                 ptr: NonNull::new(ptr).unwrap(),
                 len: 0,
-                cap: CHUNK_SIZE,
-                pool: self.inner.clone(), // Keep reference to return on drop
+                cap: slab.config.block_size,
+                pool: self.inner.clone(),
             })
         } else {
             None
@@ -53,20 +119,25 @@ impl BufferPool {
     #[cfg(target_os = "linux")]
     pub(crate) fn get_all_ptrs(&self) -> Vec<libc::iovec> {
         let inner = self.inner.borrow();
-        (0..POOL_SIZE)
-            .map(|i| {
-                let ptr = unsafe { inner.memory.as_ptr().add(i * CHUNK_SIZE) };
-                libc::iovec {
+        let mut iovecs = Vec::new();
+
+        for slab in &inner.slabs {
+            for i in 0..slab.config.count {
+                let ptr = unsafe { slab.memory.as_ptr().add(i * slab.config.block_size) };
+                iovecs.push(libc::iovec {
                     iov_base: ptr as *mut _,
-                    iov_len: CHUNK_SIZE,
-                }
-            })
-            .collect()
+                    iov_len: slab.config.block_size,
+                });
+            }
+        }
+        iovecs
     }
 }
 
 pub struct FixedBuf {
+    slab_index: u8,
     index: usize,
+    global_index: u16,
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
@@ -75,11 +146,10 @@ pub struct FixedBuf {
 
 // Safety: This buffer is generally not Send because it refers to thread-local pool logic
 // but in Thread-per-Core it stays on thread.
-// We rely on simple logic.
 
 impl FixedBuf {
     pub fn buf_index(&self) -> u16 {
-        self.index as u16
+        self.global_index
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -118,6 +188,8 @@ impl Drop for FixedBuf {
     fn drop(&mut self) {
         // Return index to pool
         let mut inner = self.pool.borrow_mut();
-        inner.free_indices.push(self.index);
+        if let Some(slab) = inner.slabs.get_mut(self.slab_index as usize) {
+            slab.free_indices.push(self.index);
+        }
     }
 }
