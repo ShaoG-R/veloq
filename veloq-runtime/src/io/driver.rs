@@ -1,6 +1,7 @@
 // use crate::buffer::FixedBuf;
 use crate::io::op::IoResources;
 
+pub(crate) mod blocking;
 pub(crate) mod op_registry;
 use std::io;
 use std::task::{Context, Poll};
@@ -37,8 +38,10 @@ pub trait Driver {
 
     /// Register a set of file descriptors/handles.
     /// Returns a list of `IoFd` that can be used in subsequent operations.
-    fn register_files(&mut self, files: &[crate::io::op::SysRawOp])
-    -> io::Result<Vec<crate::io::op::IoFd>>;
+    fn register_files(
+        &mut self,
+        files: &[crate::io::op::SysRawOp],
+    ) -> io::Result<Vec<crate::io::op::IoFd>>;
 
     /// Unregister a set of file descriptors/handles.
     fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()>;

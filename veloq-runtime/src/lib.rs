@@ -15,4 +15,5 @@ mod tests {
     mod select_test;
     mod tcp;
     mod udp;
+    mod fs;
 }

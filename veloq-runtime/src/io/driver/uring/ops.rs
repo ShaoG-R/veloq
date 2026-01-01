@@ -67,6 +67,9 @@ impl UringOp for IoResources {
             IoResources::SendTo(op) => op.make_sqe(),
             IoResources::RecvFrom(op) => op.make_sqe(),
             IoResources::Wakeup(op) => op.make_sqe(),
+            IoResources::Open(op) => op.make_sqe(),
+            IoResources::Close(op) => op.make_sqe(),
+            IoResources::Fsync(op) => op.make_sqe(),
             IoResources::None => opcode::Nop::new().build(),
         }
     }
@@ -196,6 +199,47 @@ impl UringOp for Wakeup {
     }
 }
 
+
+impl UringOp for crate::io::op::Open {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        let path_ptr = self.path.as_ptr();
+        // OpenAt: dir_fd, path, flags, mode
+        // We use AT_FDCWD for dir_fd to support absolute and relative paths from CWD.
+        opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
+            .flags(self.flags)
+            .mode(self.mode)
+            .build()
+    }
+}
+
+impl UringOp for crate::io::op::Close {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        match self.fd {
+            crate::io::op::IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd)).build(),
+            crate::io::op::IoFd::Fixed(idx) => {
+                 // Assume Raw for now as File usually holds Raw Fd.
+                 opcode::Close::new(types::Fixed(idx)).build()
+            }
+        }
+    }
+}
+
+impl UringOp for crate::io::op::Fsync {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        let flags = if self.datasync {
+             // IORING_FSYNC_DATASYNC
+             io_uring::types::FsyncFlags::DATASYNC
+        } else {
+             io_uring::types::FsyncFlags::empty()
+        };
+
+        match self.fd {
+            crate::io::op::IoFd::Raw(fd) => opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
+            crate::io::op::IoFd::Fixed(idx) => opcode::Fsync::new(types::Fixed(idx)).flags(flags).build(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,11 +252,6 @@ mod tests {
             ts: [0, 0],
         };
         let _sqe = op.make_sqe();
-        // Just verify it doesn't crash and returns something.
-        // Inspecting raw sqe is hard without access to io_uring internals,
-        // but we can check if it constructed successfully.
-        // For strict correctness we might need to cast to io_uring_sqe but that's unsafe and hidden.
-        // Validating the side effect (self.ts populated)
         assert_eq!(op.ts[0], 1);
         assert_eq!(op.ts[1], 0);
     }

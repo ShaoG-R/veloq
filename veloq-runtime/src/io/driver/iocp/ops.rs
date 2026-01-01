@@ -1,5 +1,6 @@
 use crate::io::op::{
-    Accept, Connect, IoFd, IoResources, ReadFixed, Recv, RecvFrom, Send, SendTo, WriteFixed,
+    Accept, Connect, IoFd, IoResources, ReadFixed, Recv, RecvFrom, Send as OpSend, SendTo,
+    WriteFixed,
 };
 use std::io;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
@@ -12,6 +13,12 @@ use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
 
 use super::ext::Extensions;
 
+pub enum SubmissionResult {
+    Pending,
+    PostToQueue,
+    Offload(Box<dyn FnOnce() -> io::Result<usize> + Send>),
+}
+
 pub(crate) trait IocpSubmit {
     unsafe fn submit(
         &mut self,
@@ -19,7 +26,7 @@ pub(crate) trait IocpSubmit {
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool);
+    ) -> io::Result<SubmissionResult>;
 }
 
 fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::Result<HANDLE> {
@@ -45,15 +52,12 @@ impl IocpSubmit for ReadFixed {
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
+    ) -> io::Result<SubmissionResult> {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = self.offset as u32;
         entry_ext.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
 
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+        let handle = resolve_fd(self.fd, registered_files)?;
 
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
@@ -71,10 +75,10 @@ impl IocpSubmit for ReadFixed {
         if ret == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_IO_PENDING {
-                return (Some(io::Error::from_raw_os_error(err as i32)), true);
+                return Err(io::Error::from_raw_os_error(err as i32));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
@@ -85,15 +89,12 @@ impl IocpSubmit for WriteFixed {
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
+    ) -> io::Result<SubmissionResult> {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = self.offset as u32;
         entry_ext.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
 
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+        let handle = resolve_fd(self.fd, registered_files)?;
 
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
@@ -111,10 +112,10 @@ impl IocpSubmit for WriteFixed {
         if ret == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_IO_PENDING {
-                return (Some(io::Error::from_raw_os_error(err as i32)), true);
+                return Err(io::Error::from_raw_os_error(err as i32));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
@@ -125,15 +126,12 @@ impl IocpSubmit for Recv {
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
+    ) -> io::Result<SubmissionResult> {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = 0;
         entry_ext.Anonymous.Anonymous.OffsetHigh = 0;
 
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+        let handle = resolve_fd(self.fd, registered_files)?;
 
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
@@ -151,29 +149,26 @@ impl IocpSubmit for Recv {
         if ret == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_IO_PENDING {
-                return (Some(io::Error::from_raw_os_error(err as i32)), true);
+                return Err(io::Error::from_raw_os_error(err as i32));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
-impl IocpSubmit for Send {
+impl IocpSubmit for OpSend {
     unsafe fn submit(
         &mut self,
         port: HANDLE,
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
+    ) -> io::Result<SubmissionResult> {
         let entry_ext = unsafe { &mut *overlapped };
         entry_ext.Anonymous.Anonymous.Offset = 0;
         entry_ext.Anonymous.Anonymous.OffsetHigh = 0;
 
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+        let handle = resolve_fd(self.fd, registered_files)?;
 
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
@@ -191,10 +186,10 @@ impl IocpSubmit for Send {
         if ret == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_IO_PENDING {
-                return (Some(io::Error::from_raw_os_error(err as i32)), true);
+                return Err(io::Error::from_raw_os_error(err as i32));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
@@ -205,26 +200,20 @@ impl IocpSubmit for Accept {
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
+    ) -> io::Result<SubmissionResult> {
         let accept_socket = self.accept_socket;
 
         // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
         const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
         let buf_len = self.addr.len();
         if buf_len < 2 * MIN_ADDR_LEN {
-            return (
-                Some(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Accept buffer too small for AcceptEx",
-                )),
-                true,
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Accept buffer too small for AcceptEx",
+            ));
         }
 
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+        let handle = resolve_fd(self.fd, registered_files)?;
 
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
         unsafe { CreateIoCompletionPort(accept_socket as HANDLE, port, 0, 0) };
@@ -248,10 +237,10 @@ impl IocpSubmit for Accept {
         if ret == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_IO_PENDING {
-                return (Some(io::Error::from_raw_os_error(err as i32)), true);
+                return Err(io::Error::from_raw_os_error(err as i32));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
@@ -262,11 +251,8 @@ impl IocpSubmit for Connect {
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+    ) -> io::Result<SubmissionResult> {
+        let handle = resolve_fd(self.fd, registered_files)?;
 
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
@@ -343,10 +329,10 @@ impl IocpSubmit for Connect {
         if ret == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_IO_PENDING {
-                return (Some(io::Error::from_raw_os_error(err as i32)), true);
+                return Err(io::Error::from_raw_os_error(err as i32));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
@@ -357,11 +343,8 @@ impl IocpSubmit for SendTo {
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+    ) -> io::Result<SubmissionResult> {
+        let handle = resolve_fd(self.fd, registered_files)?;
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
         self.wsabuf.len = self.buf.len() as u32;
@@ -385,10 +368,10 @@ impl IocpSubmit for SendTo {
         if ret == SOCKET_ERROR {
             let err = unsafe { WSAGetLastError() };
             if err != ERROR_IO_PENDING as i32 {
-                return (Some(io::Error::from_raw_os_error(err)), true);
+                return Err(io::Error::from_raw_os_error(err));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
@@ -399,11 +382,8 @@ impl IocpSubmit for RecvFrom {
         overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
-        let handle = match resolve_fd(self.fd, registered_files) {
-            Ok(h) => h,
-            Err(e) => return (Some(e), true),
-        };
+    ) -> io::Result<SubmissionResult> {
+        let handle = resolve_fd(self.fd, registered_files)?;
         unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
 
         self.wsabuf.len = self.buf.capacity() as u32;
@@ -427,10 +407,10 @@ impl IocpSubmit for RecvFrom {
         if ret == SOCKET_ERROR {
             let err = unsafe { WSAGetLastError() };
             if err != ERROR_IO_PENDING as i32 {
-                return (Some(io::Error::from_raw_os_error(err)), true);
+                return Err(io::Error::from_raw_os_error(err));
             }
         }
-        (None, false)
+        Ok(SubmissionResult::Pending)
     }
 }
 
@@ -441,7 +421,7 @@ impl IocpSubmit for IoResources {
         overlapped: *mut OVERLAPPED,
         ext: &Extensions,
         registered_files: &[Option<HANDLE>],
-    ) -> (Option<io::Error>, bool) {
+    ) -> io::Result<SubmissionResult> {
         match self {
             IoResources::ReadFixed(op) => unsafe {
                 op.submit(port, overlapped, ext, registered_files)
@@ -463,9 +443,105 @@ impl IocpSubmit for IoResources {
             IoResources::RecvFrom(op) => unsafe {
                 op.submit(port, overlapped, ext, registered_files)
             },
-            IoResources::None => (None, true),
-            IoResources::Wakeup(_) => (None, true),
-            IoResources::Timeout(_) => (None, false),
+            IoResources::Open(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::Close(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::Fsync(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::None => Ok(SubmissionResult::PostToQueue),
+            IoResources::Wakeup(_) => Ok(SubmissionResult::PostToQueue),
+            IoResources::Timeout(_) => Ok(SubmissionResult::Pending),
         }
+    }
+}
+
+impl IocpSubmit for crate::io::op::Open {
+    unsafe fn submit(
+        &mut self,
+        _port: HANDLE,
+        _overlapped: *mut OVERLAPPED,
+        _ext: &Extensions,
+        _registered_files: &[Option<HANDLE>],
+    ) -> io::Result<SubmissionResult> {
+        let path = self.path.clone();
+        let flags = self.flags;
+        let mode = self.mode;
+
+        Ok(SubmissionResult::Offload(Box::new(move || {
+            // Synchronous open for IOCP MVP
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
+            };
+
+            // self.path is Vec<u16> on Windows
+            #[cfg(windows)]
+            let path_ptr = path.as_ptr();
+            #[cfg(not(windows))]
+            let path_ptr = std::ptr::null(); // Should not happen
+
+            let handle = unsafe {
+                CreateFileW(
+                    path_ptr,
+                    flags as u32, // Simplified mapping
+                    0,            // share mode (0 = no share) - maybe should be configurable
+                    std::ptr::null(),
+                    mode as u32, // creation disposition
+                    FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if handle == INVALID_HANDLE_VALUE {
+                let err = unsafe { GetLastError() };
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+
+            Ok(handle as usize)
+        })))
+    }
+}
+
+impl IocpSubmit for crate::io::op::Close {
+    unsafe fn submit(
+        &mut self,
+        _port: HANDLE,
+        _overlapped: *mut OVERLAPPED,
+        _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
+    ) -> io::Result<SubmissionResult> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        let handle = resolve_fd(self.fd, registered_files)?;
+        let handle = handle as usize;
+
+        Ok(SubmissionResult::Offload(Box::new(move || {
+            let ret = unsafe { CloseHandle(handle as HANDLE) };
+            if ret == 0 {
+                let err = unsafe { GetLastError() };
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+            Ok(0)
+        })))
+    }
+}
+
+impl IocpSubmit for crate::io::op::Fsync {
+    unsafe fn submit(
+        &mut self,
+        _port: HANDLE,
+        _overlapped: *mut OVERLAPPED,
+        _ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
+    ) -> io::Result<SubmissionResult> {
+        use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
+        let handle = resolve_fd(self.fd, registered_files)?;
+        let handle = handle as usize;
+
+        Ok(SubmissionResult::Offload(Box::new(move || {
+            let ret = unsafe { FlushFileBuffers(handle as HANDLE) };
+            if ret == 0 {
+                let err = unsafe { GetLastError() };
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+            Ok(0)
+        })))
     }
 }

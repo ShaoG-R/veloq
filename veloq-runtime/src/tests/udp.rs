@@ -151,7 +151,7 @@ fn test_udp_echo() {
         // Verify
         assert_eq!(from_addr, server_addr);
         assert_eq!(bytes_sent, bytes_received);
-        assert_eq!(&recv_buf.as_slice()[..bytes_received as usize], test_data);
+        assert_eq!(&recv_buf.as_slice()[..bytes_received], test_data);
         println!("UDP echo test successful!");
         
         server_h.await;

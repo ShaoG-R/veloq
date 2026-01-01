@@ -48,6 +48,9 @@ pub enum IoResources {
     SendTo(SendTo),
     RecvFrom(RecvFrom),
     Wakeup(Wakeup),
+    Open(Open),
+    Close(Close),
+    Fsync(Fsync),
     // Placeholder for when we have no resource back yet or it's empty
     None,
 }
@@ -247,6 +250,64 @@ impl IoOp for Connect {
         match res {
             IoResources::Connect(r) => r,
             _ => panic!("Resource type mismatch for Connect"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Open {
+    #[cfg(unix)]
+    pub path: std::ffi::CString,
+    #[cfg(windows)]
+    pub path: Vec<u16>,
+    pub flags: i32,
+    pub mode: u32,
+}
+
+impl IoOp for Open {
+    fn into_resource(self) -> IoResources {
+        IoResources::Open(self)
+    }
+
+    fn from_resource(res: IoResources) -> Self {
+        match res {
+            IoResources::Open(r) => r,
+            _ => panic!("Resource type mismatch for Open"),
+        }
+    }
+}
+
+pub struct Close {
+    pub fd: IoFd,
+}
+
+impl IoOp for Close {
+    fn into_resource(self) -> IoResources {
+        IoResources::Close(self)
+    }
+
+    fn from_resource(res: IoResources) -> Self {
+        match res {
+            IoResources::Close(r) => r,
+            _ => panic!("Resource type mismatch for Close"),
+        }
+    }
+}
+
+pub struct Fsync {
+    pub fd: IoFd,
+    pub datasync: bool,
+}
+
+impl IoOp for Fsync {
+    fn into_resource(self) -> IoResources {
+        IoResources::Fsync(self)
+    }
+
+    fn from_resource(res: IoResources) -> Self {
+        match res {
+            IoResources::Fsync(r) => r,
+            _ => panic!("Resource type mismatch for Fsync"),
         }
     }
 }
