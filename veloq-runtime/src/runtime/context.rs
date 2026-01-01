@@ -47,7 +47,11 @@ pub(crate) fn enter(
     buffer_pool: Weak<BufferPool>,
 ) -> ContextGuard {
     CONTEXT.with(|ctx| {
-        *ctx.borrow_mut() = Some(ExecutorContext { driver, queue, buffer_pool });
+        *ctx.borrow_mut() = Some(ExecutorContext {
+            driver,
+            queue,
+            buffer_pool,
+        });
     });
     ContextGuard { _private: () }
 }
@@ -74,16 +78,16 @@ where
             .as_ref()
             .expect("spawn() called outside of runtime context");
 
-        let queue = ctx
-            .queue
-            .upgrade()
-            .expect("executor has been dropped");
+        let queue = ctx.queue.upgrade().expect("executor has been dropped");
 
         let (handle, producer) = JoinHandle::new();
-        let task = Task::new(async move {
-            let output = future.await;
-            producer.set(output);
-        }, ctx.queue.clone());
+        let task = Task::new(
+            async move {
+                let output = future.await;
+                producer.set(output);
+            },
+            ctx.queue.clone(),
+        );
         queue.borrow_mut().push_back(task);
         handle
     })
