@@ -443,15 +443,28 @@ impl IocpSubmit for IoResources {
         registered_files: &[Option<HANDLE>],
     ) -> (Option<io::Error>, bool) {
         match self {
-            IoResources::ReadFixed(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::WriteFixed(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+            IoResources::ReadFixed(op) => unsafe {
+                op.submit(port, overlapped, ext, registered_files)
+            },
+            IoResources::WriteFixed(op) => unsafe {
+                op.submit(port, overlapped, ext, registered_files)
+            },
             IoResources::Recv(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
             IoResources::Send(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::Accept(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::Connect(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::SendTo(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::RecvFrom(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::None => (None, true), 
+            IoResources::Accept(op) => unsafe {
+                op.submit(port, overlapped, ext, registered_files)
+            },
+            IoResources::Connect(op) => unsafe {
+                op.submit(port, overlapped, ext, registered_files)
+            },
+            IoResources::SendTo(op) => unsafe {
+                op.submit(port, overlapped, ext, registered_files)
+            },
+            IoResources::RecvFrom(op) => unsafe {
+                op.submit(port, overlapped, ext, registered_files)
+            },
+            IoResources::None => (None, true),
+            IoResources::Wakeup(_) => (None, true),
             IoResources::Timeout(_) => (None, false),
         }
     }

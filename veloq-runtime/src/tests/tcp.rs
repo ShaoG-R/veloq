@@ -3,7 +3,7 @@
 use crate::io::buffer::{BufferPool, FixedBuf};
 use crate::runtime::executor::{LocalExecutor, Runtime};
 use crate::net::tcp::{TcpListener, TcpStream};
-use crate::{current_driver, spawn};
+use crate::{current_driver, spawn_local as spawn};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -42,6 +42,16 @@ pub trait Driver {
 
     /// Unregister a set of file descriptors/handles.
     fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()>;
+
+    /// Wake up the driver from blocking wait.
+    fn wake(&mut self) -> io::Result<()>;
+
+    /// Create a thread-safe waker.
+    fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
+}
+
+pub trait RemoteWaker: Send + Sync {
+    fn wake(&self) -> io::Result<()>;
 }
 
 // Platform-specific driver implementations

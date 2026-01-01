@@ -4,16 +4,20 @@ mod ops;
 mod tests;
 
 // use crate::io::buffer::{BufferPool, FixedBuf};
-use crate::io::driver::Driver;
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
+use crate::io::driver::{Driver, RemoteWaker};
 use crate::io::op::IoResources;
 use ext::Extensions;
 use ops::IocpSubmit;
 use std::io;
 use std::task::{Context, Poll};
 use std::time::Instant;
+
+const WAKEUP_USER_DATA: usize = usize::MAX;
+
 use windows_sys::Win32::Foundation::{
-    ERROR_HANDLE_EOF, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_HANDLE_EOF, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
@@ -22,6 +26,7 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
@@ -40,10 +45,37 @@ pub struct IocpDriver {
     free_slots: Vec<usize>,
 }
 
+
+
 #[repr(C)]
 pub struct OverlappedEntry {
     inner: OVERLAPPED,
     user_data: usize,
+}
+
+struct IocpWaker(HANDLE);
+
+unsafe impl Send for IocpWaker {}
+unsafe impl Sync for IocpWaker {}
+
+impl RemoteWaker for IocpWaker {
+    fn wake(&self) -> io::Result<()> {
+        let res = unsafe {
+            PostQueuedCompletionStatus(self.0, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
+        };
+        if res == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IocpWaker {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
 }
 
 impl IocpDriver {
@@ -117,6 +149,10 @@ impl IocpDriver {
                     return Ok(());
                 }
                 return Err(io::Error::from_raw_os_error(err as i32));
+            }
+            // If the completion key matches our wakeup token, return immediately.
+            if completion_key == WAKEUP_USER_DATA {
+                return Ok(());
             }
             return Ok(());
         }
@@ -543,6 +579,36 @@ impl Driver for IocpDriver {
             }
         }
         Ok(())
+    }
+
+    fn wake(&mut self) -> io::Result<()> {
+        let res = unsafe {
+            PostQueuedCompletionStatus(self.port, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
+        };
+        if res == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {
+        let process = unsafe { GetCurrentProcess() };
+        let mut new_handle = INVALID_HANDLE_VALUE;
+        let res = unsafe {
+            DuplicateHandle(
+                process,
+                self.port,
+                process,
+                &mut new_handle,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if res == 0 {
+            panic!("Failed to dup handle");
+        }
+        std::sync::Arc::new(IocpWaker(new_handle))
     }
 }
 

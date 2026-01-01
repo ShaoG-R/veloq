@@ -1,5 +1,5 @@
 use crate::io::op::{
-    Accept, Connect, IoResources, ReadFixed, Recv, RecvFrom, Send, SendTo, Timeout, WriteFixed,
+    Accept, Connect, IoResources, ReadFixed, Recv, RecvFrom, Send, SendTo, Timeout, Wakeup, WriteFixed,
 };
 use io_uring::{opcode, squeue, types};
 
@@ -66,6 +66,7 @@ impl UringOp for IoResources {
             IoResources::Connect(op) => op.make_sqe(),
             IoResources::SendTo(op) => op.make_sqe(),
             IoResources::RecvFrom(op) => op.make_sqe(),
+            IoResources::Wakeup(op) => op.make_sqe(),
             IoResources::None => opcode::Nop::new().build(),
         }
     }
@@ -180,6 +181,17 @@ impl UringOp for RecvFrom {
             crate::io::op::IoFd::Fixed(idx) => {
                 opcode::RecvMsg::new(types::Fixed(idx), &mut *self.msghdr as *mut _).build()
             }
+        }
+    }
+}
+
+impl UringOp for Wakeup {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        match self.fd {
+            crate::io::op::IoFd::Raw(fd) => {
+                opcode::Read::new(types::Fd(fd), self.buf.as_mut_ptr(), 8).build()
+            }
+            _ => panic!("Wakeup only supports raw fd"),
         }
     }
 }

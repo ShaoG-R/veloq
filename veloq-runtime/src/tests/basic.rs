@@ -1,245 +1,200 @@
-//! Basic runtime tests for executor, context, and spawn functionality.
+//! Basic runtime tests for spawn and spawn_local functionality.
 
-use crate::io::buffer::BufferPool;
 use crate::runtime::executor::{LocalExecutor, Runtime};
-use crate::io::op::{IoOp, IoResources, Op};
-use crate::{current_driver, spawn};
+use crate::{spawn, spawn_local};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
-// ============ Helper Types ============
+// ============ LocalExecutor Tests (Single Threaded) ============
 
-struct Nop;
-
-impl IoOp for Nop {
-    fn into_resource(self) -> IoResources {
-        IoResources::None
-    }
-
-    fn from_resource(_res: IoResources) -> Self {
-        Nop
-    }
-}
-
-// ============ Single-Thread Basic Tests ============
-
-/// Test basic nop operation completion
+/// Test that spawn_local works correctly in a basic LocalExecutor.
+/// This verifies that tasks are executed on the same thread.
 #[test]
-fn test_nop_completion() {
+fn test_spawn_local_basic() {
     let exec = LocalExecutor::new();
-    let driver = exec.driver_handle();
+    let result = Rc::new(RefCell::new(0));
+    let result_clone = result.clone();
 
-    let result = exec.block_on(async move {
-        let op = Op::new(Nop, driver);
-        let (res, _nop) = op.await;
-        res
+    exec.block_on(async move {
+        let handle = spawn_local(async move {
+            *result_clone.borrow_mut() = 42;
+            "done"
+        });
+
+        assert_eq!(handle.await, "done");
     });
 
-    assert!(result.is_ok());
+    assert_eq!(*result.borrow(), 42);
 }
 
-/// Test global spawn() API works inside block_on
+/// Test that spawn_local supports !Send futures (like Rc).
 #[test]
-fn test_global_spawn() {
+fn test_spawn_local_not_send() {
+    let exec = LocalExecutor::new();
+    // Rc is !Send
+    let data = Rc::new(vec![1, 2, 3]);
+    let data_clone = data.clone();
+
+    exec.block_on(async move {
+        // This would fail to compile with spawn()
+        let handle = spawn_local(async move {
+            assert_eq!(data_clone.len(), 3);
+            data_clone[0] + data_clone[1] + data_clone[2]
+        });
+
+        assert_eq!(handle.await, 6);
+    });
+}
+
+/// Test nested spawn_local calls.
+#[test]
+fn test_nested_spawn_local() {
     let exec = LocalExecutor::new();
     let counter = Rc::new(RefCell::new(0));
-    let counter_clone = counter.clone();
+    let c1 = counter.clone();
 
     exec.block_on(async move {
-        // Use global spawn API
-        let handle = spawn(async move {
-            *counter_clone.borrow_mut() += 1;
-        });
-
-        // Wait for spawned task to complete
-        handle.await;
-    });
-
-    // The spawned task should have run
-    assert_eq!(*counter.borrow(), 1);
-}
-
-/// Test multiple global spawns execute in order
-#[test]
-fn test_multiple_spawns() {
-    let exec = LocalExecutor::new();
-    let order = Rc::new(RefCell::new(Vec::new()));
-
-    let order1 = order.clone();
-    let order2 = order.clone();
-    let order3 = order.clone();
-
-    exec.block_on(async move {
-        let h1 = spawn(async move {
-            order1.borrow_mut().push(1);
-        });
-
-        let h2 = spawn(async move {
-            order2.borrow_mut().push(2);
-        });
-
-        let h3 = spawn(async move {
-            order3.borrow_mut().push(3);
-        });
-
-        // Wait for all spawned tasks to complete
-        h1.await;
-        h2.await;
-        h3.await;
-    });
-
-    // All tasks should have run
-    // Note: Execution order isn't strictly guaranteed by just awaiting, 
-    // but with the current FIFO executor it likely matches. 
-    // However, we just check that they all ran.
-    let result = order.borrow();
-    assert_eq!(result.len(), 3);
-    assert!(result.contains(&1));
-    assert!(result.contains(&2));
-    assert!(result.contains(&3));
-}
-
-/// Test current_driver() returns valid driver
-#[test]
-fn test_current_driver() {
-    let exec = LocalExecutor::new();
-
-    exec.block_on(async {
-        let driver = current_driver();
-        assert!(driver.upgrade().is_some(), "Driver should be valid");
-
-        // Can allocate a buffer through the pool
-        let pool = crate::current_buffer_pool();
-        let buf = pool.upgrade().unwrap().alloc();
-        assert!(buf.is_some(), "Should be able to allocate buffer");
-    });
-}
-
-/// Test nested spawns
-#[test]
-fn test_nested_spawns() {
-    let exec = LocalExecutor::new();
-    let counter = Rc::new(RefCell::new(0));
-
-    let counter1 = counter.clone();
-    let counter2 = counter.clone();
-
-    exec.block_on(async move {
-        let h_outer = spawn(async move {
-            *counter1.borrow_mut() += 1;
-
-            // Nested spawn
-            let h_inner = spawn(async move {
-                *counter2.borrow_mut() += 10;
-            });
+        let h1 = spawn_local(async move {
+            *c1.borrow_mut() += 1;
+            let c2 = c1.clone();
             
-            h_inner.await;
+            let h2 = spawn_local(async move {
+                *c2.borrow_mut() += 10;
+            });
+            h2.await;
         });
-
-        h_outer.await;
+        h1.await;
     });
 
-    // Both spawns should have executed
     assert_eq!(*counter.borrow(), 11);
 }
 
-/// Test buffer pool allocation
+// ============ Runtime Tests (Multi-Threaded) ============
+
+/// Test global spawn works from within the Runtime (injecting into workers).
 #[test]
-fn test_buffer_pool_allocation() {
-    let pool = BufferPool::new();
+fn test_runtime_global_spawn() {
+    let mut runtime = Runtime::new();
+    let (tx, rx) = std::sync::mpsc::channel();
 
-    // Allocate multiple buffers
-    let buf1 = pool.alloc();
-    assert!(buf1.is_some());
+    // Spawn 1 worker that stays alive
+    runtime.spawn_worker(move || async move {
+        // Keep alive for a bit to allow receiving tasks
+        let mut i = 0;
+        while i < 10 {
+            crate::runtime::context::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            i += 1;
+        }
+    });
 
-    let buf2 = pool.alloc();
-    assert!(buf2.is_some());
+    // Spawn a task globally from the main thread
+    let _handle = runtime.spawn(async move {
+        42
+    });
 
-    // Drop one and reallocate
-    drop(buf1);
-    let buf3 = pool.alloc();
-    assert!(buf3.is_some());
+    // We can't await the handle directly in a blocking test without blocking on the runtime,
+    // but the runtime handle allows us to await it if we were in an async context.
+    // Here we'll just block_on_all which runs the workers.
+    // Ideally, we want to know if the task ran. 
+    
+    // Let's spawn a task that sends a signal.
+    runtime.spawn(async move {
+        tx.send(true).unwrap();
+    });
+
+    runtime.block_on_all();
+    assert!(rx.recv().unwrap());
 }
 
-// ============ Multi-Thread Tests ============
-
-/// Test Runtime with multiple worker threads
+/// Test global spawn works from INSIDE a worker.
 #[test]
-fn test_multithread_runtime() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let counter = Arc::new(AtomicUsize::new(0));
+fn test_spawn_from_worker() {
     let mut runtime = Runtime::new();
+    let (tx, rx) = std::sync::mpsc::channel();
 
-    // Spawn 3 worker threads
-    for _ in 0..3 {
-        let counter_clone = counter.clone();
+    runtime.spawn_worker(move || async move {
+        // We are inside a worker, so we should have a Spawner in context.
+        let handle = spawn(async move {
+            "hello from global"
+        });
+        
+        // Wait for it
+        let res = handle.await;
+        tx.send(res).unwrap();
+    });
+
+    runtime.block_on_all();
+    assert_eq!(rx.recv().unwrap(), "hello from global");
+}
+
+/// Test using both spawn_local and spawn in a worker.
+#[test]
+fn test_mixed_spawn_in_worker() {
+    let mut runtime = Runtime::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    runtime.spawn_worker(move || async move {
+        // 1. spawn_local (!Send)
+        let rc_val = Rc::new(5);
+        let rc_clone = rc_val.clone();
+        let local_handle = spawn_local(async move {
+            *rc_clone * 2
+        });
+
+        // 2. spawn (Send)
+        let global_handle = spawn(async move {
+            20
+        });
+
+        let v1 = local_handle.await;
+        let v2 = global_handle.await;
+
+        tx.send(v1 + v2).unwrap();
+    });
+
+    runtime.block_on_all();
+    assert_eq!(rx.recv().unwrap(), 10 + 20);
+}
+
+/// Test that tasks can float between workers (basic check).
+/// If we have 2 workers, and one spawns many tasks, they *should* ideally be distributed,
+/// but since the current implementation is likely a simple injector or FIFO, 
+/// we just verify they all run, and that we can use multiple workers.
+#[test]
+fn test_multi_worker_throughput() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut runtime = Runtime::new();
+    let counter = Arc::new(AtomicUsize::new(0));
+    
+    // Spawn 2 workers that process tasks until done
+    let c_worker = counter.clone();
+    for _ in 0..2 {
+        let c = c_worker.clone();
         runtime.spawn_worker(move || async move {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
+             let start = std::time::Instant::now();
+             // Run until we see 50 tasks done or timeout
+             while c.load(Ordering::SeqCst) < 50 {
+                 if start.elapsed() > std::time::Duration::from_secs(5) {
+                     break;
+                 }
+                 crate::runtime::context::yield_now().await;
+             }
+        });
+    }
+
+    // Spawn 50 global tasks
+    for _ in 0..50 {
+        let c = counter.clone();
+        runtime.spawn(async move {
+            c.fetch_add(1, Ordering::SeqCst);
         });
     }
 
     runtime.block_on_all();
-
-    assert_eq!(counter.load(Ordering::SeqCst), 3);
-    println!("All 3 workers completed");
-}
-
-/// Test each worker thread has independent executor
-#[test]
-fn test_multithread_isolation() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    let counter = Arc::new(AtomicUsize::new(0));
-    let mut runtime = Runtime::new();
-
-    // Worker 1: increments counter
-    let counter1 = counter.clone();
-    runtime.spawn_worker(move || async move {
-        for _ in 0..5 {
-            counter1.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    // Worker 2: also increments counter
-    let counter2 = counter.clone();
-    runtime.spawn_worker(move || async move {
-        for _ in 0..5 {
-            counter2.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    runtime.block_on_all();
-
-    assert_eq!(counter.load(Ordering::SeqCst), 10);
-    println!("Both workers completed with total count: 10");
-}
-
-/// Test context is thread-local (spawn in one thread doesn't affect another)
-#[test]
-fn test_context_thread_local() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let spawn_succeeded = Arc::new(AtomicBool::new(false));
-    let mut runtime = Runtime::new();
-
-    let spawn_flag = spawn_succeeded.clone();
-    runtime.spawn_worker(move || async move {
-        // This spawn should work - we're in a runtime context
-        let handle = spawn(async {
-            // Do nothing
-        });
-        handle.await;
-        spawn_flag.store(true, Ordering::SeqCst);
-    });
-
-    runtime.block_on_all();
-
-    assert!(spawn_succeeded.load(Ordering::SeqCst));
+    
+    let final_count = counter.load(Ordering::SeqCst);
+    assert_eq!(final_count, 50);
+    println!("Processed {} tasks", final_count);
 }

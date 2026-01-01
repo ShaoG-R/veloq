@@ -5,15 +5,70 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::io::driver::{Driver, PlatformDriver};
-use crate::runtime::join::JoinHandle;
+use crate::runtime::join::LocalJoinHandle;
 use crate::runtime::task::Task;
 
 use crate::io::buffer::BufferPool;
+use crate::io::driver::RemoteWaker;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+
+use crossbeam_queue::SegQueue;
+
+pub type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Global spawner that can schedule tasks to workers
+#[derive(Clone)]
+pub struct Spawner {
+    workers: Arc<Mutex<Vec<WorkerHandle>>>,
+    next: Arc<AtomicUsize>, // For round-robin scheduling
+}
+
+struct WorkerHandle {
+    injector: Arc<SegQueue<Job>>,
+    waker: Arc<dyn RemoteWaker>,
+}
+
+impl Spawner {
+    pub fn spawn<F>(&self, future: F) -> crate::runtime::join::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (handle, producer) = crate::runtime::join::JoinHandle::new();
+        
+        let job: Job = Box::pin(async move {
+            let output = future.await;
+            producer.set(output);
+        });
+
+        // Loop to find a worker (simple round-robin)
+        let workers = self.workers.lock().unwrap();
+        let worker_count = workers.len();
+        if worker_count == 0 {
+            panic!("No workers available in runtime");
+        }
+
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % worker_count;
+        let worker = &workers[idx];
+        
+        // Push and wake
+        worker.injector.push(job);
+        worker.waker.wake().expect("Failed to wake worker");
+
+        handle
+    }
+}
+
 
 pub struct LocalExecutor {
     driver: Rc<RefCell<PlatformDriver>>,
     queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
     buffer_pool: Rc<BufferPool>,
+    injector: Option<Arc<SegQueue<Job>>>,
+    spawner: Option<Spawner>,
 }
 
 impl LocalExecutor {
@@ -21,10 +76,33 @@ impl LocalExecutor {
         Rc::downgrade(&self.driver)
     }
 
+    /// Create a new local executor for testing (no global injection).
     pub fn new() -> Self {
-        // Initialize Driver with 1024 entries
+        Self::create_internal(None, None, None)
+    }
+    
+    /// Create a new local executor with global injection support.
+    pub fn with_injector(injector: Arc<SegQueue<Job>>, spawner: Spawner) -> Self {
+        Self::create_internal(None, Some(injector), Some(spawner))
+    }
+
+    /// Create a new local executor from an existing driver (used for worker threads).
+    pub fn from_driver(
+        driver: PlatformDriver,
+        injector: Arc<SegQueue<Job>>,
+        spawner: Spawner,
+    ) -> Self {
+        Self::create_internal(Some(driver), Some(injector), Some(spawner))
+    }
+
+    fn create_internal(
+        driver: Option<PlatformDriver>,
+        injector: Option<Arc<SegQueue<Job>>>,
+        spawner: Option<Spawner>,
+    ) -> Self {
+        // Initialize Driver with 1024 entries if not provided
         let driver = Rc::new(RefCell::new(
-            PlatformDriver::new(1024).expect("Failed to create driver"),
+            driver.unwrap_or_else(|| PlatformDriver::new(1024).expect("Failed to create driver")),
         ));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let buffer_pool = Rc::new(BufferPool::new());
@@ -34,20 +112,22 @@ impl LocalExecutor {
             .borrow_mut()
             .register_buffer_pool(&buffer_pool)
             .expect("Failed to register buffer pool");
-
+            
         Self {
             driver,
             queue,
             buffer_pool,
+            injector,
+            spawner,
         }
     }
 
-    pub fn spawn<F, T>(&self, future: F) -> JoinHandle<T>
+    pub fn spawn_local<F, T>(&self, future: F) -> LocalJoinHandle<T>
     where
         F: Future<Output = T> + 'static,
         T: 'static,
     {
-        let (handle, producer) = JoinHandle::new();
+        let (handle, producer) = LocalJoinHandle::new();
         let task = Task::new(
             async move {
                 let output = future.await;
@@ -68,6 +148,7 @@ impl LocalExecutor {
             Rc::downgrade(&self.driver),
             Rc::downgrade(&self.queue),
             Rc::downgrade(&self.buffer_pool),
+            self.spawner.clone(),
         );
 
         let mut pinned_future = Box::pin(future);
@@ -89,6 +170,20 @@ impl LocalExecutor {
             }
 
             // 2. Run ONE spawned task (not all!) - this is key for fair scheduling
+            // Also check injector if present
+            if let Some(injector) = &self.injector {
+                loop {
+                    match injector.pop() {
+                        Some(job) => {
+                            // Create local task from job
+                            let task = Task::new(job, Rc::downgrade(&self.queue));
+                            self.queue.borrow_mut().push_back(task);
+                        },
+                        None => break,
+                    }
+                }
+            }
+
             let task = self.queue.borrow_mut().pop_front();
             if let Some(task) = task {
                 task.run();
@@ -113,6 +208,7 @@ impl LocalExecutor {
 /// A Thread-per-Core Runtime that manages multiple independent worker threads.
 pub struct Runtime {
     handles: Vec<std::thread::JoinHandle<()>>,
+    workers: Arc<Mutex<Vec<WorkerHandle>>>,
 }
 
 impl Runtime {
@@ -120,6 +216,7 @@ impl Runtime {
     pub fn new() -> Self {
         Self {
             handles: Vec::new(),
+            workers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -132,11 +229,65 @@ impl Runtime {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
+        let injector = Arc::new(SegQueue::new());
+        
+        // Solution 2: Executor creates driver. Signal back waker.
+        let (waker_tx, waker_rx) = std::sync::mpsc::channel();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        
+        let workers = self.workers.clone();
+        
+        // This spawner shares the same worker list
+        let spawner = Spawner {
+            workers: workers.clone(),
+            next: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let injector_clone = injector.clone();
         let handle = std::thread::spawn(move || {
-            let executor = LocalExecutor::new();
+            let executor = LocalExecutor::with_injector(injector_clone, spawner);
+            
+            // Send waker back to main thread
+            let waker = executor.driver.borrow().create_waker();
+            waker_tx.send(waker).unwrap();
+
+            // Wait for main thread to register us
+            // This prevents "No workers available" race if the worker immediately spawns
+            ack_rx.recv().expect("Failed to receive ack from main thread");
+
             executor.block_on(future_factory());
         });
+        
+        let waker = waker_rx.recv().expect("Failed to receive waker from worker");
+        
         self.handles.push(handle);
+        workers.lock().unwrap().push(WorkerHandle { 
+            injector,
+            waker,
+        });
+
+        // Notify worker it can start
+        ack_tx.send(()).unwrap();
+    }
+
+    pub fn spawner(&self) -> Spawner {
+        Spawner {
+            workers: self.workers.clone(),
+            next: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Spawn a future onto the runtime (round-robin)
+    pub fn spawn<Fut>(&self, future: Fut) -> crate::runtime::join::JoinHandle<Fut::Output>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        // Simple temporary spawner just for this call
+        // Note: For frequent calls, one should cache spawner or use context access.
+        // But Runtime::spawn() is typically top-level.
+        let spawner = self.spawner();
+        spawner.spawn(future)
     }
 
     /// Wait for all worker threads to complete.

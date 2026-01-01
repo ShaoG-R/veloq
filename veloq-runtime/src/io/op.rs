@@ -47,6 +47,7 @@ pub enum IoResources {
     Connect(Connect),
     SendTo(SendTo),
     RecvFrom(RecvFrom),
+    Wakeup(Wakeup),
     // Placeholder for when we have no resource back yet or it's empty
     None,
 }

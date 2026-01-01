@@ -4,9 +4,9 @@ pub mod io;
 pub mod runtime;
 
 // Re-export key functions for convenient access
-pub use runtime::{current_buffer_pool, current_driver, spawn, yield_now};
+pub use runtime::{current_buffer_pool, current_driver, spawn, spawn_local, yield_now};
 pub use runtime::LocalExecutor;
-pub use runtime::JoinHandle;
+pub use runtime::{LocalJoinHandle, JoinHandle};
 
 
 #[cfg(test)]

@@ -171,3 +171,18 @@ impl IoOp for RecvFrom {
         }
     }
 }
+
+pub struct Wakeup;
+
+impl IoOp for Wakeup {
+    fn into_resource(self) -> IoResources {
+        IoResources::Wakeup(self)
+    }
+
+    fn from_resource(res: IoResources) -> Self {
+        match res {
+            IoResources::Wakeup(r) => r,
+            _ => panic!("Resource type mismatch for Wakeup"),
+        }
+    }
+}

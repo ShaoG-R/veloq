@@ -9,8 +9,10 @@ use std::future::Future;
 use std::rc::{Rc, Weak};
 
 use crate::io::driver::PlatformDriver;
-use crate::runtime::join::JoinHandle;
+use crate::runtime::join::{LocalJoinHandle, JoinHandle};
 use crate::runtime::task::Task;
+use crate::runtime::executor::Spawner;
+
 
 use crate::io::buffer::BufferPool;
 
@@ -25,6 +27,7 @@ struct ExecutorContext {
     driver: Weak<RefCell<PlatformDriver>>,
     queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     buffer_pool: Weak<BufferPool>,
+    spawner: Option<Spawner>,
 }
 
 /// RAII guard that sets the context on creation and clears it on drop.
@@ -45,12 +48,14 @@ pub(crate) fn enter(
     driver: Weak<RefCell<PlatformDriver>>,
     queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     buffer_pool: Weak<BufferPool>,
+    spawner: Option<Spawner>,
 ) -> ContextGuard {
     CONTEXT.with(|ctx| {
         *ctx.borrow_mut() = Some(ExecutorContext {
             driver,
             queue,
             buffer_pool,
+            spawner,
         });
     });
     ContextGuard { _private: () }
@@ -67,7 +72,33 @@ pub(crate) fn enter(
 ///     println!("Hello from spawned task!");
 /// });
 /// ```
-pub fn spawn<F, T>(future: F) -> JoinHandle<T>
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    CONTEXT.with(|ctx| {
+        let ctx = ctx.borrow();
+        let spawner = ctx.as_ref()
+            .and_then(|c| c.spawner.as_ref())
+            .expect("spawn() called outside of runtime context or spawner not available");
+
+        spawner.spawn(future)
+    })
+}
+
+/// Spawn a new task on the current executor.
+///
+/// # Panics
+/// Panics if called outside of a runtime context (i.e., not within block_on).
+///
+/// # Example
+/// ```ignore
+/// runtime::spawn(async {
+///     println!("Hello from spawned task!");
+/// });
+/// ```
+pub fn spawn_local<F, T>(future: F) -> LocalJoinHandle<T>
 where
     F: Future<Output = T> + 'static,
     T: 'static,
@@ -80,7 +111,7 @@ where
 
         let queue = ctx.queue.upgrade().expect("executor has been dropped");
 
-        let (handle, producer) = JoinHandle::new();
+        let (handle, producer) = LocalJoinHandle::new();
         let task = Task::new(
             async move {
                 let output = future.await;
