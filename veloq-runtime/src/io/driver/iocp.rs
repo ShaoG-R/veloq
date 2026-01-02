@@ -362,12 +362,10 @@ impl Driver for IocpDriver {
             match op.platform_data {
                 PlatformData::Timer(_) => true,
                 PlatformData::None => {
-                    // For IO ops, we only remove if completion happened.
-                    // But if we just cancelled, we wait for CancelIo completion?
-                    // Usually yes. But if it was never submitted?
-                    // We assume it was submitted if it is in None state with resources.
-                    // So we do NOT remove immediately for IO.
-                    false
+                    // For IO ops, we can remove if the result is already available
+                    // (either completed or failed submission).
+                    // If result is None, we must wait for the completion packet.
+                    op.result.is_some()
                 }
             }
         } else {
@@ -516,17 +514,12 @@ impl Drop for IocpDriver {
         // This is a trade-off: safe shutdown vs hanging shutdown. Safe is preferred here.
 
         let mut ops_drained = 0;
-        let start = Instant::now();
 
         while ops_drained < pending_count {
             // Failsafe timeout: if we stuck for too long (e.g. 3s), we panic or leak?
             // Leaking is better than UAF. But here we try to wait.
-            if start.elapsed() > Duration::from_secs(5) {
-                // Emergency bail out: ensure we don't UAF by leaking the memory?
-                // But we are in Drop, so `self.ops` is about to be freed.
-                // We really should wait. Logging might be good here.
-                // println!("WARNING: IocpDriver stuck in drop waiting for completions.");
-            }
+            // We wait indefinitely for completions to avoid Use-After-Free.
+            // If the kernel never returns the completion, we hang, which is safer than memory corruption.
 
             let mut bytes = 0;
             let mut key = 0;
