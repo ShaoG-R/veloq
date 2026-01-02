@@ -57,6 +57,11 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
         self.slab.is_empty()
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut OpEntry<Op, P>)> {
+        self.slab.iter_mut()
+    }
+
     pub fn poll_op(
         &mut self,
         user_data: usize,

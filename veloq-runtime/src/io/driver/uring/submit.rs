@@ -170,13 +170,13 @@ impl UringSubmit for UringAccept {
             IoFd::Raw(fd) => opcode::Accept::new(
                 types::Fd(fd as i32),
                 self.addr.as_mut_ptr() as *mut _,
-                self.addr_len.as_mut() as *mut _,
+                &mut self.addr_len as *mut _,
             )
             .build(),
             IoFd::Fixed(idx) => opcode::Accept::new(
                 types::Fixed(idx),
                 self.addr.as_mut_ptr() as *mut _,
-                self.addr_len.as_mut() as *mut _,
+                &mut self.addr_len as *mut _,
             )
             .build(),
         }

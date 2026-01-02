@@ -228,7 +228,9 @@ impl IocpSubmit for IocpAccept {
         ext: &Extensions,
         registered_files: &[Option<HANDLE>],
     ) -> io::Result<SubmissionResult> {
-        let accept_socket = self.accept_socket;
+        let accept_socket = self
+            .accept_socket
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "accept_socket missing"))?;
 
         // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
         const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
@@ -271,7 +273,9 @@ impl IocpSubmit for IocpAccept {
     }
 
     fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
-        let accept_socket = self.accept_socket;
+        let accept_socket = self
+            .accept_socket
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "accept_socket missing"))?;
 
         let listen_handle = self
             .fd
@@ -462,7 +466,7 @@ impl_wsa_op!(
     |op: &mut Self, handle, bytes, overlapped| unsafe {
         WSASendTo(
             handle as SOCKET,
-            op.wsabuf.as_ref(),
+            &op.wsabuf,
             1,
             bytes,
             0,
@@ -483,12 +487,12 @@ impl_wsa_op!(
     |op: &mut Self, handle, bytes, overlapped| unsafe {
         WSARecvFrom(
             handle as SOCKET,
-            op.wsabuf.as_ref(),
+            &op.wsabuf,
             1,
             bytes,
-            op.flags.as_mut(),
+            &mut op.flags,
             op.addr.as_mut_ptr() as *mut SOCKADDR,
-            op.addr_len.as_mut(),
+            &mut op.addr_len,
             overlapped as *mut _,
             None,
         )

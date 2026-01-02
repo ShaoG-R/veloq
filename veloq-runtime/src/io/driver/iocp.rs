@@ -497,6 +497,76 @@ impl Driver for IocpDriver {
 
 impl Drop for IocpDriver {
     fn drop(&mut self) {
+        // 1. Cancel all pending operations
+        let mut pending_count = 0;
+        for (_user_data, op) in self.ops.iter_mut() {
+            // We only care about operations that have resources (submitted) AND have no result yet.
+            // If result is Some, the completion packet was already processed, so don't wait for it.
+            if op.resources.is_some() && op.result.is_none() {
+                if !op.cancelled {
+                    // Try to CancelIoEx
+                    if let Some(res) = op.resources.as_mut() {
+                        // We only attempt to cancel if we can resolve the handle.
+                        // If we can't resolve (e.g. invalid handle), good luck,
+                        // but we still count it as pending because the Overlapped is out there.
+                        if let Some(fd) = res.get_fd() {
+                            if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
+                                if let Some(entry) = res.entry_mut() {
+                                    unsafe {
+                                        use windows_sys::Win32::System::IO::CancelIoEx;
+                                        let _ =
+                                            CancelIoEx(handle, &entry.inner as *const _ as *mut _);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                pending_count += 1;
+            }
+        }
+
+        // 2. Wait for all pending operations to drain
+        // We do this by calling GetQueuedCompletionStatus until we see enough completions.
+        // We rely on the fact that CancelIoEx will trigger a completion packet (usually with ERROR_OPERATION_ABORTED).
+        // Note: For 'Offload' tasks in thread pool, they might not be cancellable via CancelIoEx,
+        // but our Offload implementation posts a completion status when done.
+        // We might be waiting a while if a blocking task is stuck.
+        // This is a trade-off: safe shutdown vs hanging shutdown. Safe is preferred here.
+
+        let mut ops_drained = 0;
+        let start = Instant::now();
+
+        while ops_drained < pending_count {
+            // Failsafe timeout: if we stuck for too long (e.g. 3s), we panic or leak?
+            // Leaking is better than UAF. But here we try to wait.
+            if start.elapsed() > Duration::from_secs(5) {
+                // Emergency bail out: ensure we don't UAF by leaking the memory?
+                // But we are in Drop, so `self.ops` is about to be freed.
+                // We really should wait. Logging might be good here.
+                // println!("WARNING: IocpDriver stuck in drop waiting for completions.");
+            }
+
+            let mut bytes = 0;
+            let mut key = 0;
+            let mut overlapped = std::ptr::null_mut();
+
+            let res = unsafe {
+                GetQueuedCompletionStatus(self.port, &mut bytes, &mut key, &mut overlapped, 100)
+            };
+
+            // If we got a packet (overlapped != null), it counts as a completion
+            if !overlapped.is_null() {
+                ops_drained += 1;
+            } else if res == 0 {
+                let err = unsafe { GetLastError() };
+                if err == WAIT_TIMEOUT {
+                    continue;
+                }
+                // Some other error, but no packet.
+            }
+        }
+
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.port) };
     }
 }

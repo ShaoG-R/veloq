@@ -50,7 +50,7 @@ fn test_iocp_accept() {
     let accept_op = Accept::into_op(listener_handle, acceptor_handle);
     // Convert to IocpAccept and set accept_socket
     let mut iocp_accept: IocpAccept = accept_op.into();
-    iocp_accept.accept_socket = acceptor_handle;
+    iocp_accept.accept_socket = Some(acceptor_handle);
 
     let iocp_op = IocpOp::Accept {
         data: iocp_accept,
@@ -87,7 +87,9 @@ fn test_iocp_accept() {
                             if let Some(fd) = op.fd.raw() {
                                 windows_sys::Win32::Foundation::CloseHandle(fd as _);
                             }
-                            windows_sys::Win32::Foundation::CloseHandle(op.accept_socket as _);
+                            if let Some(s) = op.accept_socket {
+                                windows_sys::Win32::Foundation::CloseHandle(s as _);
+                            }
                         }
                         break;
                     }

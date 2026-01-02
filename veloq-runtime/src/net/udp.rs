@@ -1,6 +1,6 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
-use crate::io::op::{Op, RecvFrom, SendTo, RawHandle, IoFd};
+use crate::io::op::{IoFd, Op, RawHandle, RecvFrom, SendTo};
 use crate::io::socket::Socket;
 use std::cell::RefCell;
 use std::io;
@@ -45,7 +45,11 @@ impl UdpSocket {
         })
     }
 
-    pub async fn send_to(&self, buf: FixedBuf, target: SocketAddr) -> (io::Result<usize>, FixedBuf) {
+    pub async fn send_to(
+        &self,
+        buf: FixedBuf,
+        target: SocketAddr,
+    ) -> (io::Result<usize>, FixedBuf) {
         let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(target);
         let op = SendTo {
             fd: IoFd::Raw(self.fd),
@@ -61,7 +65,7 @@ impl UdpSocket {
     pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
         let addr_buf_size = 128usize;
         let addr = vec![0u8; addr_buf_size].into_boxed_slice();
-        let addr_len = Box::new(addr_buf_size as u32);
+        let addr_len = addr_buf_size as u32;
 
         let op = RecvFrom {
             fd: IoFd::Raw(self.fd),
@@ -74,7 +78,7 @@ impl UdpSocket {
 
         match res {
             Ok(n) => {
-                let len = *op_back.addr_len as usize;
+                let len = op_back.addr_len as usize;
                 let addr = crate::io::socket::to_socket_addr(&op_back.addr[..len])
                     .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
                 (Ok((n, addr)), op_back.buf)
@@ -89,7 +93,8 @@ impl UdpSocket {
         #[cfg(unix)]
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as i32)) };
         #[cfg(windows)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as *mut std::ffi::c_void)) };
+        let socket =
+            unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as *mut std::ffi::c_void)) };
         socket.local_addr()
     }
 }

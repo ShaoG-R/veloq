@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 pub struct UringAccept {
     pub fd: IoFd,
     pub addr: Box<[u8]>,
-    pub addr_len: Box<u32>,
+    pub addr_len: u32,
     pub remote_addr: Option<SocketAddr>,
 }
 
@@ -128,7 +128,7 @@ pub struct UringRecvFrom {
     pub fd: IoFd,
     pub buf: FixedBuf,
     pub addr: Box<[u8]>,
-    pub addr_len: Box<u32>,
+    pub addr_len: u32,
     pub msghdr: Box<libc::msghdr>,
     pub iovec: Box<libc::iovec>,
 }
@@ -137,7 +137,7 @@ impl UringRecvFrom {
     pub fn new(fd: RawHandle, mut buf: FixedBuf) -> Self {
         let addr_buf_size = std::mem::size_of::<libc::sockaddr_storage>();
         let addr = vec![0u8; addr_buf_size].into_boxed_slice();
-        let addr_len = Box::new(addr_buf_size as u32);
+        let addr_len = addr_buf_size as u32;
 
         let mut iovec = Box::new(libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut _,
@@ -145,7 +145,7 @@ impl UringRecvFrom {
         });
         let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
         msghdr.msg_name = addr.as_ptr() as *mut _;
-        msghdr.msg_namelen = *addr_len;
+        msghdr.msg_namelen = addr_len;
         msghdr.msg_iov = iovec.as_mut() as *mut _;
         msghdr.msg_iovlen = 1;
 
@@ -173,7 +173,7 @@ impl From<RecvFrom> for UringRecvFrom {
         });
         let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
         msghdr.msg_name = recv_from.addr.as_ptr() as *mut _;
-        msghdr.msg_namelen = *recv_from.addr_len;
+        msghdr.msg_namelen = recv_from.addr_len;
         msghdr.msg_iov = iovec.as_mut() as *mut _;
         msghdr.msg_iovlen = 1;
 

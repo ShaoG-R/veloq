@@ -248,7 +248,7 @@ pub struct Accept {
     /// Buffer for storing the remote address.
     pub addr: Box<[u8]>,
     /// Length of the address buffer.
-    pub addr_len: Box<u32>,
+    pub addr_len: u32,
     /// Parsed remote address (populated after completion).
     pub remote_addr: Option<std::net::SocketAddr>,
     /// Pre-allocated accept socket (Windows only, required for AcceptEx).
@@ -272,7 +272,7 @@ pub struct RecvFrom {
     /// Buffer for storing the source address.
     pub addr: Box<[u8]>,
     /// Length of the address (input: buffer size, output: actual size).
-    pub addr_len: Box<u32>,
+    pub addr_len: u32,
 }
 
 // ============================================================================
@@ -311,7 +311,7 @@ impl OpLifecycle for Accept {
         let buf_size = 288; // (sizeof(sockaddr_storage) + 16) * 2 for AcceptEx
 
         let addr_buf = vec![0u8; buf_size].into_boxed_slice();
-        let addr_len = Box::new(buf_size as u32);
+        let addr_len = buf_size as u32;
 
         #[cfg(unix)]
         {

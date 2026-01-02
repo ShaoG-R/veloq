@@ -165,6 +165,28 @@ impl<T> IndexMut<usize> for StableSlab<T> {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl<T> StableSlab<T> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
+        self.pages
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(page_idx, page)| {
+                page.iter_mut()
+                    .enumerate()
+                    .map(move |(slot_idx, slot)| (page_idx, slot_idx, slot))
+            })
+            .filter_map(|(page_idx, slot_idx, slot)| {
+                if let Slot::Occupied(val) = slot {
+                    Some(((page_idx << PAGE_SHIFT) | slot_idx, val))
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +266,24 @@ mod tests {
         }
 
         assert_eq!(slab.len(), 1500);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_iter_mut() {
+        let mut slab = StableSlab::new();
+        slab.insert(1);
+        let k2 = slab.insert(2);
+        slab.insert(3);
+        slab.remove(k2);
+
+        let mut count = 0;
+        let mut sum = 0;
+        for (_k, v) in slab.iter_mut() {
+            count += 1;
+            sum += *v;
+        }
+        assert_eq!(count, 2);
+        assert_eq!(sum, 4);
     }
 }

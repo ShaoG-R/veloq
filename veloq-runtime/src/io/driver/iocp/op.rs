@@ -25,9 +25,9 @@ use windows_sys::Win32::Networking::WinSock::WSABUF;
 pub struct IocpAccept {
     pub fd: IoFd,
     pub addr: Box<[u8]>,
-    pub addr_len: Box<u32>,
+    pub addr_len: u32,
     /// Pre-created socket for the accepted connection (Windows-specific).
-    pub accept_socket: RawHandle,
+    pub accept_socket: Option<RawHandle>,
     pub remote_addr: Option<SocketAddr>,
 }
 
@@ -38,7 +38,7 @@ impl From<Accept> for IocpAccept {
             fd: accept.fd,
             addr: accept.addr,
             addr_len: accept.addr_len,
-            accept_socket: accept.accept_socket,
+            accept_socket: Some(accept.accept_socket),
             remote_addr: accept.remote_addr,
         }
     }
@@ -46,12 +46,43 @@ impl From<Accept> for IocpAccept {
 
 impl From<IocpAccept> for Accept {
     fn from(iocp_accept: IocpAccept) -> Self {
-        Self {
-            fd: iocp_accept.fd,
-            addr: iocp_accept.addr,
-            addr_len: iocp_accept.addr_len,
-            remote_addr: iocp_accept.remote_addr,
-            accept_socket: iocp_accept.accept_socket,
+        unsafe {
+            // We need to move fields out of a type that implements Drop.
+            // We use ptr::read to take ownership of fields, and then mem::forget the container
+            // so its Drop implementation (which closes the socket) is NOT called.
+            // The socket ownership is transferred to the resulting Accept struct.
+
+            let fd = iocp_accept.fd; // Copy
+            let addr = std::ptr::read(&iocp_accept.addr);
+            let addr_len = iocp_accept.addr_len; // Copy
+            let remote_addr = iocp_accept.remote_addr; // Copy
+
+            // We take the socket.
+            // Note: iocp_accept.accept_socket is Option<RawHandle>.
+            // We read the Option.
+            let accept_socket_opt = std::ptr::read(&iocp_accept.accept_socket);
+
+            // Prevent iocp_accept destructor from running
+            std::mem::forget(iocp_accept);
+
+            Self {
+                fd,
+                addr,
+                addr_len,
+                remote_addr,
+                accept_socket: accept_socket_opt
+                    .expect("accept_socket missing in completion conversion"),
+            }
+        }
+    }
+}
+
+impl Drop for IocpAccept {
+    fn drop(&mut self) {
+        if let Some(socket) = self.accept_socket {
+            unsafe {
+                windows_sys::Win32::Networking::WinSock::closesocket(socket as _);
+            }
         }
     }
 }
@@ -63,7 +94,7 @@ pub struct IocpSendTo {
     pub buf: FixedBuf,
     pub addr: Box<[u8]>,
     pub addr_len: u32,
-    pub wsabuf: Box<WSABUF>,
+    pub wsabuf: WSABUF,
 }
 
 impl IocpSendTo {
@@ -72,10 +103,10 @@ impl IocpSendTo {
         let addr = raw_addr.into_boxed_slice();
         let addr_len = raw_addr_len as u32;
 
-        let wsabuf = Box::new(WSABUF {
+        let wsabuf = WSABUF {
             len: buf.len() as u32,
             buf: buf.as_slice().as_ptr() as *mut u8,
-        });
+        };
 
         Self {
             fd: IoFd::Raw(fd),
@@ -89,10 +120,10 @@ impl IocpSendTo {
 
 impl From<SendTo> for IocpSendTo {
     fn from(send_to: SendTo) -> Self {
-        let wsabuf = Box::new(WSABUF {
+        let wsabuf = WSABUF {
             len: send_to.buf.len() as u32,
             buf: send_to.buf.as_slice().as_ptr() as *mut u8,
-        });
+        };
 
         Self {
             fd: send_to.fd,
@@ -121,9 +152,9 @@ pub struct IocpRecvFrom {
     pub fd: IoFd,
     pub buf: FixedBuf,
     pub addr: Box<[u8]>,
-    pub addr_len: Box<i32>,
-    pub flags: Box<u32>,
-    pub wsabuf: Box<WSABUF>,
+    pub addr_len: i32,
+    pub flags: u32,
+    pub wsabuf: WSABUF,
 }
 
 impl IocpRecvFrom {
@@ -131,12 +162,12 @@ impl IocpRecvFrom {
         let addr_buf_size = 128usize;
         let addr = vec![0u8; addr_buf_size].into_boxed_slice();
 
-        let addr_len = Box::new(addr_buf_size as i32);
-        let wsabuf = Box::new(WSABUF {
+        let addr_len = addr_buf_size as i32;
+        let wsabuf = WSABUF {
             len: buf.capacity() as u32,
             buf: buf.as_mut_ptr(),
-        });
-        let flags = Box::new(0u32);
+        };
+        let flags = 0u32;
 
         Self {
             fd: IoFd::Raw(fd),
@@ -149,24 +180,24 @@ impl IocpRecvFrom {
     }
 
     pub fn get_addr_len(&self) -> usize {
-        *self.addr_len as usize
+        self.addr_len as usize
     }
 }
 
 impl From<RecvFrom> for IocpRecvFrom {
     fn from(recv_from: RecvFrom) -> Self {
         let mut buf = recv_from.buf;
-        let wsabuf = Box::new(WSABUF {
+        let wsabuf = WSABUF {
             len: buf.capacity() as u32,
             buf: buf.as_mut_ptr(),
-        });
+        };
 
         Self {
             fd: recv_from.fd,
             buf,
             addr: recv_from.addr,
-            addr_len: Box::new(*recv_from.addr_len as i32),
-            flags: Box::new(0u32),
+            addr_len: recv_from.addr_len as i32,
+            flags: 0u32,
             wsabuf,
         }
     }
@@ -178,7 +209,7 @@ impl From<IocpRecvFrom> for RecvFrom {
             fd: iocp_recv_from.fd,
             buf: iocp_recv_from.buf,
             addr: iocp_recv_from.addr,
-            addr_len: Box::new(*iocp_recv_from.addr_len as u32),
+            addr_len: iocp_recv_from.addr_len as u32,
         }
     }
 }
