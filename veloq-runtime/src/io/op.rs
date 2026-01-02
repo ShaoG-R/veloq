@@ -138,8 +138,14 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
                 op.state = State::Submitted;
 
                 // Register waker immediately by polling the op
-                let _ = driver.poll_op(user_data, cx);
-                Poll::Pending
+                match driver.poll_op(user_data, cx) {
+                    Poll::Ready((res, driver_op)) => {
+                        op.state = State::Completed;
+                        let data = T::from_platform_op(driver_op);
+                        Poll::Ready((res, data))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
             State::Submitted => {
                 let driver_rc = op.driver.upgrade().expect("Driver has been dropped");

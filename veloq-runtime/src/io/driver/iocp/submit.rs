@@ -319,7 +319,6 @@ impl IocpSubmit for IocpOp {
                 let accept_socket = op.accept_socket as HANDLE;
 
                 unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
-                unsafe { CreateIoCompletionPort(accept_socket, port, 0, 0) };
 
                 // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
                 const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
