@@ -13,7 +13,6 @@ use crate::io::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, OpAbi, Open, Operation, ReadFixed,
     Recv, RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
-use std::ffi::CString;
 use std::net::SocketAddr;
 
 // ============================================================================
@@ -60,9 +59,7 @@ impl UringRecvFromExtras {
 }
 
 /// Extras for Open: needs CString path.
-pub struct UringOpenExtras {
-    pub path: CString,
-}
+pub struct UringOpenExtras;
 
 /// Extras for Timeout: needs timespec.
 pub struct UringTimeoutExtras {
@@ -193,13 +190,9 @@ impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for RecvFrom<P> {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Open {
+impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Open<P> {
     fn into_platform_op(self) -> UringOp<P> {
-        // Convert the generic path (Vec<u8> -> CString)
-        // Note generically we store raw bytes. On Linux it should be null-terminated or we add it.
-        // CString::new checks for internal nulls and adds one at end.
-        let path = CString::new(self.path.clone()).unwrap_or_else(|_| CString::new("").unwrap());
-        UringOp::Open(self, UringOpenExtras { path })
+        UringOp::Open(self, UringOpenExtras)
     }
 
     fn from_platform_op(op: UringOp<P>) -> Self {

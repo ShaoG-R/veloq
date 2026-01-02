@@ -409,8 +409,8 @@ impl<P: BufPool> IocpSubmit for IocpOp<P> {
                 Ok(SubmissionResult::Pending)
             }
 
-            IocpOp::Open(op, extras) => {
-                let path = extras.path.clone();
+            IocpOp::Open(op, _extras) => {
+                let path_ptr = op.path.as_slice().as_ptr() as usize;
                 let flags = op.flags;
                 let mode = op.mode;
 
@@ -422,7 +422,7 @@ impl<P: BufPool> IocpSubmit for IocpOp<P> {
                     overlapped: overlapped as usize,
                 };
                 let task = BlockingTask::Open {
-                    path,
+                    path_ptr,
                     flags,
                     mode,
                     completion,

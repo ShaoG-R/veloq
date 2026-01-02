@@ -69,7 +69,6 @@ pub struct IocpRecvFromExtras {
 
 pub struct IocpOpenExtras {
     pub entry: OverlappedEntry,
-    pub path: Vec<u16>,
 }
 
 pub struct IocpWakeupExtras {
@@ -289,19 +288,10 @@ impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for RecvFrom<P> {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Open {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Open<P> {
     fn into_platform_op(self) -> IocpOp<P> {
-        // The Open struct definition states that on Windows, path is Vec<u16> bytes (serialized).
-        // Reconstruct Vec<u16> from Vec<u8>.
-        let path: Vec<u16> = self
-            .path
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-
         let extras = IocpOpenExtras {
             entry: OverlappedEntry::new(0),
-            path,
         };
         IocpOp::Open(self, extras)
     }

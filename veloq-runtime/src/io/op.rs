@@ -217,11 +217,11 @@ pub struct Connect {
 /// Open a file.
 /// Path representation is platform-agnostic (raw bytes).
 #[derive(Debug)]
-pub struct Open {
-    /// Path as raw bytes. Interpretation is platform-specific:
-    /// - Unix: UTF-8 encoded, null-terminated (CString)
-    /// - Windows: UTF-16 encoded, null-terminated (Vec<u16>)
-    pub path: Vec<u8>,
+pub struct Open<P: BufPool> {
+    /// Path stored in a fixed buffer.
+    /// - Unix: UTF-8 encoded, null-terminated.
+    /// - Windows: UTF-16 encoded, null-terminated (stored as bytes).
+    pub path: FixedBuf<P>,
     pub flags: i32,
     pub mode: u32,
 }
@@ -294,10 +294,6 @@ pub struct Fallocate {
     pub offset: u64,
     pub len: u64,
 }
-
-// ============================================================================
-// OpLifecycle Implementations
-// ============================================================================
 
 // ============================================================================
 // OpLifecycle Implementations
@@ -428,7 +424,7 @@ pub enum Operation<Abi: OpAbi, P: BufPool> {
     Connect(Connect, Abi::Connect),
     RecvFrom(RecvFrom<P>, Abi::RecvFrom),
     SendTo(SendTo<P>, Abi::SendTo),
-    Open(Open, Abi::Open),
+    Open(Open<P>, Abi::Open),
     Close(Close, Abi::Close),
     Fsync(Fsync, Abi::Fsync),
     SyncFileRange(SyncFileRange, Abi::SyncFileRange),

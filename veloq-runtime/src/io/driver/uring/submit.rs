@@ -332,8 +332,8 @@ impl<P: BufPool> UringSubmit for UringOp<P> {
                 }
             }
 
-            UringOp::Open(op, extras) => {
-                let path_ptr = extras.path.as_ptr();
+            UringOp::Open(op, _extras) => {
+                let path_ptr = op.path.as_slice().as_ptr() as *const _;
                 // OpenAt: dir_fd, path, flags, mode
                 // We use AT_FDCWD for dir_fd to support absolute and relative paths from CWD.
                 opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)

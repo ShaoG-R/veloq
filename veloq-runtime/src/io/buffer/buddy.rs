@@ -397,16 +397,17 @@ impl BufPool for BuddyPool {
 
     unsafe fn dealloc_mem(&self, params: DeallocParams) {
         let mut inner = self.inner.borrow_mut();
-        // 如果 params.cap 不匹配任何 BufferSize，这可能会有问题。
-        // 但是 FixedBuf 是通过 alloc 分配的，所以 cap 应该是合法的。
         if let Some(buf_size) = BufferSize::best_fit(params.cap) {
-            // double check capacity logic?
-            // best_fit rounds up. If underlying logic in alloc used exact BufferSize,
-            // then best_fit(allocated_cap) should return the same BufferSize.
+            debug_assert!(
+                params.cap == buf_size.size(),
+                "Invalid capacity for deallocation: {} != {}",
+                params.cap,
+                buf_size.size()
+            );
             unsafe { inner.dealloc(params.ptr, buf_size) };
         } else {
-            // This suggests corruption or memory managed outside Buddy system if size is invalid
-            // Ideally we panic or log, but dealloc_mem is unsafe.
+            #[cfg(debug_assertions)]
+            panic!("Invalid capacity for deallocation: {}", params.cap);
         }
     }
 

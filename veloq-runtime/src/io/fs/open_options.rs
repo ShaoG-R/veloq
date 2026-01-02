@@ -1,5 +1,5 @@
 use crate::io::{
-    buffer::BufPool,
+    buffer::{AllocResult, BufPool, FixedBuf},
     op::{Op, Open},
 };
 use std::path::Path;
@@ -77,7 +77,7 @@ impl OpenOptions {
         context: &crate::runtime::context::RuntimeContext<P>,
     ) -> std::io::Result<super::file::File<P>> {
         // 1. 根据不同平台生成对应的 Op 参数
-        let op = self.build_op(path.as_ref())?;
+        let op = self.build_op(path.as_ref(), context).await?;
 
         // 2. 提交给 runtime (显式传递 driver)
         let driver = context.driver();
@@ -96,11 +96,51 @@ impl OpenOptions {
     // Unix 平台实现
     // ==========================================
     #[cfg(unix)]
-    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+    async fn build_op<P: BufPool>(
+        &self,
+        path: &Path,
+        context: &crate::runtime::context::RuntimeContext<P>,
+    ) -> std::io::Result<Open<P>> {
         use std::os::unix::ffi::OsStrExt;
 
-        // 路径转换
-        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let path_bytes = path.as_os_str().as_bytes();
+        // ensure null termination
+        let len = path_bytes.len() + 1;
+
+        let pool = context
+            .buffer_pool()
+            .upgrade()
+            .expect("runtime dropped")
+            .as_ref()
+            .clone();
+
+        let mut buf = match pool.alloc_mem(len) {
+            AllocResult::Allocated {
+                ptr,
+                cap,
+                global_index,
+                context,
+            } => FixedBuf::new(pool.clone(), ptr, cap, global_index, context),
+            AllocResult::Failed => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "buf pool exhausted",
+                ));
+            }
+        };
+
+        // Write path + null
+        let slice = buf.as_slice_mut();
+        if slice.len() < len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "path too long for buffer",
+            ));
+        }
+        slice[..len - 1].copy_from_slice(path_bytes);
+        slice[len - 1] = 0;
+
+        buf.set_len(len);
 
         // 标志位计算
         let mut flags = if self.read && !self.write && !self.append {
@@ -125,7 +165,7 @@ impl OpenOptions {
         flags |= self.custom_flags;
 
         Ok(Open {
-            path: path_c.into_bytes(),
+            path: buf,
             flags,
             mode: self.mode,
         })
@@ -135,16 +175,64 @@ impl OpenOptions {
     // Windows 平台实现
     // ==========================================
     #[cfg(windows)]
-    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+    async fn build_op<P: BufPool>(
+        &self,
+        path: &Path,
+        context: &crate::runtime::context::RuntimeContext<P>,
+    ) -> std::io::Result<Open<P>> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 
-        // 1. 处理路径
-        let mut path_w: Vec<u16> = path.as_os_str().encode_wide().collect();
-        path_w.push(0);
+        // 1. Process Path (UTF-16 + Null)
+        let path_w: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let len_bytes = path_w.len() * 2;
 
-        // 2. 处理 Access (读写权限)
+        let pool = context
+            .buffer_pool()
+            .upgrade()
+            .expect("runtime dropped")
+            .as_ref()
+            .clone();
+
+        let mut buf = match pool.alloc_mem(len_bytes) {
+            AllocResult::Allocated {
+                ptr,
+                cap,
+                global_index,
+                context,
+            } => FixedBuf::new(pool.clone(), ptr, cap, global_index, context),
+            AllocResult::Failed => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "buf pool exhausted",
+                ));
+            }
+        };
+
+        let slice = buf.as_slice_mut();
+        if slice.len() < len_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "path too long for buffer",
+            ));
+        }
+
+        // Copy u16s to u8 buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                path_w.as_ptr() as *const u8,
+                slice.as_mut_ptr(),
+                len_bytes,
+            );
+            buf.set_len(len_bytes);
+        }
+
+        // 2. Process Access
         let mut access = 0;
         if self.read {
             access |= GENERIC_READ;
@@ -154,9 +242,9 @@ impl OpenOptions {
         }
         if self.append {
             access |= FILE_APPEND_DATA;
-        } // 注意: append在windows下比较特殊
+        }
 
-        // 3. Disposition (创建/打开策略) - 使用 match 模式匹配更清晰
+        // 3. Disposition
         const OPEN_EXISTING: u32 = 3;
         const CREATE_NEW: u32 = 1;
         const CREATE_ALWAYS: u32 = 2;
@@ -164,21 +252,17 @@ impl OpenOptions {
         const TRUNCATE_EXISTING: u32 = 5;
 
         let disposition = match (self.create, self.create_new, self.truncate) {
-            (_, true, _) => CREATE_NEW,            // create_new 优先级最高
-            (true, _, true) => CREATE_ALWAYS,      // create + truncate = 覆盖创建
-            (true, _, false) => OPEN_ALWAYS,       // create = 不存在建，存在开
-            (false, _, true) => TRUNCATE_EXISTING, // truncate = 必须存在并截断
-            (false, _, false) => OPEN_EXISTING,    // 默认 = 必须存在
+            (_, true, _) => CREATE_NEW,
+            (true, _, true) => CREATE_ALWAYS,
+            (true, _, false) => OPEN_ALWAYS,
+            (false, _, true) => TRUNCATE_EXISTING,
+            (false, _, false) => OPEN_EXISTING,
         };
 
-        // Convert Vec<u16> to Vec<u8> for storage
-        // The platform driver will convert back to Vec<u16> when needed
-        let path_bytes: Vec<u8> = path_w.iter().flat_map(|&c| c.to_le_bytes()).collect();
-
         Ok(Open {
-            path: path_bytes,
-            flags: access as i32, // 对应 Win32 dwDesiredAccess
-            mode: disposition,    // 对应 Win32 dwCreationDisposition
+            path: buf,
+            flags: access as i32,
+            mode: disposition,
         })
     }
 }

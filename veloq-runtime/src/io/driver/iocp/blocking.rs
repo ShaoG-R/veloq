@@ -22,7 +22,7 @@ pub struct CompletionInfo {
 
 pub enum BlockingTask {
     Open {
-        path: Vec<u16>,
+        path_ptr: usize, // *const u16
         flags: i32,
         mode: u32,
         completion: CompletionInfo,
@@ -52,14 +52,14 @@ impl BlockingTask {
     fn run(self) {
         match self {
             BlockingTask::Open {
-                path,
+                path_ptr,
                 flags,
                 mode,
                 completion,
             } => {
                 let handle = unsafe {
                     CreateFileW(
-                        path.as_ptr(),
+                        path_ptr as *const u16,
                         flags as u32,
                         0,
                         std::ptr::null(),

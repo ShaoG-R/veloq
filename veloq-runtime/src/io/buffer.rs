@@ -46,6 +46,7 @@ pub trait BufPool: Clone + std::fmt::Debug + 'static {
     fn get_registration_buffers(&self) -> Vec<libc::iovec>;
 }
 
+#[derive(Debug)]
 pub struct FixedBuf<P: BufPool> {
     pool: P,
     ptr: NonNull<u8>,
