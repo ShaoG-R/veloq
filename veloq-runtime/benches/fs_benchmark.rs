@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
-use veloq_runtime::io::buffer::{BufferPool, BufferSize};
+use veloq_runtime::io::buffer::{BuddyPool, BufferSize};
 use veloq_runtime::io::fs::File;
 
 fn benchmark_1gb_write(c: &mut Criterion) {
@@ -20,7 +20,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     group.bench_function("write_1gb_concurrent", |b| {
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<BuddyPool>::new();
         b.iter(|| {
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(|cx| {
@@ -55,13 +55,12 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                         // 1. 尝试分配并在此窗口内提交任务
                         if tasks.len() < concurrency_limit {
                             // Use cx.buffer_pool()
-                            if let Some(mut buf) =
+                            if let Some(buf) =
                                 cx.buffer_pool().upgrade().unwrap().alloc(CHUNK_SIZE_ENUM)
                             {
                                 let remaining = TOTAL_SIZE - offset;
                                 let write_len =
                                     std::cmp::min(remaining, chunk_size as u64) as usize;
-                                buf.set_len(write_len);
 
                                 let file_clone = file.clone();
                                 let current_offset = offset;
@@ -117,7 +116,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     group.bench_function("write_32_files_concurrent", |b| {
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<BuddyPool>::new();
         b.iter(|| {
             exec.block_on(|cx| {
                 let cx = cx.clone();
@@ -136,9 +135,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             let _ = std::fs::remove_file(&path);
                         }
 
-                        let file = File::create(&path, &cx)
-                            .await
-                            .expect("Failed to create");
+                        let file = File::create(&path, &cx).await.expect("Failed to create");
                         let file = Rc::new(file);
 
                         file.fallocate(0, FILE_SIZE)
@@ -175,13 +172,12 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             }
 
                             if let Some(idx) = found {
-                                if let Some(mut buf) =
+                                if let Some(buf) =
                                     cx.buffer_pool().upgrade().unwrap().alloc(CHUNK_SIZE_ENUM)
                                 {
                                     let remaining = FILE_SIZE - offsets[idx];
                                     let write_len =
                                         std::cmp::min(remaining, chunk_size as u64) as usize;
-                                    buf.set_len(write_len);
 
                                     let file_clone = files[idx].clone();
                                     let current_offset = offsets[idx];

@@ -26,10 +26,11 @@ fn test_file_integrity() {
                     let mut write_buf = cx.buffer_pool().upgrade().unwrap().alloc(size).unwrap();
                     let data = b"Hello World!";
                     write_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-                    write_buf.set_len(data.len());
+                    // write_buf.set_len(data.len()); // Buffer defaults to full capacity
 
                     let (res, _) = file.write_at(write_buf, 0).await;
-                    assert_eq!(res.expect("Write failed"), data.len());
+                    let wrote = res.expect("Write failed");
+                    assert_eq!(wrote, size.size()); // Expect full buffer write
 
                     file.sync_all().await.expect("Sync failed");
                 }
@@ -38,15 +39,14 @@ fn test_file_integrity() {
                 {
                     let file = File::open(&file_path, &cx).await.expect("Failed to open");
 
-                    let mut read_buf = cx.buffer_pool().upgrade().unwrap().alloc(size).unwrap();
-                    // Ensure the buf has size to receive data, though ReadFixed usually uses capacity.
-                    // set_len helps if we access it later.
-                    read_buf.set_len(read_buf.capacity());
+                    let read_buf = cx.buffer_pool().upgrade().unwrap().alloc(size).unwrap();
+                    // read_buf.set_len(read_buf.capacity()); // Default is full capacity
 
                     let (res, read_buf) = file.read_at(read_buf, 0).await;
                     let n = res.expect("Read failed");
-                    assert_eq!(n, 12);
-                    assert_eq!(&read_buf.as_slice()[..n], b"Hello World!");
+                    // Read should return full size since we wrote full size
+                    assert_eq!(n, size.size());
+                    assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
                 }
 
                 // Cleanup
