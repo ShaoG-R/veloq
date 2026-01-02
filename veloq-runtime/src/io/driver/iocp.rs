@@ -1,6 +1,6 @@
 mod ext;
 pub mod op;
-mod ops;
+mod submit;
 #[cfg(test)]
 mod tests;
 
@@ -10,10 +10,10 @@ use crate::io::driver::op_registry::{OpEntry, OpRegistry};
 use crate::io::driver::{Driver, RemoteWaker};
 use ext::Extensions;
 use op::IocpOp;
-use ops::{IocpSubmit, SubmissionResult};
 use std::io;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use submit::{IocpSubmit, SubmissionResult};
 
 const WAKEUP_USER_DATA: usize = usize::MAX;
 
@@ -368,7 +368,7 @@ impl Driver for IocpDriver {
                     // Check for handles and CancelIoEx
                     if let Some(res) = &op.resources {
                         if let Some(fd) = res.get_fd() {
-                            if let Ok(handle) = ops::resolve_fd(fd, &self.registered_files) {
+                            if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
                                 unsafe {
                                     use windows_sys::Win32::System::IO::CancelIoEx;
                                     let _ =

@@ -8,10 +8,10 @@ use crate::io::driver::RemoteWaker;
 use std::sync::Arc;
 
 pub mod op;
-mod ops;
+mod submit;
 
 use op::{UringOp, UringWakeup};
-use ops::UringSubmit;
+use submit::UringSubmit;
 
 struct UringWaker(RawFd);
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::io::buffer::{BufferPool, BufferSize};
 use crate::io::driver::Driver;
-use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, Recv, Timeout, RawHandle};
+use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, RawHandle, Recv, Timeout};
 use crate::io::socket::Socket;
 use op::{IocpAccept, IocpOp};
 use std::net::TcpListener;
