@@ -277,6 +277,10 @@ pub struct RecvFrom {
 // OpLifecycle Implementations
 // ============================================================================
 
+// ============================================================================
+// OpLifecycle Implementations
+// ============================================================================
+
 impl OpLifecycle for Accept {
     /// On Windows: pre-created accept socket handle
     /// On Unix: unit (no pre-allocation needed)
@@ -362,6 +366,66 @@ impl OpLifecycle for Accept {
             };
             // On Windows, the accept_socket was pre-allocated and is the new connection
             Ok((self.accept_socket, addr))
+        }
+    }
+}
+
+// ============================================================================
+// Unified Operation Abstraction
+// ============================================================================
+
+/// Defines the platform-specific data layout for operations.
+/// This trait allows constructing a unified `Operation` enum that adapts to
+/// platform-specific requirements (e.g., `msghdr` on Linux, `OVERLAPPED` on Windows).
+pub trait OpAbi: 'static + std::marker::Send + Sized {
+    type ReadFixed: Unpin;
+    type WriteFixed: Unpin;
+    type Recv: Unpin;
+    type Send: Unpin;
+    type Accept: Unpin;
+    type Connect: Unpin;
+    type RecvFrom: Unpin;
+    type SendTo: Unpin;
+    type Open: Unpin;
+    type Close: Unpin;
+    type Fsync: Unpin;
+    type Wakeup: Unpin;
+    type Timeout: Unpin;
+}
+
+/// The unified operation enum generic over the platform ABI.
+/// This replaces platform-specific enums like `UringOp` and `IocpOp`.
+pub enum Operation<P: OpAbi> {
+    ReadFixed(ReadFixed, P::ReadFixed),
+    WriteFixed(WriteFixed, P::WriteFixed),
+    Recv(Recv, P::Recv),
+    Send(Send, P::Send),
+    Accept(Accept, P::Accept),
+    Connect(Connect, P::Connect),
+    RecvFrom(RecvFrom, P::RecvFrom),
+    SendTo(SendTo, P::SendTo),
+    Open(Open, P::Open),
+    Close(Close, P::Close),
+    Fsync(Fsync, P::Fsync),
+    Wakeup(Wakeup, P::Wakeup),
+    Timeout(Timeout, P::Timeout),
+}
+
+impl<P: OpAbi> Operation<P> {
+    /// Get the file descriptor associated with this operation (if any).
+    pub fn get_fd(&self) -> Option<IoFd> {
+        match self {
+            Self::ReadFixed(op, _) => Some(op.fd),
+            Self::WriteFixed(op, _) => Some(op.fd),
+            Self::Recv(op, _) => Some(op.fd),
+            Self::Send(op, _) => Some(op.fd),
+            Self::Accept(op, _) => Some(op.fd),
+            Self::Connect(op, _) => Some(op.fd),
+            Self::RecvFrom(op, _) => Some(op.fd),
+            Self::SendTo(op, _) => Some(op.fd),
+            Self::Close(op, _) => Some(op.fd),
+            Self::Fsync(op, _) => Some(op.fd),
+            Self::Open(_, _) | Self::Wakeup(_, _) | Self::Timeout(_, _) => None,
         }
     }
 }

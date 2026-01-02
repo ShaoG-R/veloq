@@ -228,7 +228,7 @@ impl Driver for IocpDriver {
     }
 
     fn submit(&mut self, user_data: usize, op: Self::Op) {
-        if let IocpOp::Timeout(t) = &op {
+        if let IocpOp::Timeout(t, _) = &op {
             // Handle timeout
             let id = self.wheel.insert(user_data, t.duration);
             if let Some(op_entry) = self.ops.get_mut(user_data) {
@@ -418,7 +418,7 @@ impl Driver for IocpDriver {
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         match op {
-            IocpOp::Close { data, .. } => {
+            IocpOp::Close(data, _) => {
                 if let Some(fd) = data.fd.raw() {
                     let fd_val = fd as usize;
                     // Fire-and-forget close. No completion info (passed set to 0).

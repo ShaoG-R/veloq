@@ -3,7 +3,7 @@ use crate::io::buffer::{BufferPool, BufferSize};
 use crate::io::driver::Driver;
 use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, RawHandle, Recv, Timeout};
 use crate::io::socket::Socket;
-use op::{IocpAccept, IocpOp, OverlappedEntry};
+use op::{IocpAcceptExtras, IocpOp, IocpTimeoutExtras, OverlappedEntry};
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -46,16 +46,17 @@ fn test_iocp_accept() {
     let acceptor_handle = acceptor.into_raw() as RawHandle;
 
     // Prepare Accept Op using OpLifecycle
-    // On Windows, PreAlloc is RawHandle (the pre-created accept socket)
-    let accept_op = Accept::into_op(listener_handle, acceptor_handle);
-    // Convert to IocpAccept and set accept_socket
-    let mut iocp_accept: IocpAccept = accept_op.into();
-    iocp_accept.accept_socket = Some(acceptor_handle);
+    let mut accept_op = Accept::into_op(listener_handle, acceptor_handle);
+    accept_op.accept_socket = acceptor_handle;
 
-    let iocp_op = IocpOp::Accept {
-        data: iocp_accept,
+    // Create extras manually to match what we need
+    let extras = IocpAcceptExtras {
         entry: OverlappedEntry::new(0),
+        accept_buffer: [0; 288],
     };
+    
+    let iocp_op = IocpOp::Accept(accept_op, extras);
+    
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -81,15 +82,14 @@ fn test_iocp_accept() {
             Poll::Ready((res, iocp_op)) => {
                 assert!(res.is_ok(), "Accept failed: {:?}", res.err());
                 match iocp_op {
-                    IocpOp::Accept { data: op, .. } => {
+                    IocpOp::Accept(op, _) => {
                         assert!(op.remote_addr.is_some(), "Remote addr should be populated");
                         unsafe {
                             if let Some(fd) = op.fd.raw() {
                                 windows_sys::Win32::Foundation::CloseHandle(fd as _);
                             }
-                            if let Some(s) = op.accept_socket {
-                                windows_sys::Win32::Foundation::CloseHandle(s as _);
-                            }
+                            let s = op.accept_socket;
+                            windows_sys::Win32::Foundation::CloseHandle(s as _);
                         }
                         break;
                     }
@@ -125,7 +125,7 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    // Connect implements IntoPlatformOp
+    // Connect implements IntoPlatformOp, which uses IocpOp::Connect(Connect, IocpState)
     let iocp_op = connect_op.into_platform_op();
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
@@ -159,7 +159,7 @@ fn test_iocp_timeout() {
         duration: std::time::Duration::from_millis(100),
     };
 
-    let iocp_op = IocpOp::Timeout(timeout_op.into());
+    let iocp_op = IocpOp::Timeout(timeout_op.into(), IocpTimeoutExtras);
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -243,7 +243,7 @@ fn test_iocp_recv_with_buffer_pool() {
                 let bytes_read = res.unwrap();
                 assert_eq!(bytes_read, 12);
 
-                if let IocpOp::Recv { data: mut op, .. } = iocp_op {
+                if let IocpOp::Recv(mut op, _) = iocp_op {
                     op.buf.set_len(bytes_read);
                     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
                 } else {

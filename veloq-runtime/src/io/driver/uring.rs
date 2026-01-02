@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub mod op;
 mod submit;
 
-use op::{UringOp, UringWakeup};
+use op::{UringOp, UringWakeupExtras};
 use submit::UringSubmit;
 
 struct UringWaker(RawFd);
@@ -105,8 +105,9 @@ impl UringDriver {
         }
 
         let fd = self.waker_fd as usize;
-        let op = UringWakeup::new(fd);
-        let uring_op = UringOp::Wakeup(op);
+        let op = crate::io::op::Wakeup { fd: crate::io::op::IoFd::Raw(fd) };
+        let extras = UringWakeupExtras { buf: [0u8; 8] };
+        let uring_op = UringOp::Wakeup(op, extras);
 
         let user_data = self.ops.insert(OpEntry::new(Some(uring_op), ()));
         self.waker_token = Some(user_data);
@@ -297,7 +298,7 @@ impl Driver for UringDriver {
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
         match op {
-            UringOp::Close(_) => {
+            UringOp::Close(_, _) => {
                 let sqe = op.make_sqe().user_data(BACKGROUND_USER_DATA);
 
                 // Try to push
