@@ -15,8 +15,12 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
 
+use super::blocking::{BlockingTask, CompletionInfo};
 use super::ext::Extensions;
-use super::op::{IocpAccept, IocpOp, IocpOpen, IocpRecvFrom, IocpSendTo, IocpTimeout, IocpWakeup};
+use super::op::{
+    IocpAccept, IocpOp, IocpOpen, IocpRecvFrom, IocpSendTo, IocpTimeout, IocpWakeup,
+    OverlappedEntry,
+};
 
 // ============================================================================
 // Submission Result Types
@@ -28,15 +32,7 @@ pub enum SubmissionResult {
     /// Post to completion queue immediately (e.g., wakeup).
     PostToQueue,
     /// Offload to thread pool for synchronous execution.
-    Offload(Box<dyn FnOnce() -> io::Result<usize> + Send>),
-}
-
-#[inline(always)]
-fn offload_task<F>(f: F) -> io::Result<SubmissionResult>
-where
-    F: FnOnce() -> io::Result<usize> + Send + 'static,
-{
-    Ok(SubmissionResult::Offload(Box::new(f)))
+    Offload(BlockingTask),
 }
 
 // ============================================================================
@@ -526,88 +522,98 @@ impl IocpSubmit for IocpTimeout {
 impl IocpSubmit for IocpOpen {
     unsafe fn submit(
         &mut self,
-        _port: HANDLE,
-        _overlapped: *mut OVERLAPPED,
+        port: HANDLE,
+        overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         _registered_files: &[Option<HANDLE>],
     ) -> io::Result<SubmissionResult> {
+        // We clone the path to give to the BlockingTask.
+        // This allocation is acceptable as Open is not a hot-path operation,
+        // and we need to retain the path in IocpOpen to allow reconstructing
+        // the generic Open op on completion (which the trait contract requires).
         let path = self.path.clone();
         let flags = self.flags;
         let mode = self.mode;
 
-        offload_task(move || {
-            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-            use windows_sys::Win32::Storage::FileSystem::{
-                CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
-            };
+        // Retrieve user_data from OVERLAPPED structure logic
+        // But here we construct CompletionInfo.
+        // Using overlapped which is a raw pointer to the pinned entry.
+        // We need to fetch user_data from it.
+        let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
+        let user_data = entry.user_data;
 
-            let path_ptr = path.as_ptr();
+        let completion = CompletionInfo {
+            port: port as usize,
+            user_data,
+            overlapped: overlapped as usize,
+        };
 
-            let handle = unsafe {
-                CreateFileW(
-                    path_ptr,
-                    flags as u32,
-                    0,
-                    std::ptr::null(),
-                    mode as u32,
-                    FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
-                    std::ptr::null_mut(),
-                )
-            };
+        let task = BlockingTask::Open {
+            path,
+            flags,
+            mode,
+            completion,
+        };
 
-            if handle == INVALID_HANDLE_VALUE {
-                let err = unsafe { GetLastError() };
-                return Err(io::Error::from_raw_os_error(err as i32));
-            }
-
-            Ok(handle as usize)
-        })
+        Ok(SubmissionResult::Offload(task))
     }
 }
 
 impl IocpSubmit for Close {
     unsafe fn submit(
         &mut self,
-        _port: HANDLE,
-        _overlapped: *mut OVERLAPPED,
+        port: HANDLE,
+        overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
     ) -> io::Result<SubmissionResult> {
-        use windows_sys::Win32::Foundation::CloseHandle;
         let handle = resolve_fd(self.fd, registered_files)?;
-        let handle = handle as usize;
+        let handle_val = handle as usize;
 
-        offload_task(move || {
-            let ret = unsafe { CloseHandle(handle as HANDLE) };
-            if ret == 0 {
-                let err = unsafe { GetLastError() };
-                return Err(io::Error::from_raw_os_error(err as i32));
-            }
-            Ok(0)
-        })
+        // Similar logic for completion info
+        let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
+        let user_data = entry.user_data;
+        let completion = CompletionInfo {
+            port: port as usize,
+            user_data,
+            overlapped: overlapped as usize,
+        };
+
+        let task = BlockingTask::Close {
+            handle: handle_val,
+            completion,
+        };
+
+        Ok(SubmissionResult::Offload(task))
     }
 }
 
 impl IocpSubmit for Fsync {
     unsafe fn submit(
         &mut self,
-        _port: HANDLE,
-        _overlapped: *mut OVERLAPPED,
+        port: HANDLE,
+        overlapped: *mut OVERLAPPED,
         _ext: &Extensions,
         registered_files: &[Option<HANDLE>],
     ) -> io::Result<SubmissionResult> {
-        use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
         let handle = resolve_fd(self.fd, registered_files)?;
-        let handle = handle as usize;
+        let handle_val = handle as usize;
 
-        offload_task(move || {
-            let ret = unsafe { FlushFileBuffers(handle as HANDLE) };
-            if ret == 0 {
-                let err = unsafe { GetLastError() };
-                return Err(io::Error::from_raw_os_error(err as i32));
-            }
-            Ok(0)
-        })
+        // Similar logic for completion info
+        let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
+        let user_data = entry.user_data;
+        let completion = CompletionInfo {
+            port: port as usize,
+            user_data,
+            overlapped: overlapped as usize,
+        };
+
+        let task = BlockingTask::Fsync {
+            handle: handle_val,
+            completion,
+        };
+
+        Ok(SubmissionResult::Offload(task))
     }
 }
 
@@ -646,17 +652,6 @@ impl IocpSubmit for IocpOp {
                 IocpOp::Fsync { data, .. } => data.submit(port, overlapped, ext, registered_files),
                 IocpOp::Wakeup { data, .. } => data.submit(port, overlapped, ext, registered_files),
                 IocpOp::Timeout(t) => t.submit(port, overlapped, ext, registered_files),
-                IocpOp::Offload { task, .. } => {
-                    // The task is taken out to be executed
-                    if let Some(f) = task.take() {
-                        Ok(SubmissionResult::Offload(f))
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "Offload task already consumed",
-                        ))
-                    }
-                }
             }
         }
     }
@@ -676,7 +671,6 @@ impl IocpSubmit for IocpOp {
             IocpOp::Fsync { data, .. } => data.on_complete(result, ext),
             IocpOp::Wakeup { data, .. } => data.on_complete(result, ext),
             IocpOp::Timeout(t) => t.on_complete(result, ext),
-            IocpOp::Offload { .. } => Ok(result),
         }
     }
 }

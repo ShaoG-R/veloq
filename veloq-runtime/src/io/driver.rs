@@ -1,7 +1,5 @@
 // use crate::buffer::FixedBuf;
 
-#[cfg(target_os = "windows")]
-pub(crate) mod blocking;
 pub(crate) mod op_registry;
 pub(crate) mod stable_slab;
 use std::io;

@@ -1,13 +1,13 @@
+mod blocking;
 mod ext;
 pub mod op;
 mod submit;
 #[cfg(test)]
 mod tests;
 
-// use crate::io::buffer::{BufferPool, FixedBuf};
-use super::blocking::ThreadPool;
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
 use crate::io::driver::{Driver, RemoteWaker};
+use blocking::ThreadPool;
 use ext::Extensions;
 use op::IocpOp;
 use std::io;
@@ -284,33 +284,9 @@ impl Driver for IocpDriver {
             Ok(SubmissionResult::PostToQueue) => unsafe {
                 PostQueuedCompletionStatus(port, 0, 0, overlapped_ptr);
             },
-            Ok(SubmissionResult::Offload(task_fn)) => {
-                let entry_ptr_val = overlapped_ptr as usize;
-                let port_val = port as usize;
-
+            Ok(SubmissionResult::Offload(task)) => {
                 // We perform the spawn. self.pool execute might fail.
-                let spawn_result = self.pool.execute(move || {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task_fn()))
-                            .unwrap_or_else(|_| {
-                                Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    "blocking task panicked",
-                                ))
-                            });
-
-                    // Access via raw pointer to pinned entry is safe
-                    let ptr = entry_ptr_val as *mut OverlappedEntry;
-                    unsafe {
-                        (*ptr).blocking_result = Some(result);
-                        PostQueuedCompletionStatus(
-                            port_val as HANDLE,
-                            0,
-                            user_data,
-                            ptr as *mut OVERLAPPED,
-                        );
-                    }
-                });
+                let spawn_result = self.pool.execute(task);
 
                 if spawn_result.is_err() {
                     // Pool overloaded or error
@@ -445,13 +421,18 @@ impl Driver for IocpDriver {
             IocpOp::Close { data, .. } => {
                 if let Some(fd) = data.fd.raw() {
                     let fd_val = fd as usize;
-                    self.pool
-                        .execute(move || unsafe {
-                            windows_sys::Win32::Foundation::CloseHandle(fd_val as HANDLE);
-                        })
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "blocking pool overloaded")
-                        })?;
+                    // Fire-and-forget close. No completion info (passed set to 0).
+                    let task = blocking::BlockingTask::Close {
+                        handle: fd_val,
+                        completion: blocking::CompletionInfo {
+                            port: 0,
+                            user_data: 0,
+                            overlapped: 0,
+                        },
+                    };
+                    self.pool.execute(task).map_err(|_| {
+                        io::Error::new(io::ErrorKind::Other, "blocking pool overloaded")
+                    })?;
                     Ok(())
                 } else {
                     Ok(())

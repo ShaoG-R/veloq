@@ -375,11 +375,6 @@ pub enum IocpOp {
         entry: OverlappedEntry,
     },
     Timeout(IocpTimeout),
-    /// Offload operation for synchronous tasks run in thread pool.
-    Offload {
-        task: Option<Box<dyn FnOnce() -> io::Result<usize> + Send>>,
-        entry: OverlappedEntry,
-    },
 }
 
 // IocpOp needs to be Send so it can be passed to the Driver
@@ -493,10 +488,7 @@ impl IocpOp {
             IocpOp::SendTo { data, .. } => Some(data.fd),
             IocpOp::Close { data, .. } => Some(data.fd),
             IocpOp::Fsync { data, .. } => Some(data.fd),
-            IocpOp::Open { .. }
-            | IocpOp::Wakeup { .. }
-            | IocpOp::Timeout(_)
-            | IocpOp::Offload { .. } => None,
+            IocpOp::Open { .. } | IocpOp::Wakeup { .. } | IocpOp::Timeout(_) => None,
         }
     }
 
@@ -514,7 +506,6 @@ impl IocpOp {
             IocpOp::Close { entry, .. } => Some(entry),
             IocpOp::Fsync { entry, .. } => Some(entry),
             IocpOp::Wakeup { entry, .. } => Some(entry),
-            IocpOp::Offload { entry, .. } => Some(entry),
             IocpOp::Timeout(_) => None,
         }
     }
