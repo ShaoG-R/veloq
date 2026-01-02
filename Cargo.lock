@@ -62,6 +62,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "veloq-macros"
+version = "0.1.0"
+
+[[package]]
 name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
@@ -69,6 +73,7 @@ dependencies = [
  "io-uring",
  "libc",
  "slab",
+ "veloq-macros",
  "veloq-wheel",
  "windows-sys",
 ]

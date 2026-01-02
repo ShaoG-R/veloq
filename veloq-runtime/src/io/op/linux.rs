@@ -1,23 +1,10 @@
-use super::{IoFd, IoOp, IoResources, OpLifecycle, SysRawOp};
+use super::{IoFd, OpLifecycle, SysRawOp};
 use crate::io::buffer::FixedBuf;
 use std::time::Duration;
 
 pub struct Timeout {
     pub duration: Duration,
     pub ts: [i64; 2],
-}
-
-impl IoOp for Timeout {
-    fn into_resource(self) -> IoResources {
-        IoResources::Timeout(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Timeout(r) => r,
-            _ => panic!("Resource type mismatch for Timeout"),
-        }
-    }
 }
 
 pub struct Accept {
@@ -63,19 +50,6 @@ impl OpLifecycle for Accept {
     }
 }
 
-impl IoOp for Accept {
-    fn into_resource(self) -> IoResources {
-        IoResources::Accept(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Accept(r) => r,
-            _ => panic!("Resource type mismatch for Accept"),
-        }
-    }
-}
-
 pub struct SendTo {
     pub fd: IoFd,
     pub buf: FixedBuf,
@@ -108,19 +82,6 @@ impl SendTo {
             addr_len,
             msghdr,
             iovec,
-        }
-    }
-}
-
-impl IoOp for SendTo {
-    fn into_resource(self) -> IoResources {
-        IoResources::SendTo(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::SendTo(r) => r,
-            _ => panic!("Resource type mismatch for SendTo"),
         }
     }
 }
@@ -165,19 +126,6 @@ impl RecvFrom {
     }
 }
 
-impl IoOp for RecvFrom {
-    fn into_resource(self) -> IoResources {
-        IoResources::RecvFrom(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::RecvFrom(r) => r,
-            _ => panic!("Resource type mismatch for RecvFrom"),
-        }
-    }
-}
-
 pub struct Wakeup {
     pub fd: IoFd,
     pub buf: Box<[u8; 8]>,
@@ -188,19 +136,6 @@ impl Wakeup {
         Self {
             fd: IoFd::Raw(fd),
             buf: Box::new([0u8; 8]),
-        }
-    }
-}
-
-impl IoOp for Wakeup {
-    fn into_resource(self) -> IoResources {
-        IoResources::Wakeup(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Wakeup(r) => r,
-            _ => panic!("Resource type mismatch for Wakeup"),
         }
     }
 }

@@ -5,9 +5,9 @@ use crate::io::op::{
 use std::io;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    WSAGetLastError, WSARecvFrom, WSASendTo, bind, getsockname,
-    SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, setsockopt,
+    AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, WSARecvFrom,
+    WSASendTo, bind, getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
@@ -252,9 +252,10 @@ impl IocpSubmit for Accept {
     fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
         let accept_socket = self.accept_socket;
 
-        let listen_handle = self.fd.raw().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "Invalid listen socket fd")
-        })?;
+        let listen_handle = self
+            .fd
+            .raw()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid listen socket fd"))?;
         let listen_socket = listen_handle as usize as SOCKET;
 
         let ret = unsafe {
@@ -509,63 +510,58 @@ impl IocpSubmit for RecvFrom {
     }
 }
 
-impl IocpSubmit for IoResources {
-    unsafe fn submit(
-        &mut self,
-        port: HANDLE,
-        overlapped: *mut OVERLAPPED,
-        ext: &Extensions,
-        registered_files: &[Option<HANDLE>],
-    ) -> io::Result<SubmissionResult> {
-        match self {
-            IoResources::ReadFixed(op) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IoResources::WriteFixed(op) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IoResources::Recv(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::Send(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::Accept(op) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IoResources::Connect(op) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IoResources::SendTo(op) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IoResources::RecvFrom(op) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IoResources::Open(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::Close(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::Fsync(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IoResources::None => Ok(SubmissionResult::PostToQueue),
-            IoResources::Wakeup(_) => Ok(SubmissionResult::PostToQueue),
-            IoResources::Timeout(_) => Ok(SubmissionResult::Pending),
-        }
-    }
+macro_rules! impl_iocp_submit {
+    ($($Variant:ident($Inner:ty)),* $(,)?) => {
+        impl IocpSubmit for IoResources {
+            unsafe fn submit(
+                &mut self,
+                port: HANDLE,
+                overlapped: *mut OVERLAPPED,
+                ext: &Extensions,
+                registered_files: &[Option<HANDLE>],
+            ) -> io::Result<SubmissionResult> {
+                match self {
+                    $(IoResources::$Variant(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },)*
+                    IoResources::None => Ok(SubmissionResult::PostToQueue),
+                }
+            }
 
-    fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
-        match self {
-            IoResources::ReadFixed(op) => op.on_complete(result, ext),
-            IoResources::WriteFixed(op) => op.on_complete(result, ext),
-            IoResources::Recv(op) => op.on_complete(result, ext),
-            IoResources::Send(op) => op.on_complete(result, ext),
-            IoResources::Accept(op) => op.on_complete(result, ext),
-            IoResources::Connect(op) => op.on_complete(result, ext),
-            IoResources::SendTo(op) => op.on_complete(result, ext),
-            IoResources::RecvFrom(op) => op.on_complete(result, ext),
-            IoResources::Open(op) => op.on_complete(result, ext),
-            IoResources::Close(op) => op.on_complete(result, ext),
-            IoResources::Fsync(op) => op.on_complete(result, ext),
-            IoResources::None => Ok(result),
-            IoResources::Wakeup(_) => Ok(result),
-            IoResources::Timeout(_) => Ok(result),
+            fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
+                match self {
+                    $(IoResources::$Variant(op) => op.on_complete(result, ext),)*
+                    IoResources::None => Ok(result),
+                }
+            }
         }
     }
 }
+
+// We need to implement IocpSubmit for Wakeup and Timeout since they are now part of the generic loop.
+impl IocpSubmit for crate::io::op::Wakeup {
+    unsafe fn submit(
+        &mut self,
+        _port: HANDLE,
+        _overlapped: *mut OVERLAPPED,
+        _ext: &Extensions,
+        _registered_files: &[Option<HANDLE>],
+    ) -> io::Result<SubmissionResult> {
+        Ok(SubmissionResult::PostToQueue)
+    }
+}
+
+impl IocpSubmit for crate::io::op::Timeout {
+    unsafe fn submit(
+        &mut self,
+        _port: HANDLE,
+        _overlapped: *mut OVERLAPPED,
+        _ext: &Extensions,
+        _registered_files: &[Option<HANDLE>],
+    ) -> io::Result<SubmissionResult> {
+        Ok(SubmissionResult::Pending)
+    }
+}
+
+veloq_macros::for_all_io_ops!(impl_iocp_submit);
 
 impl IocpSubmit for crate::io::op::Open {
     unsafe fn submit(

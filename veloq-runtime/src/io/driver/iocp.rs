@@ -197,9 +197,7 @@ impl IocpDriver {
                             if result.is_ok() {
                                 // Apply post-processing (Accept/Connect fixups)
                                 let bytes = result.unwrap();
-                                let final_res = op
-                                    .resources
-                                    .on_complete(bytes, &self.extensions);
+                                let final_res = op.resources.on_complete(bytes, &self.extensions);
                                 op.result = Some(final_res);
                             } else {
                                 op.result = Some(result);

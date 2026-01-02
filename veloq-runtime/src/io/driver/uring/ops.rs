@@ -62,51 +62,33 @@ impl UringOp for WriteFixed {
     }
 }
 
-impl UringOp for IoResources {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self {
-            IoResources::ReadFixed(op) => op.make_sqe(),
-            IoResources::WriteFixed(op) => op.make_sqe(),
-            IoResources::Send(op) => op.make_sqe(),
-            IoResources::Recv(op) => op.make_sqe(),
-            IoResources::Timeout(op) => op.make_sqe(),
-            IoResources::Accept(op) => op.make_sqe(),
-            IoResources::Connect(op) => op.make_sqe(),
-            IoResources::SendTo(op) => op.make_sqe(),
-            IoResources::RecvFrom(op) => op.make_sqe(),
-            IoResources::Wakeup(op) => op.make_sqe(),
-            IoResources::Open(op) => op.make_sqe(),
-            IoResources::Close(op) => op.make_sqe(),
-            IoResources::Fsync(op) => op.make_sqe(),
-            IoResources::None => opcode::Nop::new().build(),
-        }
-    }
+macro_rules! impl_uring_op {
+    ($($Variant:ident($Inner:ty)),* $(,)?) => {
+        impl UringOp for IoResources {
+            fn make_sqe(&mut self) -> squeue::Entry {
+                match self {
+                    $(IoResources::$Variant(op) => op.make_sqe(),)*
+                    IoResources::None => opcode::Nop::new().build(),
+                }
+            }
 
-    fn on_complete(&mut self, result: i32) -> std::io::Result<usize> {
-        match self {
-            IoResources::ReadFixed(op) => op.on_complete(result),
-            IoResources::WriteFixed(op) => op.on_complete(result),
-            IoResources::Send(op) => op.on_complete(result),
-            IoResources::Recv(op) => op.on_complete(result),
-            IoResources::Timeout(op) => op.on_complete(result),
-            IoResources::Accept(op) => op.on_complete(result),
-            IoResources::Connect(op) => op.on_complete(result),
-            IoResources::SendTo(op) => op.on_complete(result),
-            IoResources::RecvFrom(op) => op.on_complete(result),
-            IoResources::Wakeup(op) => op.on_complete(result),
-            IoResources::Open(op) => op.on_complete(result),
-            IoResources::Close(op) => op.on_complete(result),
-            IoResources::Fsync(op) => op.on_complete(result),
-            IoResources::None => {
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(std::io::Error::from_raw_os_error(-result))
+            fn on_complete(&mut self, result: i32) -> std::io::Result<usize> {
+                match self {
+                    $(IoResources::$Variant(op) => op.on_complete(result),)*
+                    IoResources::None => {
+                        if result >= 0 {
+                            Ok(result as usize)
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(-result))
+                        }
+                    }
                 }
             }
         }
     }
 }
+
+veloq_macros::for_all_io_ops!(impl_uring_op);
 
 impl UringOp for Timeout {
     fn make_sqe(&mut self) -> squeue::Entry {

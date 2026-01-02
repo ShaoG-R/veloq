@@ -37,23 +37,51 @@ impl IoFd {
     }
 }
 
-pub enum IoResources {
-    ReadFixed(ReadFixed),
-    WriteFixed(WriteFixed),
-    Send(Send),
-    Recv(Recv),
-    Timeout(Timeout),
-    Accept(Accept),
-    Connect(Connect),
-    SendTo(SendTo),
-    RecvFrom(RecvFrom),
-    Wakeup(Wakeup),
-    Open(Open),
-    Close(Close),
-    Fsync(Fsync),
-    // Placeholder for when we have no resource back yet or it's empty
-    None,
+#[macro_export]
+macro_rules! for_all_io_ops {
+    ($mac:ident) => {
+        $mac!(
+            ReadFixed(ReadFixed),
+            WriteFixed(WriteFixed),
+            Send(Send),
+            Recv(Recv),
+            Timeout(Timeout),
+            Accept(Accept),
+            Connect(Connect),
+            SendTo(SendTo),
+            RecvFrom(RecvFrom),
+            Wakeup(Wakeup),
+            Open(Open),
+            Close(Close),
+            Fsync(Fsync),
+        );
+    };
 }
+
+macro_rules! define_io_resources_enum {
+    ( $($Variant:ident($Inner:ty)),* $(,)? ) => {
+        pub enum IoResources {
+            $($Variant($Inner),)*
+            None,
+        }
+
+        $(
+            impl IoOp for $Inner {
+                fn into_resource(self) -> IoResources {
+                    IoResources::$Variant(self)
+                }
+                fn from_resource(res: IoResources) -> Self {
+                    match res {
+                        IoResources::$Variant(r) => r,
+                        _ => panic!(concat!("Resource type mismatch for ", stringify!($Variant))),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+veloq_macros::for_all_io_ops!(define_io_resources_enum);
 
 /// Trait for operations that require platform-specific resource pre-allocation
 /// and post-processing logic.
@@ -167,36 +195,10 @@ pub struct ReadFixed {
     pub offset: u64,
 }
 
-impl IoOp for ReadFixed {
-    fn into_resource(self) -> IoResources {
-        IoResources::ReadFixed(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::ReadFixed(r) => r,
-            _ => panic!("Resource type mismatch for ReadFixed"),
-        }
-    }
-}
-
 pub struct WriteFixed {
     pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
-}
-
-impl IoOp for WriteFixed {
-    fn into_resource(self) -> IoResources {
-        IoResources::WriteFixed(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::WriteFixed(r) => r,
-            _ => panic!("Resource type mismatch for WriteFixed"),
-        }
-    }
 }
 
 pub struct Recv {
@@ -204,54 +206,15 @@ pub struct Recv {
     pub buf: FixedBuf,
 }
 
-impl IoOp for Recv {
-    fn into_resource(self) -> IoResources {
-        IoResources::Recv(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Recv(r) => r,
-            _ => panic!("Resource type mismatch for Recv"),
-        }
-    }
-}
-
 pub struct Send {
     pub fd: IoFd,
     pub buf: FixedBuf,
-}
-
-impl IoOp for Send {
-    fn into_resource(self) -> IoResources {
-        IoResources::Send(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Send(r) => r,
-            _ => panic!("Resource type mismatch for Send"),
-        }
-    }
 }
 
 pub struct Connect {
     pub fd: IoFd,
     pub addr: Box<[u8]>,
     pub addr_len: u32,
-}
-
-impl IoOp for Connect {
-    fn into_resource(self) -> IoResources {
-        IoResources::Connect(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Connect(r) => r,
-            _ => panic!("Resource type mismatch for Connect"),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -264,52 +227,13 @@ pub struct Open {
     pub mode: u32,
 }
 
-impl IoOp for Open {
-    fn into_resource(self) -> IoResources {
-        IoResources::Open(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Open(r) => r,
-            _ => panic!("Resource type mismatch for Open"),
-        }
-    }
-}
-
 pub struct Close {
     pub fd: IoFd,
-}
-
-impl IoOp for Close {
-    fn into_resource(self) -> IoResources {
-        IoResources::Close(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Close(r) => r,
-            _ => panic!("Resource type mismatch for Close"),
-        }
-    }
 }
 
 pub struct Fsync {
     pub fd: IoFd,
     pub datasync: bool,
-}
-
-impl IoOp for Fsync {
-    fn into_resource(self) -> IoResources {
-        IoResources::Fsync(self)
-    }
-
-    fn from_resource(res: IoResources) -> Self {
-        match res {
-            IoResources::Fsync(r) => r,
-            _ => panic!("Resource type mismatch for Fsync"),
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
