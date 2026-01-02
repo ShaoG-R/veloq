@@ -1,119 +1,93 @@
-#[cfg(unix)]
-use std::os::unix::io::RawFd;
-#[cfg(windows)]
-use std::os::windows::io::RawHandle;
+//! # IO Operation Abstraction Layer
+//!
+//! This module defines platform-agnostic operation structures and traits.
+//! All types here are completely cross-platform with no conditional compilation.
+//!
+//! Platform-specific implementations reside in:
+//! - `io/driver/uring/op.rs` for Linux io_uring
+//! - `io/driver/iocp/op.rs` for Windows IOCP
+
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 
-#[cfg(unix)]
-pub type SysRawOp = RawFd;
-#[cfg(windows)]
+use crate::io::buffer::FixedBuf;
+use crate::io::driver::{Driver, PlatformDriver};
+use std::cell::RefCell;
+use std::rc::Weak;
+
+// ============================================================================
+// Core Types (Platform-Agnostic)
+// ============================================================================
+
+/// Platform-agnostic raw handle type.
+/// Uses `usize` to represent any platform's handle (fd on Unix, HANDLE on Windows).
+pub type RawHandle = usize;
+
+/// Alias for RawHandle for backwards compatibility.
+/// Deprecated: Use `RawHandle` instead.
 pub type SysRawOp = RawHandle;
 
-use crate::io::buffer::FixedBuf;
-
-/// Represents the source of an IO operation: either a raw handle/fd or a registered index.
+/// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoFd {
-    /// A raw system handle/fd.
-    /// On Linux: RawFd
-    /// On Windows: HANDLE / SOCKET
-    Raw(SysRawOp),
-    /// A registered index.
-    /// On Linux: io_uring fixed file index.
-    /// On Windows: Driver-internal registered handle index.
+    /// A raw system handle (fd on Unix, HANDLE on Windows).
+    Raw(RawHandle),
+    /// A registered index for pre-registered file descriptors.
     Fixed(u32),
 }
 
 impl IoFd {
-    pub fn raw(&self) -> Option<SysRawOp> {
+    /// Returns the raw handle if this is a Raw variant.
+    pub fn raw(&self) -> Option<RawHandle> {
         match self {
             Self::Raw(fd) => Some(*fd),
             Self::Fixed(_) => None,
         }
     }
+
+    /// Creates an IoFd from a raw handle.
+    pub fn from_raw(handle: RawHandle) -> Self {
+        Self::Raw(handle)
+    }
 }
 
-macro_rules! define_io_resources_enum {
-    (
-        WithFd { $( $(#[$meta_fd:meta])* $VariantFd:ident($InnerFd:ty) ),* $(,)? },
-        WithoutFd { $( $(#[$meta_no_fd:meta])* $VariantNoFd:ident($InnerNoFd:ty) ),* $(,)? }
-    ) => {
-        pub enum IoResources {
-            $( $(#[$meta_fd])* $VariantFd($InnerFd), )*
-            $( $(#[$meta_no_fd])* $VariantNoFd($InnerNoFd), )*
-            None,
-        }
+// ============================================================================
+// Core Traits
+// ============================================================================
 
-        impl IoResources {
-            pub fn get_fd(&self) -> Option<IoFd> {
-                match self {
-                    $( $(#[$meta_fd])* IoResources::$VariantFd(op) => Some(op.fd), )*
-                    _ => None,
-                }
-            }
-        }
-
-        $(
-            $(#[$meta_fd])*
-            impl IoOp for $InnerFd {
-                fn into_resource(self) -> IoResources {
-                    IoResources::$VariantFd(self)
-                }
-                fn from_resource(res: IoResources) -> Self {
-                    match res {
-                        IoResources::$VariantFd(r) => r,
-                        _ => panic!(concat!("Resource type mismatch for ", stringify!($VariantFd))),
-                    }
-                }
-            }
-        )*
-
-        $(
-            $(#[$meta_no_fd])*
-            impl IoOp for $InnerNoFd {
-                fn into_resource(self) -> IoResources {
-                    IoResources::$VariantNoFd(self)
-                }
-                fn from_resource(res: IoResources) -> Self {
-                    match res {
-                        IoResources::$VariantNoFd(r) => r,
-                        _ => panic!(concat!("Resource type mismatch for ", stringify!($VariantNoFd))),
-                    }
-                }
-            }
-        )*
-    };
-}
-
-veloq_macros::for_all_io_ops!(define_io_resources_enum);
-
-/// Trait for operations that require platform-specific resource pre-allocation
-/// and post-processing logic.
+/// Trait for managing the lifecycle of an operation.
+/// Handles pre-allocation, construction, and output conversion.
 pub trait OpLifecycle: Sized {
-    /// Resources allocated before the operation is submitted.
+    /// Type for any pre-allocated resources needed before creating the op.
     type PreAlloc;
-    /// The final output of the operation after completion.
+    /// The final output type after the operation completes.
     type Output;
 
-    /// Perform pre-allocation.
-    /// `fd` is provided in case the pre-allocation depends on the main resource (e.g. address family).
-    fn pre_alloc(fd: SysRawOp) -> std::io::Result<Self::PreAlloc>;
+    /// Pre-allocate any resources needed (e.g., accept socket on Windows).
+    fn pre_alloc(fd: RawHandle) -> std::io::Result<Self::PreAlloc>;
 
-    /// Create the Op struct from the main resource and pre-allocated resources.
-    fn into_op(fd: SysRawOp, pre: Self::PreAlloc) -> Self;
+    /// Construct the operation from a raw handle and pre-allocated resources.
+    fn into_op(fd: RawHandle, pre: Self::PreAlloc) -> Self;
 
-    /// Convert the completed Op back into the desired output.
+    /// Convert the completed operation result to the final output type.
     fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output>;
 }
 
-pub trait IoOp: Sized {
-    fn into_resource(self) -> IoResources;
-    fn from_resource(res: IoResources) -> Self;
+/// Trait to convert a user-facing operation to a platform-specific driver operation.
+pub trait IntoPlatformOp<D: Driver>: Sized {
+    /// Convert this operation into the platform driver's operation type.
+    fn into_platform_op(self) -> D::Op;
+
+    /// Convert from the platform driver's operation type back to this type.
+    fn from_platform_op(op: D::Op) -> Self;
 }
+
+// ============================================================================
+// Op Future Wrapper
+// ============================================================================
 
 enum State {
     Defined,
@@ -121,18 +95,21 @@ enum State {
     Completed,
 }
 
-use crate::io::driver::{Driver, PlatformDriver};
-use std::cell::RefCell;
-use std::rc::Weak;
-
-pub struct Op<T: IoOp + 'static> {
+/// A Future wrapper for asynchronous IO operations.
+///
+/// This struct manages the lifecycle of an IO operation:
+/// 1. Defined: Operation created but not submitted
+/// 2. Submitted: Operation submitted to the driver
+/// 3. Completed: Operation finished, result available
+pub struct Op<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
     user_data: usize,
     driver: Weak<RefCell<PlatformDriver>>,
 }
 
-impl<T: IoOp> Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver>> Op<T> {
+    /// Create a new operation with the given data and driver reference.
     pub fn new(data: T, driver: Weak<RefCell<PlatformDriver>>) -> Self {
         Self {
             state: State::Defined,
@@ -143,7 +120,7 @@ impl<T: IoOp> Op<T> {
     }
 }
 
-impl<T: IoOp + 'static> Future for Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
     type Output = (std::io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -156,15 +133,14 @@ impl<T: IoOp + 'static> Future for Op<T> {
 
                 // Submit to driver
                 let data = op.data.take().expect("Op started without data");
-                let resources = data.into_resource();
+                let driver_op = data.into_platform_op();
                 let user_data = driver.reserve_op();
                 op.user_data = user_data;
-                driver.submit_op_resources(user_data, resources);
+                driver.submit(user_data, driver_op);
 
                 op.state = State::Submitted;
 
                 // Register waker immediately by polling the op
-                // This ensures that if the operation completes quickly, we get woken up
                 let _ = driver.poll_op(user_data, cx);
                 Poll::Pending
             }
@@ -173,10 +149,10 @@ impl<T: IoOp + 'static> Future for Op<T> {
                 let mut driver = driver_rc.borrow_mut();
 
                 match driver.poll_op(op.user_data, cx) {
-                    Poll::Ready((res, resources_enum)) => {
+                    Poll::Ready((res, driver_op)) => {
                         op.state = State::Completed;
                         // Convert resources back to T
-                        let data = T::from_resource(resources_enum);
+                        let data = T::from_platform_op(driver_op);
                         Poll::Ready((res, data))
                     }
                     Poll::Pending => Poll::Pending,
@@ -187,7 +163,7 @@ impl<T: IoOp + 'static> Future for Op<T> {
     }
 }
 
-impl<T: IoOp + 'static> Drop for Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for Op<T> {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
             if let Some(driver_rc) = self.driver.upgrade() {
@@ -197,59 +173,194 @@ impl<T: IoOp + 'static> Drop for Op<T> {
     }
 }
 
+// ============================================================================
+// Cross-Platform Operation Structures
+// ============================================================================
+
+/// Read from a file descriptor at a specific offset using a fixed buffer.
 pub struct ReadFixed {
     pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
 }
 
+/// Write to a file descriptor at a specific offset using a fixed buffer.
 pub struct WriteFixed {
     pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
 }
 
+/// Receive data from a socket into a fixed buffer.
 pub struct Recv {
     pub fd: IoFd,
     pub buf: FixedBuf,
 }
 
+/// Send data from a fixed buffer to a socket.
 pub struct Send {
     pub fd: IoFd,
     pub buf: FixedBuf,
 }
 
+/// Connect a socket to a remote address.
 pub struct Connect {
     pub fd: IoFd,
+    /// Raw address bytes (sockaddr representation).
     pub addr: Box<[u8]>,
     pub addr_len: u32,
 }
 
+/// Open a file.
+/// Path representation is platform-agnostic (raw bytes).
 #[derive(Debug)]
 pub struct Open {
-    #[cfg(unix)]
-    pub path: std::ffi::CString,
-    #[cfg(windows)]
-    pub path: Vec<u16>,
+    /// Path as raw bytes. Interpretation is platform-specific:
+    /// - Unix: UTF-8 encoded, null-terminated (CString)
+    /// - Windows: UTF-16 encoded, null-terminated (Vec<u16>)
+    pub path: Vec<u8>,
     pub flags: i32,
     pub mode: u32,
 }
 
+/// Close a file descriptor or handle.
 pub struct Close {
     pub fd: IoFd,
 }
 
+/// Flush file buffers to disk.
 pub struct Fsync {
     pub fd: IoFd,
+    /// If true, only sync data (not metadata).
     pub datasync: bool,
 }
 
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "linux")]
-pub use linux::*;
+/// Timeout operation (platform-specific timing).
+pub struct Timeout {
+    pub duration: std::time::Duration,
+}
 
-#[cfg(target_os = "windows")]
-mod windows;
-#[cfg(target_os = "windows")]
-pub use windows::*;
+/// Wake up the event loop.
+pub struct Wakeup {
+    pub fd: IoFd,
+}
+
+/// Accept a new connection on a listening socket.
+/// Result includes the new socket handle and remote address.
+pub struct Accept {
+    pub fd: IoFd,
+    /// Buffer for storing the remote address.
+    pub addr: Box<[u8]>,
+    /// Length of the address buffer.
+    pub addr_len: Box<u32>,
+    /// Parsed remote address (populated after completion).
+    pub remote_addr: Option<std::net::SocketAddr>,
+    /// Pre-allocated accept socket (Windows only, required for AcceptEx).
+    #[cfg(windows)]
+    pub accept_socket: RawHandle,
+}
+
+/// Send data to a specific address (UDP).
+pub struct SendTo {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+    /// Target address bytes.
+    pub addr: Box<[u8]>,
+    pub addr_len: u32,
+}
+
+/// Receive data and source address (UDP).
+pub struct RecvFrom {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+    /// Buffer for storing the source address.
+    pub addr: Box<[u8]>,
+    /// Length of the address (input: buffer size, output: actual size).
+    pub addr_len: Box<u32>,
+}
+
+// ============================================================================
+// OpLifecycle Implementations
+// ============================================================================
+
+impl OpLifecycle for Accept {
+    /// On Windows: pre-created accept socket handle
+    /// On Unix: unit (no pre-allocation needed)
+    #[cfg(unix)]
+    type PreAlloc = ();
+    #[cfg(windows)]
+    type PreAlloc = RawHandle;
+
+    type Output = (RawHandle, std::net::SocketAddr);
+
+    fn pre_alloc(_fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
+        #[cfg(unix)]
+        {
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            // On Windows, we need to pre-create a socket for AcceptEx
+            use crate::io::socket::Socket;
+            Ok(Socket::new_tcp_v4()?.into_raw() as RawHandle)
+        }
+    }
+
+    #[allow(unused_variables)]
+    fn into_op(fd: RawHandle, pre: Self::PreAlloc) -> Self {
+        // Buffer size for sockaddr_storage + extra for AcceptEx on Windows
+        #[cfg(unix)]
+        let buf_size = 128; // sizeof(sockaddr_storage) is typically 128
+        #[cfg(windows)]
+        let buf_size = 288; // (sizeof(sockaddr_storage) + 16) * 2 for AcceptEx
+
+        let addr_buf = vec![0u8; buf_size].into_boxed_slice();
+        let addr_len = Box::new(buf_size as u32);
+
+        #[cfg(unix)]
+        {
+            Self {
+                fd: IoFd::Raw(fd),
+                addr: addr_buf,
+                addr_len,
+                remote_addr: None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                fd: IoFd::Raw(fd),
+                addr: addr_buf,
+                addr_len,
+                remote_addr: None,
+                accept_socket: pre,
+            }
+        }
+    }
+
+    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output> {
+        #[cfg(unix)]
+        {
+            let fd = res? as RawHandle;
+            use crate::io::socket::to_socket_addr;
+            let addr = if let Some(a) = self.remote_addr {
+                a
+            } else {
+                to_socket_addr(&self.addr).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+            };
+            Ok((fd, addr))
+        }
+        #[cfg(windows)]
+        {
+            res?;
+            use crate::io::socket::to_socket_addr;
+            let addr = if let Some(a) = self.remote_addr {
+                a
+            } else {
+                to_socket_addr(&self.addr).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+            };
+            // On Windows, the accept_socket was pre-allocated and is the new connection
+            Ok((self.accept_socket, addr))
+        }
+    }
+}

@@ -1,20 +1,20 @@
-use crate::io::op::IoResources;
+use crate::io::driver::PlatformOp;
 use slab::Slab;
 use std::io;
 use std::ops::{Index, IndexMut};
 use std::task::{Context, Poll, Waker};
 
-pub struct OpEntry<P> {
+pub struct OpEntry<Op: PlatformOp, P> {
     pub waker: Option<Waker>,
     pub result: Option<io::Result<usize>>,
-    pub resources: IoResources,
+    pub resources: Option<Op>,
     pub cancelled: bool,
     #[allow(dead_code)]
     pub platform_data: P,
 }
 
-impl<P> OpEntry<P> {
-    pub fn new(resources: IoResources, platform_data: P) -> Self {
+impl<Op: PlatformOp, P> OpEntry<Op, P> {
+    pub fn new(resources: Option<Op>, platform_data: P) -> Self {
         Self {
             waker: None,
             result: None,
@@ -25,22 +25,22 @@ impl<P> OpEntry<P> {
     }
 }
 
-pub struct OpRegistry<P> {
-    slab: Slab<OpEntry<P>>,
+pub struct OpRegistry<Op: PlatformOp, P> {
+    slab: Slab<OpEntry<Op, P>>,
 }
 
-impl<P> OpRegistry<P> {
+impl<Op: PlatformOp, P> OpRegistry<Op, P> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             slab: Slab::with_capacity(capacity),
         }
     }
 
-    pub fn insert(&mut self, entry: OpEntry<P>) -> usize {
+    pub fn insert(&mut self, entry: OpEntry<Op, P>) -> usize {
         self.slab.insert(entry)
     }
 
-    pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
+    pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<Op, P>> {
         self.slab.get_mut(user_data)
     }
 
@@ -49,7 +49,7 @@ impl<P> OpRegistry<P> {
     }
 
     #[allow(dead_code)]
-    pub fn remove(&mut self, user_data: usize) -> OpEntry<P> {
+    pub fn remove(&mut self, user_data: usize) -> OpEntry<Op, P> {
         self.slab.remove(user_data)
     }
 
@@ -61,33 +61,40 @@ impl<P> OpRegistry<P> {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<usize>, IoResources)> {
+    ) -> Poll<(io::Result<usize>, Op)> {
         if let Some(op) = self.slab.get_mut(user_data) {
             if let Some(res) = op.result.take() {
-                let entry = self.slab.remove(user_data);
-                Poll::Ready((res, entry.resources))
+                let mut entry = self.slab.remove(user_data);
+                // Resources should be present if we have a result (implying submission happened)
+                // If None, it means logic error.
+                let resources = entry
+                    .resources
+                    .take()
+                    .expect("Op completed but resources missing");
+                Poll::Ready((res, resources))
             } else {
                 op.waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         } else {
-            Poll::Ready((
-                Err(io::Error::new(io::ErrorKind::Other, "Op not found")),
-                IoResources::None,
-            ))
+            // Op not found. Can't return DriverOp.
+            // This poll signature assumes we always return Op back.
+            // If we can't find it, we can't return Op.
+            // In previous code `IoResources::None` was returned.
+            panic!("Op not found in registry and no None variant available");
         }
     }
 }
 
-impl<P> Index<usize> for OpRegistry<P> {
-    type Output = OpEntry<P>;
+impl<Op: PlatformOp, P> Index<usize> for OpRegistry<Op, P> {
+    type Output = OpEntry<Op, P>;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.slab[index]
     }
 }
 
-impl<P> IndexMut<usize> for OpRegistry<P> {
+impl<Op: PlatformOp, P> IndexMut<usize> for OpRegistry<Op, P> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.slab[index]
     }

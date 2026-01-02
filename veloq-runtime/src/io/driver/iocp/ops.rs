@@ -1,8 +1,11 @@
-use crate::io::op::{
-    Accept, Connect, IoFd, IoResources, ReadFixed, Recv, RecvFrom, Send as OpSend, SendTo,
-    WriteFixed,
-};
+//! IOCP Operation Submission Implementations
+//!
+//! This module implements the `IocpSubmit` trait for all operation types,
+//! providing the logic to submit operations and handle completions.
+
+use crate::io::op::{Close, Connect, Fsync, IoFd, ReadFixed, Recv, Send as OpSend, WriteFixed};
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
@@ -13,11 +16,18 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
 
 use super::ext::Extensions;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use super::op::{IocpAccept, IocpOp, IocpOpen, IocpRecvFrom, IocpSendTo, IocpTimeout, IocpWakeup};
+
+// ============================================================================
+// Submission Result Types
+// ============================================================================
 
 pub enum SubmissionResult {
+    /// Operation is pending, will complete via IOCP.
     Pending,
+    /// Post to completion queue immediately (e.g., wakeup).
     PostToQueue,
+    /// Offload to thread pool for synchronous execution.
     Offload(Box<dyn FnOnce() -> io::Result<usize> + Send>),
 }
 
@@ -29,7 +39,12 @@ where
     Ok(SubmissionResult::Offload(Box::new(f)))
 }
 
+// ============================================================================
+// IocpSubmit Trait
+// ============================================================================
+
 pub(crate) trait IocpSubmit {
+    /// Submit the operation to IOCP.
     unsafe fn submit(
         &mut self,
         port: HANDLE,
@@ -38,10 +53,15 @@ pub(crate) trait IocpSubmit {
         registered_files: &[Option<HANDLE>],
     ) -> io::Result<SubmissionResult>;
 
+    /// Handle completion event.
     fn on_complete(&mut self, result: usize, _ext: &Extensions) -> io::Result<usize> {
         Ok(result)
     }
 }
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::Result<HANDLE> {
     match fd {
@@ -58,6 +78,10 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
         }
     }
 }
+
+// ============================================================================
+// Macro for File Operations
+// ============================================================================
 
 macro_rules! impl_file_op {
     ($Op:ty, $init_fn:expr, $api_fn:expr) => {
@@ -119,6 +143,10 @@ macro_rules! impl_wsa_op {
         }
     };
 }
+
+// ============================================================================
+// Direct Operations (Cross-Platform Structs)
+// ============================================================================
 
 impl_file_op!(
     ReadFixed,
@@ -188,7 +216,11 @@ impl_file_op!(
     }
 );
 
-impl IocpSubmit for Accept {
+// ============================================================================
+// Platform-Specific Operations (Iocp* Structs)
+// ============================================================================
+
+impl IocpSubmit for IocpAccept {
     unsafe fn submit(
         &mut self,
         port: HANDLE,
@@ -245,7 +277,7 @@ impl IocpSubmit for Accept {
             .fd
             .raw()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid listen socket fd"))?;
-        let listen_socket = listen_handle as usize as SOCKET;
+        let listen_socket = listen_handle as SOCKET;
 
         let ret = unsafe {
             setsockopt(
@@ -406,7 +438,7 @@ impl IocpSubmit for Connect {
 
         let ret = unsafe {
             setsockopt(
-                fd as usize as SOCKET,
+                fd as SOCKET,
                 SOL_SOCKET,
                 SO_UPDATE_CONNECT_CONTEXT,
                 std::ptr::null(),
@@ -422,7 +454,7 @@ impl IocpSubmit for Connect {
 }
 
 impl_wsa_op!(
-    SendTo,
+    IocpSendTo,
     |op: &mut Self| {
         op.wsabuf.len = op.buf.len() as u32;
         op.wsabuf.buf = op.buf.as_slice().as_ptr() as *mut u8;
@@ -443,7 +475,7 @@ impl_wsa_op!(
 );
 
 impl_wsa_op!(
-    RecvFrom,
+    IocpRecvFrom,
     |op: &mut Self| {
         op.wsabuf.len = op.buf.capacity() as u32;
         op.wsabuf.buf = op.buf.as_mut_ptr();
@@ -463,39 +495,7 @@ impl_wsa_op!(
     }
 );
 
-macro_rules! impl_iocp_submit {
-    (
-        WithFd { $( $(#[$meta_fd:meta])* $VariantFd:ident($InnerFd:ty) ),* $(,)? },
-        WithoutFd { $( $(#[$meta_no_fd:meta])* $VariantNoFd:ident($InnerNoFd:ty) ),* $(,)? }
-    ) => {
-        impl IocpSubmit for IoResources {
-            unsafe fn submit(
-                &mut self,
-                port: HANDLE,
-                overlapped: *mut OVERLAPPED,
-                ext: &Extensions,
-                registered_files: &[Option<HANDLE>],
-            ) -> io::Result<SubmissionResult> {
-                match self {
-                    $( $(#[$meta_fd])* IoResources::$VariantFd(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },)*
-                    $( $(#[$meta_no_fd])* IoResources::$VariantNoFd(op) => unsafe { op.submit(port, overlapped, ext, registered_files) },)*
-                    IoResources::None => Ok(SubmissionResult::PostToQueue),
-                }
-            }
-
-            fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
-                match self {
-                    $( $(#[$meta_fd])* IoResources::$VariantFd(op) => op.on_complete(result, ext),)*
-                    $( $(#[$meta_no_fd])* IoResources::$VariantNoFd(op) => op.on_complete(result, ext),)*
-                    IoResources::None => Ok(result),
-                }
-            }
-        }
-    }
-}
-
-// We need to implement IocpSubmit for Wakeup and Timeout since they are now part of the generic loop.
-impl IocpSubmit for crate::io::op::Wakeup {
+impl IocpSubmit for IocpWakeup {
     unsafe fn submit(
         &mut self,
         _port: HANDLE,
@@ -507,7 +507,7 @@ impl IocpSubmit for crate::io::op::Wakeup {
     }
 }
 
-impl IocpSubmit for crate::io::op::Timeout {
+impl IocpSubmit for IocpTimeout {
     unsafe fn submit(
         &mut self,
         _port: HANDLE,
@@ -519,9 +519,7 @@ impl IocpSubmit for crate::io::op::Timeout {
     }
 }
 
-veloq_macros::for_all_io_ops!(impl_iocp_submit);
-
-impl IocpSubmit for crate::io::op::Open {
+impl IocpSubmit for IocpOpen {
     unsafe fn submit(
         &mut self,
         _port: HANDLE,
@@ -534,22 +532,20 @@ impl IocpSubmit for crate::io::op::Open {
         let mode = self.mode;
 
         offload_task(move || {
-            // Synchronous open for IOCP MVP
             use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             use windows_sys::Win32::Storage::FileSystem::{
                 CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
             };
 
-            // self.path is Vec<u16> on Windows
             let path_ptr = path.as_ptr();
 
             let handle = unsafe {
                 CreateFileW(
                     path_ptr,
-                    flags as u32, // Simplified mapping
-                    0,            // share mode (0 = no share) - maybe should be configurable
+                    flags as u32,
+                    0,
                     std::ptr::null(),
-                    mode as u32, // creation disposition
+                    mode as u32,
                     FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
                     std::ptr::null_mut(),
                 )
@@ -565,7 +561,7 @@ impl IocpSubmit for crate::io::op::Open {
     }
 }
 
-impl IocpSubmit for crate::io::op::Close {
+impl IocpSubmit for Close {
     unsafe fn submit(
         &mut self,
         _port: HANDLE,
@@ -588,7 +584,7 @@ impl IocpSubmit for crate::io::op::Close {
     }
 }
 
-impl IocpSubmit for crate::io::op::Fsync {
+impl IocpSubmit for Fsync {
     unsafe fn submit(
         &mut self,
         _port: HANDLE,
@@ -608,5 +604,66 @@ impl IocpSubmit for crate::io::op::Fsync {
             }
             Ok(0)
         })
+    }
+}
+
+// ============================================================================
+// IocpOp Enum Dispatch
+// ============================================================================
+
+impl IocpSubmit for IocpOp {
+    unsafe fn submit(
+        &mut self,
+        port: HANDLE,
+        overlapped: *mut OVERLAPPED,
+        ext: &Extensions,
+        registered_files: &[Option<HANDLE>],
+    ) -> io::Result<SubmissionResult> {
+        unsafe {
+            match self {
+                IocpOp::ReadFixed(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::WriteFixed(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Recv(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Send(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Accept(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Connect(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::RecvFrom(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::SendTo(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Open(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Close(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Fsync(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Wakeup(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Timeout(op) => op.submit(port, overlapped, ext, registered_files),
+                IocpOp::Offload(op) => {
+                    if let Some(f) = op.take() {
+                        Ok(SubmissionResult::Offload(f))
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "Offload task already consumed",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
+        match self {
+            IocpOp::ReadFixed(op) => op.on_complete(result, ext),
+            IocpOp::WriteFixed(op) => op.on_complete(result, ext),
+            IocpOp::Recv(op) => op.on_complete(result, ext),
+            IocpOp::Send(op) => op.on_complete(result, ext),
+            IocpOp::Accept(op) => op.on_complete(result, ext),
+            IocpOp::Connect(op) => op.on_complete(result, ext),
+            IocpOp::RecvFrom(op) => op.on_complete(result, ext),
+            IocpOp::SendTo(op) => op.on_complete(result, ext),
+            IocpOp::Open(op) => op.on_complete(result, ext),
+            IocpOp::Close(op) => op.on_complete(result, ext),
+            IocpOp::Fsync(op) => op.on_complete(result, ext),
+            IocpOp::Wakeup(op) => op.on_complete(result, ext),
+            IocpOp::Timeout(op) => op.on_complete(result, ext),
+            IocpOp::Offload(_) => Ok(result),
+        }
     }
 }

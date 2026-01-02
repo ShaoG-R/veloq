@@ -1,6 +1,6 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
-use crate::io::op::{Accept, Connect, IoFd, Op, Recv, Send, SysRawOp};
+use crate::io::op::{Accept, Connect, IoFd, Op, OpLifecycle, Recv, Send, RawHandle};
 use crate::io::socket::Socket;
 use std::cell::RefCell;
 use std::io;
@@ -8,26 +8,30 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Weak;
 
 pub struct TcpListener {
-    fd: SysRawOp,
+    fd: RawHandle,
     driver: Weak<RefCell<PlatformDriver>>,
 }
 
 pub struct TcpStream {
-    fd: SysRawOp,
+    fd: RawHandle,
     driver: Weak<RefCell<PlatformDriver>>,
 }
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        use crate::io::socket::Socket;
-        let _ = unsafe { Socket::from_raw(self.fd) };
+        #[cfg(unix)]
+        let _ = unsafe { Socket::from_raw(self.fd as i32) };
+        #[cfg(windows)]
+        let _ = unsafe { Socket::from_raw(self.fd as *mut std::ffi::c_void) };
     }
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        use crate::io::socket::Socket;
-        let _ = unsafe { Socket::from_raw(self.fd) };
+        #[cfg(unix)]
+        let _ = unsafe { Socket::from_raw(self.fd as i32) };
+        #[cfg(windows)]
+        let _ = unsafe { Socket::from_raw(self.fd as *mut std::ffi::c_void) };
     }
 }
 
@@ -52,26 +56,23 @@ impl TcpListener {
         socket.listen(1024)?; // backlog
 
         Ok(Self {
-            fd: socket.into_raw(),
+            fd: socket.into_raw() as RawHandle,
             driver,
         })
     }
 
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        use crate::io::op::OpLifecycle;
-
-        // 1. Pre-allocate resources (platform specific)
+        // Pre-allocate resources (platform specific)
         let pre_alloc = Accept::pre_alloc(self.fd)?;
 
-        // 2. Create the Op
-        // Use IoFd::Raw
+        // Create the Op
         let op = Accept::into_op(self.fd, pre_alloc);
 
-        // 3. Submit and Await
+        // Submit and Await
         let future = Op::new(op, self.driver.clone());
-        let (res, op_back) = future.await;
+        let (res, op_back): (io::Result<usize>, Accept) = future.await;
 
-        // 4. Post-process to get output
+        // Post-process to get output
         let (fd, addr) = op_back.into_output(res)?;
 
         let stream = TcpStream {
@@ -83,10 +84,12 @@ impl TcpListener {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        use crate::io::socket::Socket;
         use std::mem::ManuallyDrop;
 
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
+        #[cfg(unix)]
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as i32)) };
+        #[cfg(windows)]
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as *mut std::ffi::c_void)) };
         socket.local_addr()
     }
 }
@@ -101,7 +104,7 @@ impl TcpStream {
         } else {
             Socket::new_tcp_v6()?
         };
-        let fd = socket.into_raw();
+        let fd = socket.into_raw() as RawHandle;
 
         let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(addr);
         let op = Connect {

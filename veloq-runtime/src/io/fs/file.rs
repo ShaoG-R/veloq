@@ -72,13 +72,14 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         use crate::io::driver::Driver;
-        use crate::io::op::IoOp;
+        use crate::io::op::IntoPlatformOp;
 
         // Try to submit a background close op
         let submitted = {
             let driver_weak = crate::runtime::current_driver();
             if let Some(driver_rc) = driver_weak.upgrade() {
-                let op = crate::io::op::Close { fd: self.fd }.into_resource();
+                let close = crate::io::op::Close { fd: self.fd };
+                let op = close.into_platform_op();
 
                 if let Ok(mut driver) = driver_rc.try_borrow_mut() {
                     driver.submit_background(op).is_ok()
@@ -95,7 +96,7 @@ impl Drop for File {
             if let Some(fd) = self.fd.raw() {
                 #[cfg(unix)]
                 unsafe {
-                    libc::close(fd);
+                    libc::close(fd as i32);
                 }
                 #[cfg(windows)]
                 unsafe {

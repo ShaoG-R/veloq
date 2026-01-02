@@ -1,5 +1,4 @@
 // use crate::buffer::FixedBuf;
-use crate::io::op::IoResources;
 
 #[cfg(target_os = "windows")]
 pub(crate) mod blocking;
@@ -7,22 +6,28 @@ pub(crate) mod op_registry;
 use std::io;
 use std::task::{Context, Poll};
 
+/// Platform-specific operation trait
+pub trait PlatformOp: 'static {}
+
 pub trait Driver {
+    /// Platform-specific operation type
+    type Op: PlatformOp;
+
     /// Register a new operation. Returns the user_data key.
     fn reserve_op(&mut self) -> usize;
 
     /// Submit an operation with its resources directly.
-    fn submit_op_resources(&mut self, user_data: usize, resources: IoResources);
+    fn submit(&mut self, user_data: usize, op: Self::Op);
 
     /// Poll operation status.
     fn poll_op(
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<usize>, IoResources)>;
+    ) -> Poll<(io::Result<usize>, Self::Op)>;
 
     /// Submit queued operations to the kernel.
-    fn submit(&mut self) -> io::Result<()>;
+    fn submit_queue(&mut self) -> io::Result<()>;
 
     /// Wait for completions.
     fn wait(&mut self) -> io::Result<()>;
@@ -49,7 +54,7 @@ pub trait Driver {
 
     /// Submit a fire-and-forget operation (e.g. Close).
     /// The driver takes ownership of resources and ensures cleanup.
-    fn submit_background(&mut self, _op: IoResources) -> io::Result<()>;
+    fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
 
     /// Wake up the driver from blocking wait.
     fn wake(&mut self) -> io::Result<()>;

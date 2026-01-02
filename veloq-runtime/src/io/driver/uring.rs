@@ -1,6 +1,4 @@
-// use crate::io::buffer::{BufferPool, FixedBuf};
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
-use crate::io::op::{IoOp, IoResources, Wakeup};
 use io_uring::{IoUring, opcode, squeue};
 use std::io;
 use std::os::unix::io::RawFd;
@@ -9,8 +7,11 @@ use std::task::{Context, Poll};
 use crate::io::driver::RemoteWaker;
 use std::sync::Arc;
 
+pub mod op;
 mod ops;
-use ops::UringOp;
+
+use op::{UringOp, UringWakeup};
+use ops::UringSubmit;
 
 struct UringWaker(RawFd);
 
@@ -48,7 +49,7 @@ pub struct UringDriver {
     ring: IoUring,
     /// Store for in-flight operations.
     /// The key (usize) is used as the io_uring user_data.
-    ops: OpRegistry<()>,
+    ops: OpRegistry<UringOp, ()>,
     waker_fd: RawFd,
     waker_token: Option<usize>,
 }
@@ -103,17 +104,23 @@ impl UringDriver {
             return;
         }
 
-        let fd = self.waker_fd;
-        let op = Wakeup::new(fd);
-        let resources = op.into_resource();
+        let fd = self.waker_fd as usize;
+        let op = UringWakeup::new(fd);
+        let uring_op = UringOp::Wakeup(op);
 
-        let user_data = self.reserve_op_internal();
+        let user_data = self.ops.insert(OpEntry::new(Some(uring_op), ()));
         self.waker_token = Some(user_data);
 
-        self.submit_op_resources_internal(user_data, resources);
+        // Generate and push SQE
+        if let Some(entry) = self.ops.get_mut(user_data) {
+            if let Some(ref mut resources) = entry.resources {
+                let sqe = resources.make_sqe().user_data(user_data as u64);
+                self.push_entry(sqe);
+            }
+        }
     }
 
-    pub fn submit(&mut self) -> io::Result<()> {
+    pub fn submit_to_kernel(&mut self) -> io::Result<()> {
         if self.ring.params().is_setup_sqpoll() {
             if self.ring.submission().need_wakeup() {
                 self.ring.submit()?;
@@ -133,17 +140,17 @@ impl UringDriver {
         // Optimization: check if we have completions available in userspace queue
         // before issuing a syscall to wait.
         if !self.ring.completion().is_empty() {
-            self.process_completions();
+            self.process_completions_internal();
             return Ok(());
         }
 
         self.ring.submit_and_wait(1)?;
-        self.process_completions();
+        self.process_completions_internal();
         Ok(())
     }
 
     /// Process the completion queue.
-    pub fn process_completions_internal(&mut self) {
+    fn process_completions_internal(&mut self) {
         let mut needs_waker_resubmit = false;
 
         {
@@ -171,7 +178,18 @@ impl UringDriver {
 
                 if self.ops.contains(user_data) {
                     let op = &mut self.ops[user_data];
-                    let res = op.resources.on_complete(cqe.result());
+
+                    // Call on_complete on the resources
+                    let res = if let Some(ref mut resources) = op.resources {
+                        resources.on_complete(cqe.result())
+                    } else {
+                        // No resources, just convert result
+                        if cqe.result() >= 0 {
+                            Ok(cqe.result() as usize)
+                        } else {
+                            Err(io::Error::from_raw_os_error(-cqe.result()))
+                        }
+                    };
 
                     if op.cancelled {
                         // Future is gone. Cleanup.
@@ -196,41 +214,11 @@ impl UringDriver {
         }
     }
 
-    /// Register a new operation.
-    /// Returns the user_data key.
-    /// `resources` are the moved-in buffers/fds that must live until completion.
-    /// Reserve a slot for an operation.
-    pub fn reserve_op_internal(&mut self) -> usize {
-        self.ops.insert(OpEntry::new(IoResources::None, ()))
-    }
-
-    /// Store resources for a reserved operation.
-    pub fn store_op_resources(&mut self, user_data: usize, resources: IoResources) {
-        if let Some(op) = self.ops.get_mut(user_data) {
-            op.resources = resources;
-        }
-    }
-
     /// Get a submission queue entry to fill.
-    /// The caller must fill it and verify it's valid.
-    /// NOTE: This API is tricky because `squeue::Entry` setup usually consumes it.
-    /// We'll let the Op construct the Entry and pass it here to push.
-    pub fn push_entry(&mut self, entry: squeue::Entry) {
+    fn push_entry(&mut self, entry: squeue::Entry) {
         let mut sq = self.ring.submission();
         // unsafe because we must ensure the entry is valid. Use io-uring guarantee.
         let _ = unsafe { sq.push(&entry) };
-    }
-
-    /// Submit an operation with its resources directly.
-    pub fn submit_op_resources_internal(&mut self, user_data: usize, mut resources: IoResources) {
-        // 1. Create SQE
-        let sqe = resources.make_sqe().user_data(user_data as u64);
-
-        // 2. Store resources
-        self.store_op_resources(user_data, resources);
-
-        // 3. Push to ring
-        self.push_entry(sqe);
     }
 
     /// Register buffers with the kernel invocation of io_uring.
@@ -240,17 +228,8 @@ impl UringDriver {
         unsafe { self.ring.submitter().register_buffers(&iovecs) }
     }
 
-    /// Called by the Future when it is polled.
-    pub fn poll_op(
-        &mut self,
-        user_data: usize,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<(io::Result<usize>, IoResources)> {
-        self.ops.poll_op(user_data, cx)
-    }
-
     /// Called when the Future is dropped.
-    pub fn cancel_op(&mut self, user_data: usize) {
+    fn cancel_op_internal(&mut self, user_data: usize) {
         if let Some(op) = self.ops.get_mut(user_data) {
             // We cannot remove it yet, because the kernel still has the pointer!
             // We just mark it cancelled. When CQE arrives, we'll drop resources.
@@ -268,51 +247,37 @@ impl UringDriver {
             self.push_entry(cancel_sqe);
         }
     }
-
-    pub fn register_files(
-        &mut self,
-        files: &[crate::io::op::SysRawOp],
-    ) -> io::Result<Vec<crate::io::op::IoFd>> {
-        // Note: this replaces the entire file table in io_uring currently.
-        // A more advanced implementation would use IORING_REGISTER_FILES_UPDATE
-        // to incrementally add files, or manage a sparse table.
-        // For now, we assume this is called once or manages the full set.
-        self.ring.submitter().register_files(files)?;
-
-        let mut fixed_fds = Vec::with_capacity(files.len());
-        for i in 0..files.len() {
-            fixed_fds.push(crate::io::op::IoFd::Fixed(i as u32));
-        }
-        Ok(fixed_fds)
-    }
-
-    pub fn unregister_files(&mut self, _files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
-        // specific file unregistration not strictly supported by raw unregister_files (which kills all)
-        // unless we use update with -1.
-        // For now, unregister all.
-        self.ring.submitter().unregister_files()
-    }
 }
 
 use crate::io::driver::Driver;
 
 impl Driver for UringDriver {
+    type Op = UringOp;
+
     fn reserve_op(&mut self) -> usize {
-        self.reserve_op_internal()
+        self.ops.insert(OpEntry::new(None, ()))
     }
 
-    fn submit_op_resources(&mut self, user_data: usize, resources: IoResources) {
-        self.submit_op_resources_internal(user_data, resources);
+    fn submit(&mut self, user_data: usize, mut op: Self::Op) {
+        // 1. Create SQE
+        let sqe = op.make_sqe().user_data(user_data as u64);
+
+        // 2. Store resources
+        if let Some(entry) = self.ops.get_mut(user_data) {
+            entry.resources = Some(op);
+        }
+
+        // 3. Push to ring
+        self.push_entry(sqe);
     }
 
-    fn submit_background(&mut self, mut op: IoResources) -> io::Result<()> {
+    fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
         match op {
-            IoResources::Close(_) => {
+            UringOp::Close(_) => {
                 let sqe = op.make_sqe().user_data(BACKGROUND_USER_DATA);
 
                 // Try to push
                 // Optimization: direct access to ring submission to handle full queue
-
                 let mut sq = self.ring.submission();
                 if unsafe { sq.push(&sqe) }.is_err() {
                     // Queue is full. Try to submit existing to clear space.
@@ -337,12 +302,12 @@ impl Driver for UringDriver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<usize>, IoResources)> {
-        self.poll_op(user_data, cx)
+    ) -> Poll<(io::Result<usize>, Self::Op)> {
+        self.ops.poll_op(user_data, cx)
     }
 
-    fn submit(&mut self) -> io::Result<()> {
-        self.submit()
+    fn submit_queue(&mut self) -> io::Result<()> {
+        self.submit_to_kernel()
     }
 
     fn wait(&mut self) -> io::Result<()> {
@@ -354,7 +319,7 @@ impl Driver for UringDriver {
     }
 
     fn cancel_op(&mut self, user_data: usize) {
-        self.cancel_op(user_data);
+        self.cancel_op_internal(user_data);
     }
 
     fn register_buffer_pool(&mut self, pool: &crate::io::buffer::BufferPool) -> io::Result<()> {
@@ -366,11 +331,26 @@ impl Driver for UringDriver {
         &mut self,
         files: &[crate::io::op::SysRawOp],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
-        self.register_files(files)
+        // Note: this replaces the entire file table in io_uring currently.
+        // A more advanced implementation would use IORING_REGISTER_FILES_UPDATE
+        // to incrementally add files, or manage a sparse table.
+        // For now, we assume this is called once or manages the full set.
+        // Convert usize to i32 for io_uring
+        let fds: Vec<i32> = files.iter().map(|&f| f as i32).collect();
+        self.ring.submitter().register_files(&fds)?;
+
+        let mut fixed_fds = Vec::with_capacity(files.len());
+        for i in 0..files.len() {
+            fixed_fds.push(crate::io::op::IoFd::Fixed(i as u32));
+        }
+        Ok(fixed_fds)
     }
 
-    fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
-        self.unregister_files(files)
+    fn unregister_files(&mut self, _files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
+        // specific file unregistration not strictly supported by raw unregister_files (which kills all)
+        // unless we use update with -1.
+        // For now, unregister all.
+        self.ring.submitter().unregister_files()
     }
 
     fn wake(&mut self) -> io::Result<()> {

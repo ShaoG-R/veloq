@@ -1,4 +1,5 @@
 mod ext;
+pub mod op;
 mod ops;
 #[cfg(test)]
 mod tests;
@@ -7,8 +8,8 @@ mod tests;
 use super::blocking::{ThreadPool, ThreadPoolError};
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
 use crate::io::driver::{Driver, RemoteWaker};
-use crate::io::op::IoResources;
 use ext::Extensions;
+use op::IocpOp;
 use ops::{IocpSubmit, SubmissionResult};
 use std::io;
 use std::task::{Context, Poll};
@@ -35,7 +36,7 @@ pub enum PlatformData {
 
 pub struct IocpDriver {
     port: HANDLE,
-    ops: OpRegistry<PlatformData>,
+    ops: OpRegistry<IocpOp, PlatformData>,
     extensions: Extensions,
     wheel: Wheel<usize>,
     registered_files: Vec<Option<HANDLE>>,
@@ -197,7 +198,11 @@ impl IocpDriver {
                             if result.is_ok() {
                                 // Apply post-processing (Accept/Connect fixups)
                                 let bytes = result.unwrap();
-                                let final_res = op.resources.on_complete(bytes, &self.extensions);
+                                let final_res = op
+                                    .resources
+                                    .as_mut()
+                                    .unwrap()
+                                    .on_complete(bytes, &self.extensions);
                                 op.result = Some(final_res);
                             } else {
                                 op.result = Some(result);
@@ -223,17 +228,18 @@ impl IocpDriver {
 }
 
 impl Driver for IocpDriver {
+    type Op = IocpOp;
+
     fn reserve_op(&mut self) -> usize {
-        self.ops
-            .insert(OpEntry::new(IoResources::None, PlatformData::None))
+        self.ops.insert(OpEntry::new(None, PlatformData::None))
     }
 
-    fn submit_op_resources(&mut self, user_data: usize, mut resources: IoResources) {
-        if let IoResources::Timeout(op) = &resources {
+    fn submit(&mut self, user_data: usize, mut op: Self::Op) {
+        if let IocpOp::Timeout(t) = &op {
             // Handle timeout
-            let id = self.wheel.insert(user_data, op.duration);
+            let id = self.wheel.insert(user_data, t.duration);
             if let Some(op_entry) = self.ops.get_mut(user_data) {
-                op_entry.resources = resources;
+                op_entry.resources = Some(op);
                 op_entry.platform_data = PlatformData::Timer(id);
             }
             return;
@@ -250,7 +256,7 @@ impl Driver for IocpDriver {
 
         // Pass registered_files to submit
         let submission_result = unsafe {
-            resources.submit(
+            op.submit(
                 self.port,
                 overlapped_ptr,
                 &self.extensions,
@@ -258,35 +264,25 @@ impl Driver for IocpDriver {
             )
         };
 
-        if let Some(op) = self.ops.get_mut(user_data) {
+        if let Some(op_entry) = self.ops.get_mut(user_data) {
             match submission_result {
                 Ok(SubmissionResult::Pending) => {
-                    op.resources = resources;
-                    op.platform_data = PlatformData::Overlapped(entry);
+                    op_entry.resources = Some(op);
+                    op_entry.platform_data = PlatformData::Overlapped(entry);
                     // Start async operation, wait for completion on port
                 }
 
                 Ok(SubmissionResult::PostToQueue) => {
-                    op.resources = resources;
-                    op.platform_data = PlatformData::Overlapped(entry);
+                    op_entry.resources = Some(op);
+                    op_entry.platform_data = PlatformData::Overlapped(entry);
                     unsafe {
                         PostQueuedCompletionStatus(self.port, 0, 0, overlapped_ptr);
                     }
                 }
                 Ok(SubmissionResult::Offload(task_fn)) => {
-                    op.resources = resources;
+                    op_entry.resources = Some(op);
                     // Keep the entry alive in platform_data
-                    // The raw pointer is safe to use in the thread because we keep the Box alive here
-                    op.platform_data = PlatformData::Overlapped(entry);
-
-                    // We need a raw pointer that is valid. Box inside PlatformData::Overlapped owns it.
-                    // Accessing it via raw pointer in another thread is unsafe.
-                    // We must ensure 'op' does not drop 'entry' while thread is running.
-                    // This is guaranteed because cancellation is deferred until completion event.
-
-                    // However, we can't easily get the raw pointer equivalent to 'entry' because we moved it into the enum.
-                    // But we already have 'overlapped_ptr' from before the move!
-                    // And cast it back to OverlappedEntry for the task to write result.
+                    op_entry.platform_data = PlatformData::Overlapped(entry);
 
                     let entry_ptr_val = overlapped_ptr as usize;
                     let port_val = self.port as usize;
@@ -316,18 +312,16 @@ impl Driver for IocpDriver {
                         Ok(_) => {}
                         Err(ThreadPoolError::Overloaded) => {
                             // Fail the operation immediately
-                            op.result = Some(Err(io::Error::new(
+                            op_entry.result = Some(Err(io::Error::new(
                                 io::ErrorKind::Other,
                                 "blocking pool overloaded",
                             )));
-                            // We don't need to clean up platform_data here, user will see result and drop op,
-                            // triggering cancel_op which handles cleanup.
                         }
                     }
                 }
                 Err(e) => {
-                    op.resources = resources;
-                    op.result = Some(Err(e));
+                    op_entry.resources = Some(op);
+                    op_entry.result = Some(Err(e));
                 }
             }
         }
@@ -337,11 +331,11 @@ impl Driver for IocpDriver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<usize>, IoResources)> {
+    ) -> Poll<(io::Result<usize>, Self::Op)> {
         self.ops.poll_op(user_data, cx)
     }
 
-    fn submit(&mut self) -> io::Result<()> {
+    fn submit_queue(&mut self) -> io::Result<()> {
         Ok(())
     }
 
@@ -353,7 +347,9 @@ impl Driver for IocpDriver {
     }
 
     fn process_completions(&mut self) {
-        let _ = self.get_completion(0);
+        // Use a short timeout (1ms) instead of 0 to avoid busy-waiting
+        // when IO operations are pending but not yet complete
+        let _ = self.get_completion(1);
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -370,11 +366,14 @@ impl Driver for IocpDriver {
                 }
                 PlatformData::Overlapped(overlapped) => {
                     // Check for handles and CancelIoEx
-                    if let Some(fd) = op.resources.get_fd() {
-                        if let Ok(handle) = ops::resolve_fd(fd, &self.registered_files) {
-                            unsafe {
-                                use windows_sys::Win32::System::IO::CancelIoEx;
-                                let _ = CancelIoEx(handle, &overlapped.inner as *const _ as *mut _);
+                    if let Some(res) = &op.resources {
+                        if let Some(fd) = res.get_fd() {
+                            if let Ok(handle) = ops::resolve_fd(fd, &self.registered_files) {
+                                unsafe {
+                                    use windows_sys::Win32::System::IO::CancelIoEx;
+                                    let _ =
+                                        CancelIoEx(handle, &overlapped.inner as *const _ as *mut _);
+                                }
                             }
                         }
                     }
@@ -436,9 +435,9 @@ impl Driver for IocpDriver {
         Ok(())
     }
 
-    fn submit_background(&mut self, op: IoResources) -> io::Result<()> {
+    fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         match op {
-            IoResources::Close(close) => {
+            IocpOp::Close(close) => {
                 if let Some(fd) = close.fd.raw() {
                     // Offload CloseHandle to thread pool
                     // We must own the fd. SysRawOp is Copy (u32/size_t or similar handle), so we copy it.

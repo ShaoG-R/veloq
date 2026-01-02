@@ -1,11 +1,12 @@
 use super::*;
 use crate::io::buffer::{BufferPool, BufferSize};
-use crate::io::op::{Accept, Connect, IoOp, IoResources, OpLifecycle, Recv, Timeout};
+use crate::io::driver::Driver;
+use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, Recv, Timeout, RawHandle};
 use crate::io::socket::Socket;
+use op::{IocpAccept, IocpOp};
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use windows_sys::Win32::Foundation::HANDLE;
 
 fn noop_waker() -> Waker {
     unsafe fn clone(_: *const ()) -> RawWaker {
@@ -38,18 +39,22 @@ fn test_iocp_accept() {
     // Listener (Bind to random port)
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = std_listener.local_addr().unwrap();
-    let listener_handle = std_listener.into_raw_socket() as HANDLE;
+    let listener_handle = std_listener.into_raw_socket() as RawHandle;
 
-    // Acceptor
+    // Acceptor - pre-create the socket for AcceptEx
     let acceptor = Socket::new_tcp_v4().expect("Acceptor socket creation failed");
-    let acceptor_handle = acceptor.into_raw();
+    let acceptor_handle = acceptor.into_raw() as RawHandle;
 
-    // Prepare Accept Op
-    // Accept::into_op expects pre-alloc (accept_socket) which is SysRawOp (*mut c_void)
-    let accept_op = Accept::into_op(listener_handle as _, acceptor_handle as usize as _);
-    let resources = IoResources::Accept(accept_op);
+    // Prepare Accept Op using OpLifecycle
+    // On Windows, PreAlloc is RawHandle (the pre-created accept socket)
+    let accept_op = Accept::into_op(listener_handle, acceptor_handle);
+    // Convert to IocpAccept and set accept_socket
+    let mut iocp_accept: IocpAccept = accept_op.into();
+    iocp_accept.accept_socket = acceptor_handle;
+
+    let iocp_op = IocpOp::Accept(iocp_accept);
     let user_data = driver.reserve_op();
-    driver.submit_op_resources(user_data, resources);
+    driver.submit(user_data, iocp_op);
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -70,10 +75,10 @@ fn test_iocp_accept() {
         driver.process_completions();
 
         match driver.poll_op(user_data, &mut cx) {
-            Poll::Ready((res, resources)) => {
+            Poll::Ready((res, iocp_op)) => {
                 assert!(res.is_ok(), "Accept failed: {:?}", res.err());
-                match resources {
-                    IoResources::Accept(op) => {
+                match iocp_op {
+                    IocpOp::Accept(op) => {
                         assert!(op.remote_addr.is_some(), "Remote addr should be populated");
                         unsafe {
                             if let Some(fd) = op.fd.raw() {
@@ -103,7 +108,7 @@ fn test_iocp_connect() {
 
     // Client Socket
     let client = Socket::new_tcp_v4().unwrap();
-    let client_handle = client.into_raw();
+    let client_handle = client.into_raw() as RawHandle;
 
     // Create Connect Op manually as it doesn't have into_op
     use crate::io::socket::socket_addr_trans;
@@ -115,10 +120,10 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    // Connect implements IoOp
-    let resources = connect_op.into_resource();
+    // Connect implements IntoPlatformOp
+    let iocp_op = connect_op.into_platform_op();
     let user_data = driver.reserve_op();
-    driver.submit_op_resources(user_data, resources);
+    driver.submit(user_data, iocp_op);
 
     // Poll
     let waker = noop_waker();
@@ -149,9 +154,9 @@ fn test_iocp_timeout() {
         duration: std::time::Duration::from_millis(100),
     };
 
-    let resources = IoResources::Timeout(timeout_op);
+    let iocp_op = IocpOp::Timeout(timeout_op.into());
     let user_data = driver.reserve_op();
-    driver.submit_op_resources(user_data, resources);
+    driver.submit(user_data, iocp_op);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -199,7 +204,7 @@ fn test_iocp_recv_with_buffer_pool() {
     });
 
     let (stream, _) = listener.accept().unwrap();
-    let stream_handle = stream.into_raw_socket() as HANDLE;
+    let stream_handle = stream.into_raw_socket() as RawHandle;
 
     // Alloc buffer
     let buf = pool
@@ -212,9 +217,9 @@ fn test_iocp_recv_with_buffer_pool() {
         buf,
     };
 
-    let resources = recv_op.into_resource();
+    let iocp_op = recv_op.into_platform_op();
     let user_data = driver.reserve_op();
-    driver.submit_op_resources(user_data, resources);
+    driver.submit(user_data, iocp_op);
 
     // Poll
     let waker = noop_waker();
@@ -228,19 +233,19 @@ fn test_iocp_recv_with_buffer_pool() {
         driver.process_completions();
 
         match driver.poll_op(user_data, &mut cx) {
-            Poll::Ready((res, resources)) => {
+            Poll::Ready((res, iocp_op)) => {
                 assert!(res.is_ok(), "Recv failed: {:?}", res.err());
                 let bytes_read = res.unwrap();
                 assert_eq!(bytes_read, 12);
 
-                if let IoResources::Recv(mut op) = resources {
+                if let IocpOp::Recv(mut op) = iocp_op {
                     op.buf.set_len(bytes_read);
                     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
                 } else {
                     panic!("Wrong resource type");
                 }
 
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle) };
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle as _) };
                 break;
             }
             Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),

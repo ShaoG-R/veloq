@@ -101,7 +101,14 @@ impl LocalExecutor {
 
     /// Create a new local executor for testing (no global injection).
     pub fn new() -> Self {
-        Self::create_internal(None, None, None, None, None, crate::config::Config::default())
+        Self::create_internal(
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::config::Config::default(),
+        )
     }
 
     /// Create a new local executor with global injection support.
@@ -295,7 +302,7 @@ impl LocalExecutor {
             let mut driver = self.driver.borrow_mut();
             if has_pending_tasks {
                 // There are tasks waiting to run, don't block on IO
-                driver.submit().unwrap();
+                driver.submit_queue().unwrap();
                 driver.process_completions();
             } else {
                 // No tasks ready, we MUST wait for IO to make progress

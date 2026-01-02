@@ -1,5 +1,5 @@
 [workspace]
-members = ["veloq-macros",
+members = [
     "veloq-runtime",
     "veloq-wheel",
 ]

@@ -1,5 +1,5 @@
-use std::path::Path;
 use crate::io::op::{Op, Open};
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -107,7 +107,7 @@ impl OpenOptions {
         }
 
         Ok(Open {
-            path: path_c,
+            path: path_c.into_bytes(),
             flags,
             mode: self.mode,
         })
@@ -153,8 +153,14 @@ impl OpenOptions {
             (false, _, false) => OPEN_EXISTING,    // 默认 = 必须存在
         };
 
+        // Convert Vec<u16> to Vec<u8> for storage
+        // The platform driver will convert back to Vec<u16> when needed
+        let path_bytes: Vec<u8> = path_w.iter()
+            .flat_map(|&c| c.to_le_bytes())
+            .collect();
+
         Ok(Open {
-            path: path_w,
+            path: path_bytes,
             flags: access as i32, // 对应 Win32 dwDesiredAccess
             mode: disposition,    // 对应 Win32 dwCreationDisposition
         })
