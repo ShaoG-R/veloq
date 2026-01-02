@@ -20,10 +20,6 @@ use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_HANDLE_EOF, GetLastError, HANDLE,
     INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, setsockopt,
-};
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
 };
@@ -200,10 +196,12 @@ impl IocpDriver {
 
                             if result.is_ok() {
                                 // Apply post-processing (Accept/Connect fixups)
-                                Self::post_process_overlapped(op, &self.extensions);
-                            }
-
-                            if op.result.is_none() {
+                                let bytes = result.unwrap();
+                                let final_res = op
+                                    .resources
+                                    .on_complete(bytes, &self.extensions);
+                                op.result = Some(final_res);
+                            } else {
                                 op.result = Some(result);
                             }
                             result_is_ready = true;
@@ -223,104 +221,6 @@ impl IocpDriver {
         }
 
         Ok(())
-    }
-
-    // Helper to keep get_completion clean
-    fn post_process_overlapped(op: &mut OpEntry<PlatformData>, extensions: &Extensions) {
-        match &mut op.resources {
-            IoResources::Accept(accept_op) => {
-                if let Some(fd) = accept_op.fd.raw() {
-                    let accept_socket = accept_op.accept_socket;
-                    let listen_socket = fd as SOCKET;
-                    let ret = unsafe {
-                        setsockopt(
-                            accept_socket as SOCKET,
-                            SOL_SOCKET,
-                            SO_UPDATE_ACCEPT_CONTEXT,
-                            &listen_socket as *const _ as *const _,
-                            std::mem::size_of_val(&listen_socket) as i32,
-                        )
-                    };
-                    if ret != 0 {
-                        op.result = Some(Err(io::Error::last_os_error()));
-                    } else {
-                        // Parse addresses and backfill
-                        const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-                        let split = MIN_ADDR_LEN;
-
-                        let mut local_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
-                        let mut remote_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
-                        let mut local_len: i32 = 0;
-                        let mut remote_len: i32 = 0;
-
-                        unsafe {
-                            (extensions.get_accept_ex_sockaddrs)(
-                                accept_op.addr.as_ptr() as *const _,
-                                0,
-                                split as u32,
-                                split as u32,
-                                &mut local_sockaddr,
-                                &mut local_len,
-                                &mut remote_sockaddr,
-                                &mut remote_len,
-                            );
-                        }
-
-                        if !remote_sockaddr.is_null() && remote_len > 0 {
-                            unsafe {
-                                let family = (*remote_sockaddr).sa_family;
-                                if family == AF_INET as u16 {
-                                    let addr_in = &*(remote_sockaddr as *const SOCKADDR_IN);
-                                    let ip = std::net::Ipv4Addr::from(
-                                        addr_in.sin_addr.S_un.S_addr.to_ne_bytes(),
-                                    );
-                                    let port = u16::from_be(addr_in.sin_port);
-                                    accept_op.remote_addr = Some(std::net::SocketAddr::V4(
-                                        std::net::SocketAddrV4::new(ip, port),
-                                    ));
-                                } else if family == AF_INET6 as u16 {
-                                    let addr_in6 = &*(remote_sockaddr as *const SOCKADDR_IN6);
-                                    let ip = std::net::Ipv6Addr::from(addr_in6.sin6_addr.u.Byte);
-                                    let port = u16::from_be(addr_in6.sin6_port);
-                                    let flowinfo = addr_in6.sin6_flowinfo;
-                                    let scope_id = addr_in6.Anonymous.sin6_scope_id;
-                                    accept_op.remote_addr = Some(std::net::SocketAddr::V6(
-                                        std::net::SocketAddrV6::new(ip, port, flowinfo, scope_id),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    op.result = Some(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Invalid listen socket fd",
-                    )));
-                }
-            }
-            IoResources::Connect(connect_op) => {
-                if let Some(fd) = connect_op.fd.raw() {
-                    let ret = unsafe {
-                        setsockopt(
-                            fd as SOCKET,
-                            SOL_SOCKET,
-                            SO_UPDATE_CONNECT_CONTEXT,
-                            std::ptr::null(),
-                            0,
-                        )
-                    };
-                    if ret != 0 {
-                        op.result = Some(Err(io::Error::last_os_error()));
-                    }
-                } else {
-                    op.result = Some(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Invalid socket fd",
-                    )));
-                }
-            }
-            _ => {}
-        }
     }
 }
 

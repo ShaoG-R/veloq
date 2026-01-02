@@ -171,11 +171,7 @@ impl UringDriver {
 
                 if self.ops.contains(user_data) {
                     let op = &mut self.ops[user_data];
-                    let res = if cqe.result() >= 0 {
-                        Ok(cqe.result() as usize)
-                    } else {
-                        Err(io::Error::from_raw_os_error(-cqe.result()))
-                    };
+                    let res = op.resources.on_complete(cqe.result());
 
                     if op.cancelled {
                         // Future is gone. Cleanup.

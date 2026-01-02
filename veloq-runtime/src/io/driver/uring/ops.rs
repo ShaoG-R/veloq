@@ -6,6 +6,14 @@ use io_uring::{opcode, squeue, types};
 // Internal trait to generate SQEs
 pub(crate) trait UringOp {
     fn make_sqe(&mut self) -> squeue::Entry;
+
+    fn on_complete(&mut self, result: i32) -> std::io::Result<usize> {
+        if result >= 0 {
+            Ok(result as usize)
+        } else {
+            Err(std::io::Error::from_raw_os_error(-result))
+        }
+    }
 }
 
 impl UringOp for ReadFixed {
@@ -73,6 +81,31 @@ impl UringOp for IoResources {
             IoResources::None => opcode::Nop::new().build(),
         }
     }
+
+    fn on_complete(&mut self, result: i32) -> std::io::Result<usize> {
+        match self {
+            IoResources::ReadFixed(op) => op.on_complete(result),
+            IoResources::WriteFixed(op) => op.on_complete(result),
+            IoResources::Send(op) => op.on_complete(result),
+            IoResources::Recv(op) => op.on_complete(result),
+            IoResources::Timeout(op) => op.on_complete(result),
+            IoResources::Accept(op) => op.on_complete(result),
+            IoResources::Connect(op) => op.on_complete(result),
+            IoResources::SendTo(op) => op.on_complete(result),
+            IoResources::RecvFrom(op) => op.on_complete(result),
+            IoResources::Wakeup(op) => op.on_complete(result),
+            IoResources::Open(op) => op.on_complete(result),
+            IoResources::Close(op) => op.on_complete(result),
+            IoResources::Fsync(op) => op.on_complete(result),
+            IoResources::None => {
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(-result))
+                }
+            }
+        }
+    }
 }
 
 impl UringOp for Timeout {
@@ -99,6 +132,18 @@ impl UringOp for Accept {
                 self.addr_len.as_mut() as *mut _,
             )
             .build(),
+        }
+    }
+
+    fn on_complete(&mut self, result: i32) -> std::io::Result<usize> {
+        if result >= 0 {
+            // Try fallback parsing to populate remote_addr early
+            if let Ok(addr) = crate::io::socket::to_socket_addr(&self.addr) {
+                self.remote_addr = Some(addr);
+            }
+            Ok(result as usize)
+        } else {
+            Err(std::io::Error::from_raw_os_error(-result))
         }
     }
 }
