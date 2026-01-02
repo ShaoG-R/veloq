@@ -1,24 +1,32 @@
 use super::open_options::OpenOptions; // Use generic OpenOptions
-use crate::io::buffer::FixedBuf;
+use crate::io::buffer::{BufPool, FixedBuf};
+use crate::io::driver::PlatformDriver;
 use crate::io::op::{Fallocate, Fsync, IoFd, Op, ReadFixed, SyncFileRange, WriteFixed};
+use crate::runtime::context::RuntimeContext;
+use std::cell::RefCell;
 use std::io;
 use std::path::Path;
+use std::rc::Weak;
 
-pub struct File {
+pub struct File<P: BufPool> {
     pub(crate) fd: IoFd,
+    pub(crate) driver: Weak<RefCell<PlatformDriver<P>>>,
 }
 
-impl File {
-    pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
-        OpenOptions::new().read(true).open(path).await
+impl<P: BufPool> File<P> {
+    pub async fn open(path: impl AsRef<Path>, context: &RuntimeContext<P>) -> io::Result<File<P>> {
+        OpenOptions::new().read(true).open(path, context).await
     }
 
-    pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
+    pub async fn create(
+        path: impl AsRef<Path>,
+        context: &RuntimeContext<P>,
+    ) -> io::Result<File<P>> {
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)
+            .open(path, context)
             .await
     }
 
@@ -26,24 +34,28 @@ impl File {
         OpenOptions::new()
     }
 
-    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
+    pub async fn read_at(&self, buf: FixedBuf<P>, offset: u64) -> (io::Result<usize>, FixedBuf<P>) {
         let op = ReadFixed {
             fd: self.fd,
             buf,
             offset,
         };
-        let driver = crate::runtime::current_driver();
+        let driver = self.driver.clone();
         let (res, op) = Op::new(op, driver).await;
         (res, op.buf)
     }
 
-    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
+    pub async fn write_at(
+        &self,
+        buf: FixedBuf<P>,
+        offset: u64,
+    ) -> (io::Result<usize>, FixedBuf<P>) {
         let op = WriteFixed {
             fd: self.fd,
             buf,
             offset,
         };
-        let driver = crate::runtime::current_driver();
+        let driver = self.driver.clone();
         let (res, op) = Op::new(op, driver).await;
         (res, op.buf)
     }
@@ -53,7 +65,7 @@ impl File {
             fd: self.fd,
             datasync: false,
         };
-        let driver = crate::runtime::current_driver();
+        let driver = self.driver.clone();
         let (res, _) = Op::new(op, driver).await;
         res.map(|_| ())
     }
@@ -63,7 +75,7 @@ impl File {
             fd: self.fd,
             datasync: true,
         };
-        let driver = crate::runtime::current_driver();
+        let driver = self.driver.clone();
         let (res, _) = Op::new(op, driver).await;
         res.map(|_| ())
     }
@@ -85,7 +97,7 @@ impl File {
             nbytes,
             flags: flags as u32,
         };
-        let driver = crate::runtime::current_driver();
+        let driver = self.driver.clone();
         let (res, _) = Op::new(op, driver).await;
         res.map(|_| ())
     }
@@ -97,20 +109,20 @@ impl File {
             offset,
             len,
         };
-        let driver = crate::runtime::current_driver();
+        let driver = self.driver.clone();
         let (res, _) = Op::new(op, driver).await;
         res.map(|_| ())
     }
 }
 
-impl Drop for File {
+impl<P: BufPool> Drop for File<P> {
     fn drop(&mut self) {
         use crate::io::driver::Driver;
         use crate::io::op::IntoPlatformOp;
 
         // Try to submit a background close op
         let submitted = {
-            let driver_weak = crate::runtime::current_driver();
+            let driver_weak = self.driver.clone();
             if let Some(driver_rc) = driver_weak.upgrade() {
                 let close = crate::io::op::Close { fd: self.fd };
                 let op = close.into_platform_op();

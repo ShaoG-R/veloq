@@ -10,8 +10,9 @@ use std::sync::Arc;
 pub mod op;
 mod submit;
 
-use op::{UringOp, UringWakeupExtras};
-use submit::UringSubmit;
+use crate::io::driver::uring::op::{UringOp, UringWakeupExtras};
+use crate::io::driver::uring::submit::UringSubmit;
+use crate::io::buffer::BufPool;
 
 struct UringWaker(RawFd);
 
@@ -44,17 +45,17 @@ impl Drop for UringWaker {
 const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 
-pub struct UringDriver {
+pub struct UringDriver<P: BufPool> {
     /// The actual io_uring instance
     ring: IoUring,
     /// Store for in-flight operations.
     /// The key (usize) is used as the io_uring user_data.
-    ops: OpRegistry<UringOp, ()>,
+    ops: OpRegistry<UringOp<P>, ()>,
     waker_fd: RawFd,
     waker_token: Option<usize>,
 }
 
-impl UringDriver {
+impl<P: BufPool> UringDriver<P> {
     pub fn new(config: &crate::config::Config) -> io::Result<Self> {
         let entries = config.uring.entries;
         let mut builder = IoUring::builder();
@@ -270,8 +271,9 @@ impl UringDriver {
 
 use crate::io::driver::Driver;
 
-impl Driver for UringDriver {
-    type Op = UringOp;
+impl<P: BufPool> Driver for UringDriver<P> {
+    type Op = UringOp<P>;
+    type Pool = P;
 
     fn reserve_op(&mut self) -> usize {
         self.ops.insert(OpEntry::new(None, ()))
@@ -347,9 +349,17 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffer_pool(&mut self, pool: &crate::io::buffer::BufferPool) -> io::Result<()> {
-        let iovecs = pool.get_all_ptrs();
-        self.register_buffers(iovecs)
+    fn register_buffer_pool(&mut self, pool: &Self::Pool) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let iovecs = pool.get_registration_buffers();
+            self.register_buffers(iovecs)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pool;
+            Ok(())
+        }
     }
 
     fn register_files(
@@ -400,7 +410,7 @@ impl Driver for UringDriver {
     }
 }
 
-impl Drop for UringDriver {
+impl<P: BufPool> Drop for UringDriver<P> {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.waker_fd);

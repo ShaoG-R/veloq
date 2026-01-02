@@ -44,6 +44,24 @@ impl BufferSize {
     }
 }
 
+/// Trait for memory pool implementation allows custom memory management
+pub trait BufPool: Clone + std::fmt::Debug + 'static {
+    fn new() -> Self;
+    /// Allocate memory of at least `size` bytes.
+    /// Returns (ptr, capacity, global_index, context)
+    /// 
+    /// - `global_index` is the index used for io_uring registration (if applicable)
+    /// - `context` is an opaque value passed back to dealloc
+    fn alloc_mem(&self, size: usize) -> Option<(NonNull<u8>, usize, u16, usize)>;
+
+    /// Deallocate memory.
+    unsafe fn dealloc_mem(&self, ptr: NonNull<u8>, cap: usize, context: usize);
+
+    /// Get all buffers for io_uring registration.
+    #[cfg(target_os = "linux")]
+    fn get_registration_buffers(&self) -> Vec<libc::iovec>;
+}
+
 struct Slab {
     config: SlabConfig,
     memory: Vec<u8>,
@@ -55,8 +73,16 @@ struct PoolInner {
     slabs: Vec<Slab>,
 }
 
+#[derive(Clone)]
 pub struct BufferPool {
     inner: Rc<RefCell<PoolInner>>,
+}
+
+impl std::fmt::Debug for BufferPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferPool")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BufferPool {
@@ -91,33 +117,68 @@ impl BufferPool {
     }
 
     /// Allocate a buffer from the specified size class.
-    pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf> {
-        let mut inner = self.inner.borrow_mut();
-        let slab_idx = size as usize;
+    pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf<BufferPool>> {
+        self.alloc_mem(size.size())
+            .map(|(ptr, cap, global_index, context)| FixedBuf {
+                pool: self.clone(),
+                ptr,
+                cap,
+                len: 0,
+                global_index,
+                context,
+            })
+    }
 
-        // Safety: BufferSize variants match SLABS indices exactly
+    // Support registering these buffers with io_uring
+
+}
+
+impl BufPool for BufferPool {
+    fn new() -> Self {
+        BufferPool::new()
+    }
+
+    fn alloc_mem(&self, size: usize) -> Option<(NonNull<u8>, usize, u16, usize)> {
+        let mut inner = self.inner.borrow_mut();
+        // Determine best slab (smallest that fits)
+        let slab_idx = SLABS
+            .iter()
+            .position(|c| c.block_size >= size)?;
+
+        // Safety: SLABS indices map 1:1 if we used position. 
+        // But we must be sure inner.slabs matches SLABS. It does by construction.
         let slab = &mut inner.slabs[slab_idx];
 
         if let Some(index) = slab.free_indices.pop() {
             let ptr = unsafe { slab.memory.as_mut_ptr().add(index * slab.config.block_size) };
+            
+            // Encode slab_idx (0-2) and index (0-1024) into usize context
+            // Using (slab_idx << 16) | index
+            let context = (slab_idx << 16) | index;
 
-            Some(FixedBuf {
-                slab_index: slab_idx as u8,
-                index,
-                global_index: slab.global_index_offset + index as u16,
-                ptr: NonNull::new(ptr).unwrap(),
-                len: 0,
-                cap: slab.config.block_size,
-                pool: self.inner.clone(),
-            })
+            Some((
+                NonNull::new(ptr).unwrap(), 
+                slab.config.block_size, 
+                slab.global_index_offset + index as u16,
+                context
+            ))
         } else {
             None
         }
     }
 
-    // Support registering these buffers with io_uring
+    unsafe fn dealloc_mem(&self, _ptr: NonNull<u8>, _cap: usize, context: usize) {
+        let mut inner = self.inner.borrow_mut();
+        let slab_idx = context >> 16;
+        let index = context & 0xFFFF;
+
+        if let Some(slab) = inner.slabs.get_mut(slab_idx) {
+            slab.free_indices.push(index);
+        }
+    }
+
     #[cfg(target_os = "linux")]
-    pub(crate) fn get_all_ptrs(&self) -> Vec<libc::iovec> {
+    fn get_registration_buffers(&self) -> Vec<libc::iovec> {
         let inner = self.inner.borrow();
         let mut iovecs = Vec::new();
 
@@ -134,20 +195,19 @@ impl BufferPool {
     }
 }
 
-pub struct FixedBuf {
-    slab_index: u8,
-    index: usize,
-    global_index: u16,
+pub struct FixedBuf<P: BufPool> {
+    pool: P,
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
-    pool: Rc<RefCell<PoolInner>>,
+    global_index: u16,
+    context: usize,
 }
 
 // Safety: This buffer is generally not Send because it refers to thread-local pool logic
 // but in Thread-per-Core it stays on thread.
 
-impl FixedBuf {
+impl<P: BufPool> FixedBuf<P> {
     pub fn buf_index(&self) -> u16 {
         self.global_index
     }
@@ -184,12 +244,10 @@ impl FixedBuf {
     }
 }
 
-impl Drop for FixedBuf {
+impl<P: BufPool> Drop for FixedBuf<P> {
     fn drop(&mut self) {
-        // Return index to pool
-        let mut inner = self.pool.borrow_mut();
-        if let Some(slab) = inner.slabs.get_mut(self.slab_index as usize) {
-            slab.free_indices.push(self.index);
+        unsafe {
+            self.pool.dealloc_mem(self.ptr, self.cap, self.context);
         }
     }
 }

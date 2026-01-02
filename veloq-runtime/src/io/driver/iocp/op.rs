@@ -6,6 +6,7 @@
 //! - Platform-specific "extra" structures
 //! - `IntoPlatformOp` implementations
 
+use crate::io::buffer::BufPool;
 use crate::io::driver::PlatformOp;
 use crate::io::driver::iocp::IocpDriver;
 use crate::io::op::{
@@ -102,7 +103,7 @@ impl OpAbi for IocpAbi {
     type Timeout = IocpTimeoutExtras; // Or () if we don't store state
 }
 
-pub type IocpOp = Operation<IocpAbi>;
+pub type IocpOp<P> = Operation<IocpAbi, P>;
 
 // IocpOp needs to be Send
 unsafe impl Send for IocpAbi {}
@@ -112,9 +113,9 @@ unsafe impl Send for IocpAbi {}
 // So we need unsafe impl Send for OverlappedEntry.
 unsafe impl Send for OverlappedEntry {}
 
-impl PlatformOp for IocpOp {}
+impl<P: BufPool> PlatformOp for IocpOp<P> {}
 
-impl IocpOp {
+impl<P: BufPool> IocpOp<P> {
     pub fn entry_mut(&mut self) -> Option<&mut OverlappedEntry> {
         match self {
             Self::ReadFixed(_, entry) => Some(entry),
@@ -140,13 +141,13 @@ impl IocpOp {
 // IntoPlatformOp Implementations
 // ============================================================================
 
-macro_rules! impl_into_iocp_op_simple {
+macro_rules! impl_into_iocp_op_generic {
     ($Type:ident) => {
-        impl IntoPlatformOp<IocpDriver> for $Type {
-            fn into_platform_op(self) -> IocpOp {
+        impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for $Type<P> {
+            fn into_platform_op(self) -> IocpOp<P> {
                 IocpOp::$Type(self, OverlappedEntry::new(0))
             }
-            fn from_platform_op(op: IocpOp) -> Self {
+            fn from_platform_op(op: IocpOp<P>) -> Self {
                 match op {
                     IocpOp::$Type(val, _) => val,
                     _ => panic!(concat!(
@@ -159,20 +160,39 @@ macro_rules! impl_into_iocp_op_simple {
     };
 }
 
-impl_into_iocp_op_simple!(ReadFixed);
-impl_into_iocp_op_simple!(WriteFixed);
-impl_into_iocp_op_simple!(Recv);
+macro_rules! impl_into_iocp_op_simple {
+    ($Type:ident) => {
+        impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for $Type {
+            fn into_platform_op(self) -> IocpOp<P> {
+                IocpOp::$Type(self, OverlappedEntry::new(0))
+            }
+            fn from_platform_op(op: IocpOp<P>) -> Self {
+                match op {
+                    IocpOp::$Type(val, _) => val,
+                    _ => panic!(concat!(
+                        "Driver returned mismatched Op type: expected ",
+                        stringify!($Type)
+                    )),
+                }
+            }
+        }
+    };
+}
+
+impl_into_iocp_op_generic!(ReadFixed);
+impl_into_iocp_op_generic!(WriteFixed);
+impl_into_iocp_op_generic!(Recv);
 impl_into_iocp_op_simple!(Connect);
 impl_into_iocp_op_simple!(Close);
 impl_into_iocp_op_simple!(Fsync);
 
 // Manual implementation for SyncFileRange (empty/stub for now)
-impl IntoPlatformOp<IocpDriver> for SyncFileRange {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for SyncFileRange {
+    fn into_platform_op(self) -> IocpOp<P> {
         IocpOp::SyncFileRange(self, OverlappedEntry::new(0))
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::SyncFileRange(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected SyncFileRange"),
@@ -180,12 +200,12 @@ impl IntoPlatformOp<IocpDriver> for SyncFileRange {
     }
 }
 
-impl IntoPlatformOp<IocpDriver> for Fallocate {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Fallocate {
+    fn into_platform_op(self) -> IocpOp<P> {
         IocpOp::Fallocate(self, OverlappedEntry::new(0))
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::Fallocate(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Fallocate"),
@@ -195,8 +215,8 @@ impl IntoPlatformOp<IocpDriver> for Fallocate {
 
 // Manual implementations
 
-impl IntoPlatformOp<IocpDriver> for Accept {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Accept {
+    fn into_platform_op(self) -> IocpOp<P> {
         let extras = IocpAcceptExtras {
             entry: OverlappedEntry::new(0),
             accept_buffer: [0; 288],
@@ -204,7 +224,7 @@ impl IntoPlatformOp<IocpDriver> for Accept {
         IocpOp::Accept(self, extras)
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::Accept(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Accept"),
@@ -212,8 +232,8 @@ impl IntoPlatformOp<IocpDriver> for Accept {
     }
 }
 
-impl IntoPlatformOp<IocpDriver> for SendTo {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for SendTo<P> {
+    fn into_platform_op(self) -> IocpOp<P> {
         let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(self.addr); // Fix: use helper
         let wsabuf = WSABUF {
             len: self.buf.len() as u32,
@@ -228,7 +248,7 @@ impl IntoPlatformOp<IocpDriver> for SendTo {
         IocpOp::SendTo(self, extras)
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::SendTo(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected SendTo"),
@@ -236,8 +256,8 @@ impl IntoPlatformOp<IocpDriver> for SendTo {
     }
 }
 
-impl IntoPlatformOp<IocpDriver> for RecvFrom {
-    fn into_platform_op(mut self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for RecvFrom<P> {
+    fn into_platform_op(mut self) -> IocpOp<P> {
         let wsabuf = WSABUF {
             len: self.buf.capacity() as u32,
             buf: self.buf.as_mut_ptr(),
@@ -252,7 +272,7 @@ impl IntoPlatformOp<IocpDriver> for RecvFrom {
         IocpOp::RecvFrom(self, extras)
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::RecvFrom(mut val, extras) => {
                 // Convert buffer to SocketAddr if needed
@@ -269,8 +289,8 @@ impl IntoPlatformOp<IocpDriver> for RecvFrom {
     }
 }
 
-impl IntoPlatformOp<IocpDriver> for Open {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Open {
+    fn into_platform_op(self) -> IocpOp<P> {
         // The Open struct definition states that on Windows, path is Vec<u16> bytes (serialized).
         // Reconstruct Vec<u16> from Vec<u8>.
         let path: Vec<u16> = self
@@ -286,7 +306,7 @@ impl IntoPlatformOp<IocpDriver> for Open {
         IocpOp::Open(self, extras)
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::Open(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Open"),
@@ -294,12 +314,12 @@ impl IntoPlatformOp<IocpDriver> for Open {
     }
 }
 
-impl IntoPlatformOp<IocpDriver> for Timeout {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Timeout {
+    fn into_platform_op(self) -> IocpOp<P> {
         IocpOp::Timeout(self, IocpTimeoutExtras)
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::Timeout(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Timeout"),
@@ -307,8 +327,8 @@ impl IntoPlatformOp<IocpDriver> for Timeout {
     }
 }
 
-impl IntoPlatformOp<IocpDriver> for Wakeup {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Wakeup {
+    fn into_platform_op(self) -> IocpOp<P> {
         IocpOp::Wakeup(
             self,
             IocpWakeupExtras {
@@ -317,7 +337,7 @@ impl IntoPlatformOp<IocpDriver> for Wakeup {
         )
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::Wakeup(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Wakeup"),
@@ -325,12 +345,12 @@ impl IntoPlatformOp<IocpDriver> for Wakeup {
     }
 }
 
-impl IntoPlatformOp<IocpDriver> for OpSend {
-    fn into_platform_op(self) -> IocpOp {
+impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for OpSend<P> {
+    fn into_platform_op(self) -> IocpOp<P> {
         IocpOp::Send(self, OverlappedEntry::new(0))
     }
 
-    fn from_platform_op(op: IocpOp) -> Self {
+    fn from_platform_op(op: IocpOp<P>) -> Self {
         match op {
             IocpOp::Send(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Send"),

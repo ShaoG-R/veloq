@@ -3,6 +3,7 @@
 //! This module implements the `IocpSubmit` trait for all operation types,
 //! providing the logic to submit operations and handle completions.
 
+use crate::io::buffer::BufPool;
 use crate::io::op::{Connect, IoFd, ReadFixed, Recv, Send as OpSend, WriteFixed};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -76,9 +77,9 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
 // Macro for File Operations
 // ============================================================================
 
-macro_rules! impl_file_op {
-    ($Op:ty, $init_fn:expr, $api_fn:expr) => {
-        impl IocpSubmit for $Op {
+macro_rules! impl_file_op_generic {
+    ($Op:ident, $init_fn:expr, $api_fn:expr) => {
+        impl<P: BufPool> IocpSubmit for $Op<P> {
             unsafe fn submit(
                 &mut self,
                 port: HANDLE,
@@ -111,13 +112,13 @@ macro_rules! impl_file_op {
 // Direct Operations (Cross-Platform Structs)
 // ============================================================================
 
-impl_file_op!(
+impl_file_op_generic!(
     ReadFixed,
-    |op: &Self, entry: &mut OVERLAPPED| {
+    |op: &ReadFixed<P>, entry: &mut OVERLAPPED| {
         entry.Anonymous.Anonymous.Offset = op.offset as u32;
         entry.Anonymous.Anonymous.OffsetHigh = (op.offset >> 32) as u32;
     },
-    |op: &mut Self, handle, bytes, overlapped| unsafe {
+    |op: &mut ReadFixed<P>, handle, bytes, overlapped| unsafe {
         ReadFile(
             handle,
             op.buf.as_mut_ptr() as *mut _,
@@ -128,13 +129,13 @@ impl_file_op!(
     }
 );
 
-impl_file_op!(
+impl_file_op_generic!(
     WriteFixed,
-    |op: &Self, entry: &mut OVERLAPPED| {
+    |op: &WriteFixed<P>, entry: &mut OVERLAPPED| {
         entry.Anonymous.Anonymous.Offset = op.offset as u32;
         entry.Anonymous.Anonymous.OffsetHigh = (op.offset >> 32) as u32;
     },
-    |op: &mut Self, handle, bytes, overlapped| unsafe {
+    |op: &mut WriteFixed<P>, handle, bytes, overlapped| unsafe {
         WriteFile(
             handle,
             op.buf.as_slice().as_ptr() as *const _,
@@ -145,13 +146,13 @@ impl_file_op!(
     }
 );
 
-impl_file_op!(
+impl_file_op_generic!(
     Recv,
-    |_op, entry: &mut OVERLAPPED| {
+    |_op: &Recv<P>, entry: &mut OVERLAPPED| {
         entry.Anonymous.Anonymous.Offset = 0;
         entry.Anonymous.Anonymous.OffsetHigh = 0;
     },
-    |op: &mut Self, handle, bytes, overlapped| unsafe {
+    |op: &mut Recv<P>, handle, bytes, overlapped| unsafe {
         ReadFile(
             handle,
             op.buf.as_mut_ptr() as *mut _,
@@ -162,13 +163,13 @@ impl_file_op!(
     }
 );
 
-impl_file_op!(
+impl_file_op_generic!(
     OpSend,
-    |_op, entry: &mut OVERLAPPED| {
+    |_op: &OpSend<P>, entry: &mut OVERLAPPED| {
         entry.Anonymous.Anonymous.Offset = 0;
         entry.Anonymous.Anonymous.OffsetHigh = 0;
     },
-    |op: &mut Self, handle, bytes, overlapped| unsafe {
+    |op: &mut OpSend<P>, handle, bytes, overlapped| unsafe {
         WriteFile(
             handle,
             op.buf.as_slice().as_ptr() as *const _,
@@ -293,7 +294,7 @@ impl IocpSubmit for Connect {
 // IocpOp Enum Dispatch
 // ============================================================================
 
-impl IocpSubmit for IocpOp {
+impl<P: BufPool> IocpSubmit for IocpOp<P> {
     unsafe fn submit(
         &mut self,
         port: HANDLE,

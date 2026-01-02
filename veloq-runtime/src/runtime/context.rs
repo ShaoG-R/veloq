@@ -1,7 +1,7 @@
-//! Thread-local context for the async runtime.
+//! Explicit context for the async runtime.
 //!
-//! This module provides a way to access the current executor's context from anywhere
-//! within async code, similar to how tokio::spawn() works.
+//! This module provides the `RuntimeContext` which is passed to tasks
+//! allowing them to spawn new tasks and access runtime resources.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -9,107 +9,68 @@ use std::future::Future;
 use std::rc::{Rc, Weak};
 
 use crate::io::driver::PlatformDriver;
-use crate::runtime::join::{LocalJoinHandle, JoinHandle};
-use crate::runtime::task::Task;
 use crate::runtime::executor::Spawner;
+use crate::runtime::join::{JoinHandle, LocalJoinHandle};
+use crate::runtime::task::Task;
 
+use crate::io::buffer::BufPool;
 
-use crate::io::buffer::BufferPool;
+// No global thread-local storage anymore.
 
-// Thread-local storage for the current executor context.
-thread_local! {
-    static CONTEXT: RefCell<Option<ExecutorContext>> = const { RefCell::new(None) };
+/// Context passed to runtime tasks.
+///
+/// This provides access to the executor's facilities like spawning tasks
+/// and accessing the IO driver.
+#[derive(Clone)]
+pub struct RuntimeContext<P: BufPool> {
+    pub(crate) driver: Weak<RefCell<PlatformDriver<P>>>,
+    pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+    pub(crate) buffer_pool: Weak<P>,
+    pub(crate) spawner: Option<Spawner>,
 }
 
-/// Lightweight context stored in TLS.
-/// Uses Weak references to avoid preventing cleanup.
-struct ExecutorContext {
-    driver: Weak<RefCell<PlatformDriver>>,
-    queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
-    buffer_pool: Weak<BufferPool>,
-    spawner: Option<Spawner>,
-}
-
-/// RAII guard that sets the context on creation and clears it on drop.
-pub(crate) struct ContextGuard {
-    _private: (),
-}
-
-impl Drop for ContextGuard {
-    fn drop(&mut self) {
-        CONTEXT.with(|ctx| {
-            *ctx.borrow_mut() = None;
-        });
-    }
-}
-
-/// Enter the executor context. Called by LocalExecutor::block_on.
-pub(crate) fn enter(
-    driver: Weak<RefCell<PlatformDriver>>,
-    queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
-    buffer_pool: Weak<BufferPool>,
-    spawner: Option<Spawner>,
-) -> ContextGuard {
-    CONTEXT.with(|ctx| {
-        *ctx.borrow_mut() = Some(ExecutorContext {
+impl<P: BufPool> RuntimeContext<P> {
+    /// Create a new RuntimeContext.
+    pub(crate) fn new(
+        driver: Weak<RefCell<PlatformDriver<P>>>,
+        queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+        buffer_pool: Weak<P>,
+        spawner: Option<Spawner>,
+    ) -> Self {
+        Self {
             driver,
             queue,
             buffer_pool,
             spawner,
-        });
-    });
-    ContextGuard { _private: () }
-}
+        }
+    }
 
-/// Spawn a new task on the current executor.
-///
-/// # Panics
-/// Panics if called outside of a runtime context (i.e., not within block_on).
-///
-/// # Example
-/// ```ignore
-/// runtime::spawn(async {
-///     println!("Hello from spawned task!");
-/// });
-/// ```
-pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    CONTEXT.with(|ctx| {
-        let ctx = ctx.borrow();
-        let spawner = ctx.as_ref()
-            .and_then(|c| c.spawner.as_ref())
-            .expect("spawn() called outside of runtime context or spawner not available");
+    /// Spawn a new task on the current executor.
+    ///
+    /// # Panics
+    /// Panics if the current executor does not have a global spawner (e.g. some local-only configurations).
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let spawner = self
+            .spawner
+            .as_ref()
+            .expect("spawn() called on a context without a global spawner");
 
         spawner.spawn(future)
-    })
-}
+    }
 
-/// Spawn a new task on the current executor.
-///
-/// # Panics
-/// Panics if called outside of a runtime context (i.e., not within block_on).
-///
-/// # Example
-/// ```ignore
-/// runtime::spawn(async {
-///     println!("Hello from spawned task!");
-/// });
-/// ```
-pub fn spawn_local<F, T>(future: F) -> LocalJoinHandle<T>
-where
-    F: Future<Output = T> + 'static,
-    T: 'static,
-{
-    CONTEXT.with(|ctx| {
-        let ctx = ctx.borrow();
-        let ctx = ctx
-            .as_ref()
-            .expect("spawn() called outside of runtime context");
-
-        let queue = ctx.queue.upgrade().expect("executor has been dropped");
+    /// Spawn a new local task on the current executor.
+    ///
+    /// Local tasks are not Send and are guaranteed to run on the current thread.
+    pub fn spawn_local<F, T>(&self, future: F) -> LocalJoinHandle<T>
+    where
+        F: Future<Output = T> + 'static,
+        T: 'static,
+    {
+        let queue = self.queue.upgrade().expect("executor has been dropped");
 
         let (handle, producer) = LocalJoinHandle::new();
         let task = Task::new(
@@ -117,60 +78,26 @@ where
                 let output = future.await;
                 producer.set(output);
             },
-            ctx.queue.clone(),
+            self.queue.clone(),
         );
         queue.borrow_mut().push_back(task);
         handle
-    })
-}
+    }
 
-/// Get a weak reference to the current driver.
-///
-/// # Panics
-/// Panics if called outside of a runtime context.
-///
-/// # Example
-/// ```ignore
-/// let driver = runtime::current_driver();
-/// let stream = TcpStream::connect(addr, driver).await?;
-/// ```
-pub fn current_driver() -> Weak<RefCell<PlatformDriver>> {
-    CONTEXT.with(|ctx| {
-        let ctx = ctx.borrow();
-        let ctx = ctx
-            .as_ref()
-            .expect("current_driver() called outside of runtime context");
+    /// Get a weak reference to the current driver.
+    pub fn driver(&self) -> Weak<RefCell<PlatformDriver<P>>> {
+        self.driver.clone()
+    }
 
-        ctx.driver.clone()
-    })
-}
-
-/// Get a weak reference to the current buffer pool.
-pub fn current_buffer_pool() -> Weak<BufferPool> {
-    CONTEXT.with(|ctx| {
-        let ctx = ctx.borrow();
-        let ctx = ctx
-            .as_ref()
-            .expect("current_buffer_pool() called outside of runtime context");
-
-        ctx.buffer_pool.clone()
-    })
-}
-
-/// Check if we are currently inside a runtime context.
-pub fn is_in_context() -> bool {
-    CONTEXT.with(|ctx| ctx.borrow().is_some())
+    /// Get a weak reference to the current buffer pool.
+    pub fn buffer_pool(&self) -> Weak<P> {
+        self.buffer_pool.clone()
+    }
 }
 
 /// Yields execution back to the executor, allowing other tasks to run.
 ///
 /// This is useful when you want to give other spawned tasks a chance to execute.
-///
-/// # Example
-/// ```ignore
-/// spawn(async { println!("spawned task"); });
-/// yield_now().await; // Let the spawned task run
-/// ```
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }

@@ -1,23 +1,23 @@
-use crate::io::buffer::FixedBuf;
+use crate::io::buffer::{BufPool, FixedBuf};
 use crate::io::driver::PlatformDriver;
-use crate::io::op::{Accept, Connect, IoFd, Op, OpLifecycle, Recv, Send, RawHandle};
+use crate::io::op::{Accept, Connect, IoFd, Op, OpLifecycle, RawHandle, Recv, Send};
 use crate::io::socket::Socket;
 use std::cell::RefCell;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Weak;
 
-pub struct TcpListener {
+pub struct TcpListener<P: BufPool> {
     fd: RawHandle,
-    driver: Weak<RefCell<PlatformDriver>>,
+    driver: Weak<RefCell<PlatformDriver<P>>>,
 }
 
-pub struct TcpStream {
+pub struct TcpStream<P: BufPool> {
     fd: RawHandle,
-    driver: Weak<RefCell<PlatformDriver>>,
+    driver: Weak<RefCell<PlatformDriver<P>>>,
 }
 
-impl Drop for TcpListener {
+impl<P: BufPool> Drop for TcpListener<P> {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = unsafe { Socket::from_raw(self.fd as i32) };
@@ -26,7 +26,7 @@ impl Drop for TcpListener {
     }
 }
 
-impl Drop for TcpStream {
+impl<P: BufPool> Drop for TcpStream<P> {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = unsafe { Socket::from_raw(self.fd as i32) };
@@ -35,10 +35,10 @@ impl Drop for TcpStream {
     }
 }
 
-impl TcpListener {
+impl<P: BufPool> TcpListener<P> {
     pub fn bind<A: ToSocketAddrs>(
         addr: A,
-        driver: Weak<RefCell<PlatformDriver>>,
+        driver: Weak<RefCell<PlatformDriver<P>>>,
     ) -> io::Result<Self> {
         // Resolve address (take first one)
         let addr = addr
@@ -61,7 +61,7 @@ impl TcpListener {
         })
     }
 
-    pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+    pub async fn accept(&self) -> io::Result<(TcpStream<P>, SocketAddr)> {
         // Pre-allocate resources (platform specific)
         let pre_alloc = Accept::pre_alloc(self.fd)?;
 
@@ -89,15 +89,16 @@ impl TcpListener {
         #[cfg(unix)]
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as i32)) };
         #[cfg(windows)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as *mut std::ffi::c_void)) };
+        let socket =
+            unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as *mut std::ffi::c_void)) };
         socket.local_addr()
     }
 }
 
-impl TcpStream {
+impl<P: BufPool> TcpStream<P> {
     pub async fn connect(
         addr: SocketAddr,
-        driver: Weak<RefCell<PlatformDriver>>,
+        driver: Weak<RefCell<PlatformDriver<P>>>,
     ) -> io::Result<Self> {
         let socket = if addr.is_ipv4() {
             Socket::new_tcp_v4()?
@@ -120,7 +121,7 @@ impl TcpStream {
         Ok(Self { fd, driver })
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    pub async fn recv(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
         let op = Recv {
             fd: IoFd::Raw(self.fd),
             buf,
@@ -130,7 +131,7 @@ impl TcpStream {
         (res, op_back.buf)
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    pub async fn send(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
         let op = Send {
             fd: IoFd::Raw(self.fd),
             buf,

@@ -32,7 +32,9 @@ pub(crate) trait UringSubmit {
 // Direct Operations (Cross-Platform Structs)
 // ============================================================================
 
-impl UringSubmit for ReadFixed {
+use crate::io::buffer::BufPool;
+
+impl<P: BufPool> UringSubmit for ReadFixed<P> {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
             IoFd::Raw(fd) => opcode::ReadFixed::new(
@@ -55,7 +57,7 @@ impl UringSubmit for ReadFixed {
     }
 }
 
-impl UringSubmit for WriteFixed {
+impl<P: BufPool> UringSubmit for WriteFixed<P> {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
             IoFd::Raw(fd) => opcode::WriteFixed::new(
@@ -78,7 +80,7 @@ impl UringSubmit for WriteFixed {
     }
 }
 
-impl UringSubmit for Recv {
+impl<P: BufPool> UringSubmit for Recv<P> {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
             IoFd::Raw(fd) => opcode::Recv::new(
@@ -97,7 +99,7 @@ impl UringSubmit for Recv {
     }
 }
 
-impl UringSubmit for Send {
+impl<P: BufPool> UringSubmit for Send<P> {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
             IoFd::Raw(fd) => opcode::Send::new(
@@ -235,7 +237,7 @@ impl UringSubmit for Fallocate {
     }
 }
 
-impl UringSubmit for UringOp {
+impl<P: BufPool> UringSubmit for UringOp<P> {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self {
             UringOp::ReadFixed(op, _) => op.make_sqe(),
@@ -258,8 +260,8 @@ impl UringSubmit for UringOp {
                 extras.msghdr.msg_namelen = extras.addr_len;
                 extras.msghdr.msg_iov = extras.iovec.as_mut_ptr();
                 extras.msghdr.msg_iovlen = 1;
-                extras.msghdr.msg_control = std::ptr::null_mut();
-                extras.msghdr.msg_controllen = 0;
+                // extras.msghdr.msg_control = std::ptr::null_mut(); // already zeroed in new()
+                // extras.msghdr.msg_controllen = 0;
 
                 match op.fd {
                     IoFd::Raw(fd) => {
@@ -280,8 +282,8 @@ impl UringSubmit for UringOp {
                 extras.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
                 extras.msghdr.msg_iov = extras.iovec.as_mut_ptr();
                 extras.msghdr.msg_iovlen = 1;
-                extras.msghdr.msg_control = std::ptr::null_mut();
-                extras.msghdr.msg_controllen = 0;
+                // extras.msghdr.msg_control = std::ptr::null_mut();
+                // extras.msghdr.msg_controllen = 0;
 
                 match op.fd {
                     IoFd::Raw(fd) => {

@@ -27,13 +27,14 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let driver = IocpDriver::new(&crate::config::Config::default());
+    let driver: Result<IocpDriver<BufferPool>, io::Error> =
+        IocpDriver::new(&crate::config::Config::default());
     assert!(driver.is_ok(), "Driver should be created");
 }
 
 #[test]
 fn test_iocp_accept() {
-    let mut driver =
+    let mut driver: IocpDriver<BufferPool> =
         IocpDriver::new(&crate::config::Config::default()).expect("Driver creation failed");
 
     // Listener (Bind to random port)
@@ -54,9 +55,9 @@ fn test_iocp_accept() {
         entry: OverlappedEntry::new(0),
         accept_buffer: [0; 288],
     };
-    
+
     let iocp_op = IocpOp::Accept(accept_op, extras);
-    
+
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -105,7 +106,8 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_connect() {
-    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
+    let mut driver: IocpDriver<BufferPool> =
+        IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     // Listener
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -153,7 +155,8 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_timeout() {
-    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
+    let mut driver: IocpDriver<BufferPool> =
+        IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     let timeout_op = Timeout {
         duration: std::time::Duration::from_millis(100),

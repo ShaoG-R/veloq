@@ -1,4 +1,4 @@
-use crate::io::buffer::FixedBuf;
+use crate::io::buffer::{BufPool, FixedBuf};
 use crate::io::driver::PlatformDriver;
 use crate::io::op::{IoFd, Op, RawHandle, RecvFrom, SendTo};
 use crate::io::socket::Socket;
@@ -7,12 +7,12 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Weak;
 
-pub struct UdpSocket {
+pub struct UdpSocket<P: BufPool> {
     fd: RawHandle,
-    driver: Weak<RefCell<PlatformDriver>>,
+    driver: Weak<RefCell<PlatformDriver<P>>>,
 }
 
-impl Drop for UdpSocket {
+impl<P: BufPool> Drop for UdpSocket<P> {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = unsafe { Socket::from_raw(self.fd as i32) };
@@ -21,10 +21,10 @@ impl Drop for UdpSocket {
     }
 }
 
-impl UdpSocket {
+impl<P: BufPool> UdpSocket<P> {
     pub fn bind<A: ToSocketAddrs>(
         addr: A,
-        driver: Weak<RefCell<PlatformDriver>>,
+        driver: Weak<RefCell<PlatformDriver<P>>>,
     ) -> io::Result<Self> {
         let addr = addr
             .to_socket_addrs()?
@@ -47,27 +47,30 @@ impl UdpSocket {
 
     pub async fn send_to(
         &self,
-        buf: FixedBuf,
+        buf: FixedBuf<P>,
         target: SocketAddr,
-    ) -> (io::Result<usize>, FixedBuf) {
+    ) -> (io::Result<usize>, FixedBuf<P>) {
         let op = SendTo {
             fd: IoFd::Raw(self.fd),
             buf,
             addr: target,
         };
         let future = Op::new(op, self.driver.clone());
-        let (res, op_back): (io::Result<usize>, SendTo) = future.await;
+        let (res, op_back): (io::Result<usize>, SendTo<P>) = future.await;
         (res, op_back.buf)
     }
 
-    pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
+    pub async fn recv_from(
+        &self,
+        buf: FixedBuf<P>,
+    ) -> (io::Result<(usize, SocketAddr)>, FixedBuf<P>) {
         let op = RecvFrom {
             fd: IoFd::Raw(self.fd),
             buf,
             addr: None,
         };
         let future = Op::new(op, self.driver.clone());
-        let (res, op_back): (io::Result<usize>, RecvFrom) = future.await;
+        let (res, op_back): (io::Result<usize>, RecvFrom<P>) = future.await;
 
         match res {
             Ok(n) => {

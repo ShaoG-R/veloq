@@ -1,4 +1,7 @@
-use crate::io::op::{Op, Open};
+use crate::io::{
+    buffer::BufPool,
+    op::{Op, Open},
+};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -68,18 +71,25 @@ impl OpenOptions {
     }
 
     /// 对外的公共 API：清晰、线性、无平台噪音
-    pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
+    pub async fn open<P: BufPool>(
+        &self,
+        path: impl AsRef<Path>,
+        context: &crate::runtime::context::RuntimeContext<P>,
+    ) -> std::io::Result<super::file::File<P>> {
         // 1. 根据不同平台生成对应的 Op 参数
         let op = self.build_op(path.as_ref())?;
 
-        // 2. 提交给 runtime (这一部分没有任何变化，但现在看起来更显眼了)
-        let driver = crate::runtime::current_driver();
-        let (res, _) = Op::new(op, driver).await;
+        // 2. 提交给 runtime (显式传递 driver)
+        let driver = context.driver();
+        let (res, _) = Op::new(op, driver.clone()).await;
 
         // 3. 转换结果
         let fd = res? as crate::io::op::RawHandle;
         use crate::io::op::IoFd;
-        Ok(super::file::File { fd: IoFd::Raw(fd) })
+        Ok(super::file::File {
+            fd: IoFd::Raw(fd),
+            driver,
+        })
     }
 
     // ==========================================

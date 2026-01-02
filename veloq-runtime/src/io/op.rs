@@ -13,7 +13,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::io::buffer::FixedBuf;
+use crate::io::buffer::{BufPool, FixedBuf};
 use crate::io::driver::{Driver, PlatformDriver};
 use crate::io::socket::SockAddrStorage;
 use std::cell::RefCell;
@@ -98,16 +98,16 @@ enum State {
 /// 1. Defined: Operation created but not submitted
 /// 2. Submitted: Operation submitted to the driver
 /// 3. Completed: Operation finished, result available
-pub struct Op<T: IntoPlatformOp<PlatformDriver> + 'static> {
+pub struct Op<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> {
     state: State,
     data: Option<T>,
     user_data: usize,
-    driver: Weak<RefCell<PlatformDriver>>,
+    driver: Weak<RefCell<PlatformDriver<P>>>,
 }
 
-impl<T: IntoPlatformOp<PlatformDriver>> Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Op<T, P> {
     /// Create a new operation with the given data and driver reference.
-    pub fn new(data: T, driver: Weak<RefCell<PlatformDriver>>) -> Self {
+    pub fn new(data: T, driver: Weak<RefCell<PlatformDriver<P>>>) -> Self {
         Self {
             state: State::Defined,
             data: Some(data),
@@ -117,7 +117,7 @@ impl<T: IntoPlatformOp<PlatformDriver>> Op<T> {
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Future for Op<T, P> {
     type Output = (std::io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -166,7 +166,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Drop for Op<T, P> {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
             if let Some(driver_rc) = self.driver.upgrade() {
@@ -181,29 +181,29 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for Op<T> {
 // ============================================================================
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
-pub struct ReadFixed {
+pub struct ReadFixed<P: BufPool> {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    pub buf: FixedBuf<P>,
     pub offset: u64,
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
-pub struct WriteFixed {
+pub struct WriteFixed<P: BufPool> {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    pub buf: FixedBuf<P>,
     pub offset: u64,
 }
 
 /// Receive data from a socket into a fixed buffer.
-pub struct Recv {
+pub struct Recv<P: BufPool> {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    pub buf: FixedBuf<P>,
 }
 
 /// Send data from a fixed buffer to a socket.
-pub struct Send {
+pub struct Send<P: BufPool> {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    pub buf: FixedBuf<P>,
 }
 
 /// Connect a socket to a remote address.
@@ -264,17 +264,17 @@ pub struct Accept {
 }
 
 /// Send data to a specific address (UDP).
-pub struct SendTo {
+pub struct SendTo<P: BufPool> {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    pub buf: FixedBuf<P>,
     /// Target address.
     pub addr: std::net::SocketAddr,
 }
 
 /// Receive data and source address (UDP).
-pub struct RecvFrom {
+pub struct RecvFrom<P: BufPool> {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    pub buf: FixedBuf<P>,
     /// Source address (populated after completion).
     pub addr: Option<std::net::SocketAddr>,
 }
@@ -419,25 +419,25 @@ pub trait OpAbi: 'static + std::marker::Send + Sized {
 
 /// The unified operation enum generic over the platform ABI.
 /// This replaces platform-specific enums like `UringOp` and `IocpOp`.
-pub enum Operation<P: OpAbi> {
-    ReadFixed(ReadFixed, P::ReadFixed),
-    WriteFixed(WriteFixed, P::WriteFixed),
-    Recv(Recv, P::Recv),
-    Send(Send, P::Send),
-    Accept(Accept, P::Accept),
-    Connect(Connect, P::Connect),
-    RecvFrom(RecvFrom, P::RecvFrom),
-    SendTo(SendTo, P::SendTo),
-    Open(Open, P::Open),
-    Close(Close, P::Close),
-    Fsync(Fsync, P::Fsync),
-    SyncFileRange(SyncFileRange, P::SyncFileRange),
-    Fallocate(Fallocate, P::Fallocate),
-    Wakeup(Wakeup, P::Wakeup),
-    Timeout(Timeout, P::Timeout),
+pub enum Operation<Abi: OpAbi, P: BufPool> {
+    ReadFixed(ReadFixed<P>, Abi::ReadFixed),
+    WriteFixed(WriteFixed<P>, Abi::WriteFixed),
+    Recv(Recv<P>, Abi::Recv),
+    Send(Send<P>, Abi::Send),
+    Accept(Accept, Abi::Accept),
+    Connect(Connect, Abi::Connect),
+    RecvFrom(RecvFrom<P>, Abi::RecvFrom),
+    SendTo(SendTo<P>, Abi::SendTo),
+    Open(Open, Abi::Open),
+    Close(Close, Abi::Close),
+    Fsync(Fsync, Abi::Fsync),
+    SyncFileRange(SyncFileRange, Abi::SyncFileRange),
+    Fallocate(Fallocate, Abi::Fallocate),
+    Wakeup(Wakeup, Abi::Wakeup),
+    Timeout(Timeout, Abi::Timeout),
 }
 
-impl<P: OpAbi> Operation<P> {
+impl<Abi: OpAbi, P: BufPool> Operation<Abi, P> {
     /// Get the file descriptor associated with this operation (if any).
     pub fn get_fd(&self) -> Option<IoFd> {
         match self {

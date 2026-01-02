@@ -8,9 +8,14 @@ use std::task::{Context, Poll};
 /// Platform-specific operation trait
 pub trait PlatformOp: 'static {}
 
+use crate::io::buffer::BufPool;
+
 pub trait Driver {
     /// Platform-specific operation type
     type Op: PlatformOp;
+    
+    /// The specific buffer pool type this driver interacts with
+    type Pool: BufPool;
 
     /// Register a new operation. Returns the user_data key.
     fn reserve_op(&mut self) -> usize;
@@ -39,7 +44,7 @@ pub trait Driver {
 
     /// Register a buffer pool with the driver.
     /// This allows the driver to optimize buffer access (e.g. fixed buffers in io_uring).
-    fn register_buffer_pool(&mut self, pool: &crate::io::buffer::BufferPool) -> io::Result<()>;
+    fn register_buffer_pool(&mut self, pool: &Self::Pool) -> io::Result<()>;
 
     /// Register a set of file descriptors/handles.
     /// Returns a list of `IoFd` that can be used in subsequent operations.

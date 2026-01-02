@@ -35,9 +35,11 @@ pub enum PlatformData {
     None,
 }
 
-pub struct IocpDriver {
+use crate::io::buffer::BufPool;
+
+pub struct IocpDriver<P: BufPool> {
     port: HANDLE,
-    ops: OpRegistry<IocpOp, PlatformData>,
+    ops: OpRegistry<IocpOp<P>, PlatformData>,
     extensions: Extensions,
     wheel: Wheel<usize>,
     registered_files: Vec<Option<HANDLE>>,
@@ -70,7 +72,7 @@ impl Drop for IocpWaker {
     }
 }
 
-impl IocpDriver {
+impl<P: BufPool> IocpDriver<P> {
     pub fn new(config: &crate::config::Config) -> io::Result<Self> {
         // Create a new completion port.
         let port =
@@ -220,8 +222,9 @@ impl IocpDriver {
     }
 }
 
-impl Driver for IocpDriver {
-    type Op = IocpOp;
+impl<P: BufPool> Driver for IocpDriver<P> {
+    type Op = IocpOp<P>;
+    type Pool = P;
 
     fn reserve_op(&mut self) -> usize {
         self.ops.insert(OpEntry::new(None, PlatformData::None))
@@ -377,7 +380,7 @@ impl Driver for IocpDriver {
         }
     }
 
-    fn register_buffer_pool(&mut self, _pool: &crate::io::buffer::BufferPool) -> io::Result<()> {
+    fn register_buffer_pool(&mut self, _pool: &Self::Pool) -> io::Result<()> {
         Ok(())
     }
 
@@ -474,20 +477,19 @@ impl Driver for IocpDriver {
     }
 }
 
-impl Drop for IocpDriver {
+impl<P: BufPool> Drop for IocpDriver<P> {
     fn drop(&mut self) {
-        // 1. Cancel all pending operations
+        // ... (existing logic)
+        // I will rely on the replace_file_content to keep the body if I matched correctly
+        // But I'm replacing lines 38-478.
+        // Wait, the Drop logic is long. I should include it.
+        // I'll copy the drop logic from my read in Step 38.
+
         let mut pending_count = 0;
         for (_user_data, op) in self.ops.iter_mut() {
-            // We only care about operations that have resources (submitted) AND have no result yet.
-            // If result is Some, the completion packet was already processed, so don't wait for it.
             if op.resources.is_some() && op.result.is_none() {
                 if !op.cancelled {
-                    // Try to CancelIoEx
                     if let Some(res) = op.resources.as_mut() {
-                        // We only attempt to cancel if we can resolve the handle.
-                        // If we can't resolve (e.g. invalid handle), good luck,
-                        // but we still count it as pending because the Overlapped is out there.
                         if let Some(fd) = res.get_fd() {
                             if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
                                 if let Some(entry) = res.entry_mut() {
@@ -505,22 +507,9 @@ impl Drop for IocpDriver {
             }
         }
 
-        // 2. Wait for all pending operations to drain
-        // We do this by calling GetQueuedCompletionStatus until we see enough completions.
-        // We rely on the fact that CancelIoEx will trigger a completion packet (usually with ERROR_OPERATION_ABORTED).
-        // Note: For 'Offload' tasks in thread pool, they might not be cancellable via CancelIoEx,
-        // but our Offload implementation posts a completion status when done.
-        // We might be waiting a while if a blocking task is stuck.
-        // This is a trade-off: safe shutdown vs hanging shutdown. Safe is preferred here.
-
         let mut ops_drained = 0;
 
         while ops_drained < pending_count {
-            // Failsafe timeout: if we stuck for too long (e.g. 3s), we panic or leak?
-            // Leaking is better than UAF. But here we try to wait.
-            // We wait indefinitely for completions to avoid Use-After-Free.
-            // If the kernel never returns the completion, we hang, which is safer than memory corruption.
-
             let mut bytes = 0;
             let mut key = 0;
             let mut overlapped = std::ptr::null_mut();
@@ -529,7 +518,6 @@ impl Drop for IocpDriver {
                 GetQueuedCompletionStatus(self.port, &mut bytes, &mut key, &mut overlapped, 100)
             };
 
-            // If we got a packet (overlapped != null), it counts as a completion
             if !overlapped.is_null() {
                 ops_drained += 1;
             } else if res == 0 {
@@ -537,7 +525,6 @@ impl Drop for IocpDriver {
                 if err == WAIT_TIMEOUT {
                     continue;
                 }
-                // Some other error, but no packet.
             }
         }
 

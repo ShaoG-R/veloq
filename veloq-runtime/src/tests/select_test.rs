@@ -1,3 +1,4 @@
+use crate::io::buffer::BufferPool;
 use crate::runtime::executor::LocalExecutor;
 use crate::select;
 use std::future::Future;
@@ -30,8 +31,8 @@ impl Future for PendingFuture {
 
 #[test]
 fn test_select_basic() {
-    let exec = LocalExecutor::new();
-    exec.block_on(async {
+    let exec = LocalExecutor::<BufferPool>::new();
+    exec.block_on(|_cx| async {
         let res = select! {
             val = ready(1) => { val },
             _ = PendingFuture => { 2 },
@@ -43,8 +44,8 @@ fn test_select_basic() {
 #[test]
 fn test_select_biased() {
     // Both are ready immediately. First one should win.
-    let exec = LocalExecutor::new();
-    exec.block_on(async {
+    let exec = LocalExecutor::<BufferPool>::new();
+    exec.block_on(|_cx| async {
         let res = select! {
             val = ready(10) => { val },
             val2 = ready(20) => { val2 },
@@ -56,8 +57,8 @@ fn test_select_biased() {
 #[test]
 fn test_select_biased_reverse() {
     // Both are ready immediately. First one declared (which is ready(20)) should win.
-    let exec = LocalExecutor::new();
-    exec.block_on(async {
+    let exec = LocalExecutor::<BufferPool>::new();
+    exec.block_on(|_cx| async {
         let res = select! {
             val = ready(20) => { val },
             val2 = ready(10) => { val2 },
@@ -69,8 +70,8 @@ fn test_select_biased_reverse() {
 #[test]
 fn test_select_expression() {
     // Test using complex expressions in select
-    let exec = LocalExecutor::new();
-    exec.block_on(async {
+    let exec = LocalExecutor::<BufferPool>::new();
+    exec.block_on(|_cx| async {
         let res = select! {
             v = async { 5 + 5 } => { v },
             _ = PendingFuture => { 0 }

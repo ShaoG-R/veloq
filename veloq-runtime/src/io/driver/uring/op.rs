@@ -6,6 +6,7 @@
 //! - Platform-specific "extra" structures (e.g., `UringSendToExtras`)
 //! - `IntoPlatformOp` implementations
 
+use crate::io::buffer::BufPool;
 use crate::io::driver::PlatformOp;
 use crate::io::driver::uring::UringDriver;
 use crate::io::op::{
@@ -97,9 +98,9 @@ impl OpAbi for UringAbi {
     type Timeout = UringTimeoutExtras;
 }
 
-pub type UringOp = Operation<UringAbi>;
+pub type UringOp<P> = Operation<UringAbi, P>;
 
-impl PlatformOp for UringOp {}
+impl<P: BufPool> PlatformOp for UringOp<P> {}
 
 // ============================================================================
 // IntoPlatformOp Implementations
@@ -107,11 +108,30 @@ impl PlatformOp for UringOp {}
 
 macro_rules! impl_into_uring_op_direct {
     ($Type:ident) => {
-        impl IntoPlatformOp<UringDriver> for $Type {
-            fn into_platform_op(self) -> UringOp {
+        impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for $Type<P> {
+            fn into_platform_op(self) -> UringOp<P> {
                 UringOp::$Type(self, ())
             }
-            fn from_platform_op(op: UringOp) -> Self {
+            fn from_platform_op(op: UringOp<P>) -> Self {
+                match op {
+                    UringOp::$Type(val, _) => val,
+                    _ => panic!(concat!(
+                        "Driver returned mismatched Op type: expected ",
+                        stringify!($Type)
+                    )),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_into_uring_op_direct_no_generic {
+    ($Type:ident) => {
+        impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for $Type {
+            fn into_platform_op(self) -> UringOp<P> {
+                UringOp::$Type(self, ())
+            }
+            fn from_platform_op(op: UringOp<P>) -> Self {
                 match op {
                     UringOp::$Type(val, _) => val,
                     _ => panic!(concat!(
@@ -127,21 +147,23 @@ macro_rules! impl_into_uring_op_direct {
 impl_into_uring_op_direct!(ReadFixed);
 impl_into_uring_op_direct!(WriteFixed);
 impl_into_uring_op_direct!(Recv);
-impl_into_uring_op_direct!(Connect);
-impl_into_uring_op_direct!(Close);impl_into_uring_op_direct!(Fsync);
-impl_into_uring_op_direct!(SyncFileRange);
-impl_into_uring_op_direct!(Fallocate);
-impl_into_uring_op_direct!(Accept);
+
+impl_into_uring_op_direct_no_generic!(Connect);
+impl_into_uring_op_direct_no_generic!(Close);
+impl_into_uring_op_direct_no_generic!(Fsync);
+impl_into_uring_op_direct_no_generic!(SyncFileRange);
+impl_into_uring_op_direct_no_generic!(Fallocate);
+impl_into_uring_op_direct_no_generic!(Accept);
 
 // Manual implementations for ops with extras
 
-impl IntoPlatformOp<UringDriver> for SendTo {
-    fn into_platform_op(self) -> UringOp {
+impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for SendTo<P> {
+    fn into_platform_op(self) -> UringOp<P> {
         let extras = UringSendToExtras::new(self.addr);
         UringOp::SendTo(self, extras)
     }
 
-    fn from_platform_op(op: UringOp) -> Self {
+    fn from_platform_op(op: UringOp<P>) -> Self {
         match op {
             UringOp::SendTo(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected SendTo"),
@@ -149,13 +171,13 @@ impl IntoPlatformOp<UringDriver> for SendTo {
     }
 }
 
-impl IntoPlatformOp<UringDriver> for RecvFrom {
-    fn into_platform_op(self) -> UringOp {
+impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for RecvFrom<P> {
+    fn into_platform_op(self) -> UringOp<P> {
         let extras = UringRecvFromExtras::new();
         UringOp::RecvFrom(self, extras)
     }
 
-    fn from_platform_op(op: UringOp) -> Self {
+    fn from_platform_op(op: UringOp<P>) -> Self {
         match op {
             UringOp::RecvFrom(mut val, extras) => {
                 // Update the address from the msghdr/addr in extras
@@ -171,8 +193,8 @@ impl IntoPlatformOp<UringDriver> for RecvFrom {
     }
 }
 
-impl IntoPlatformOp<UringDriver> for Open {
-    fn into_platform_op(self) -> UringOp {
+impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Open {
+    fn into_platform_op(self) -> UringOp<P> {
         // Convert the generic path (Vec<u8> -> CString)
         // Note generically we store raw bytes. On Linux it should be null-terminated or we add it.
         // CString::new checks for internal nulls and adds one at end.
@@ -180,7 +202,7 @@ impl IntoPlatformOp<UringDriver> for Open {
         UringOp::Open(self, UringOpenExtras { path })
     }
 
-    fn from_platform_op(op: UringOp) -> Self {
+    fn from_platform_op(op: UringOp<P>) -> Self {
         match op {
             UringOp::Open(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Open"),
@@ -188,12 +210,12 @@ impl IntoPlatformOp<UringDriver> for Open {
     }
 }
 
-impl IntoPlatformOp<UringDriver> for Timeout {
-    fn into_platform_op(self) -> UringOp {
+impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Timeout {
+    fn into_platform_op(self) -> UringOp<P> {
         UringOp::Timeout(self, UringTimeoutExtras { ts: [0, 0] })
     }
 
-    fn from_platform_op(op: UringOp) -> Self {
+    fn from_platform_op(op: UringOp<P>) -> Self {
         match op {
             UringOp::Timeout(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Timeout"),
@@ -201,12 +223,12 @@ impl IntoPlatformOp<UringDriver> for Timeout {
     }
 }
 
-impl IntoPlatformOp<UringDriver> for Wakeup {
-    fn into_platform_op(self) -> UringOp {
+impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Wakeup {
+    fn into_platform_op(self) -> UringOp<P> {
         UringOp::Wakeup(self, UringWakeupExtras { buf: [0; 8] })
     }
 
-    fn from_platform_op(op: UringOp) -> Self {
+    fn from_platform_op(op: UringOp<P>) -> Self {
         match op {
             UringOp::Wakeup(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Wakeup"),
@@ -215,11 +237,11 @@ impl IntoPlatformOp<UringDriver> for Wakeup {
 }
 
 // Manual implementation for Send because of name conflict
-impl IntoPlatformOp<UringDriver> for OpSend {
-    fn into_platform_op(self) -> UringOp {
+impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for OpSend<P> {
+    fn into_platform_op(self) -> UringOp<P> {
         UringOp::Send(self, ())
     }
-    fn from_platform_op(op: UringOp) -> Self {
+    fn from_platform_op(op: UringOp<P>) -> Self {
         match op {
             UringOp::Send(val, _) => val,
             _ => panic!("Driver returned mismatched Op type: expected Send"),

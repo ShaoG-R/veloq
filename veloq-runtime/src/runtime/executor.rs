@@ -8,8 +8,9 @@ use crate::io::driver::{Driver, PlatformDriver};
 use crate::runtime::join::LocalJoinHandle;
 use crate::runtime::task::Task;
 
-use crate::io::buffer::BufferPool;
+use crate::io::buffer::BufPool;
 use crate::io::driver::RemoteWaker;
+use crate::runtime::context::RuntimeContext;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -84,18 +85,18 @@ impl Spawner {
     }
 }
 
-pub struct LocalExecutor {
-    driver: Rc<RefCell<PlatformDriver>>,
+pub struct LocalExecutor<P: BufPool> {
+    driver: Rc<RefCell<PlatformDriver<P>>>,
     queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Rc<P>,
     injector: Option<Arc<SegQueue<Job>>>,
     injected_load: Option<Arc<AtomicUsize>>,
     local_load: Option<Arc<AtomicUsize>>,
     spawner: Option<Spawner>,
 }
 
-impl LocalExecutor {
-    pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver>> {
+impl<P: BufPool> LocalExecutor<P> {
+    pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver<P>>> {
         Rc::downgrade(&self.driver)
     }
 
@@ -131,7 +132,7 @@ impl LocalExecutor {
 
     /// Create a new local executor from an existing driver (used for worker threads).
     pub fn from_driver(
-        driver: PlatformDriver,
+        driver: PlatformDriver<P>,
         injector: Arc<SegQueue<Job>>,
         injected_load: Arc<AtomicUsize>,
         local_load: Arc<AtomicUsize>,
@@ -148,7 +149,7 @@ impl LocalExecutor {
     }
 
     fn create_internal(
-        driver: Option<PlatformDriver>,
+        driver: Option<PlatformDriver<P>>,
         injector: Option<Arc<SegQueue<Job>>>,
         injected_load: Option<Arc<AtomicUsize>>,
         local_load: Option<Arc<AtomicUsize>>,
@@ -160,12 +161,12 @@ impl LocalExecutor {
             PlatformDriver::new(&config).expect("Failed to create driver")
         })));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
-        let buffer_pool = Rc::new(BufferPool::new());
+        let buffer_pool = Rc::new(P::new());
 
         // Register buffer pool with driver
         driver
             .borrow_mut()
-            .register_buffer_pool(&buffer_pool)
+            .register_buffer_pool(buffer_pool.as_ref())
             .expect("Failed to register buffer pool");
 
         Self {
@@ -199,18 +200,20 @@ impl LocalExecutor {
         handle
     }
 
-    pub fn block_on<F>(&self, future: F) -> F::Output
+    pub fn block_on<F, Fut>(&self, func: F) -> Fut::Output
     where
-        F: Future,
+        F: FnOnce(&RuntimeContext<P>) -> Fut,
+        Fut: Future,
     {
-        // Enter the runtime context - this enables spawn() and current_driver()
-        let _guard = crate::runtime::context::enter(
+        // Create the runtime context to pass to the future factory
+        let context = RuntimeContext::new(
             Rc::downgrade(&self.driver),
             Rc::downgrade(&self.queue),
             Rc::downgrade(&self.buffer_pool),
             self.spawner.clone(),
         );
 
+        let future = func(&context);
         let mut pinned_future = Box::pin(future);
 
         // Create a real waker for the main future.
@@ -332,10 +335,11 @@ impl Runtime {
     /// Spawn a new worker thread.
     ///
     /// The `future_factory` is called inside the new thread to create the main Future for that thread.
-    /// This ensures that the Future (and any Task it spawns) is created within the thread's context.
-    pub fn spawn_worker<F, Fut>(&mut self, future_factory: F)
+    /// It receives a `RuntimeContext` which can be used to spawn tasks.
+    pub fn spawn_worker<F, Fut, P>(&mut self, future_factory: F)
     where
-        F: FnOnce() -> Fut + Send + 'static,
+        P: BufPool + 'static,
+        F: FnOnce(RuntimeContext<P>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let injector = Arc::new(SegQueue::new());
@@ -361,7 +365,7 @@ impl Runtime {
         let config = self.config.clone();
 
         let handle = std::thread::spawn(move || {
-            let executor = LocalExecutor::with_injector(
+            let executor = LocalExecutor::<P>::with_injector(
                 injector_clone,
                 injected_load_clone,
                 local_load_clone,
@@ -379,7 +383,7 @@ impl Runtime {
                 .recv()
                 .expect("Failed to receive ack from main thread");
 
-            executor.block_on(future_factory());
+            executor.block_on(move |cx| future_factory(cx.clone()));
         });
 
         let waker = waker_rx
