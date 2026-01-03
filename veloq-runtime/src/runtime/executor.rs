@@ -13,27 +13,101 @@ use crate::io::driver::RemoteWaker;
 use crate::runtime::context::RuntimeContext;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crossbeam_queue::SegQueue;
 
 pub type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Global spawner that can schedule tasks to workers
+/// Handle to a remote executor, used for task injection and load monitoring.
 #[derive(Clone)]
-pub struct Spawner {
-    workers: Arc<Mutex<Vec<WorkerHandle>>>,
-    next: Arc<AtomicUsize>, // For round-robin scheduling
+pub struct ExecutorHandle {
+    pub(crate) injector: Arc<SegQueue<Job>>,
+    pub(crate) waker: Arc<dyn RemoteWaker>,
+    pub(crate) injected_load: Arc<AtomicUsize>,
+    pub(crate) local_load: Arc<AtomicUsize>,
 }
 
-struct WorkerHandle {
-    injector: Arc<SegQueue<Job>>,
-    waker: Arc<dyn RemoteWaker>,
-    injected_load: Arc<AtomicUsize>,
-    local_load: Arc<AtomicUsize>,
+impl ExecutorHandle {
+    pub fn total_load(&self) -> usize {
+        self.injected_load.load(Ordering::Relaxed) + self.local_load.load(Ordering::Relaxed)
+    }
+}
+
+/// A registry that maintains the set of all active executors.
+/// Used for global task spawning (P2C) and work stealing.
+pub struct ExecutorRegistry {
+    workers: RwLock<Vec<ExecutorHandle>>,
+    epoch: AtomicUsize, // Incremented whenever a new worker is added
+    next: AtomicUsize,  // Source of randomness for P2C
+}
+
+impl ExecutorRegistry {
+    pub fn new() -> Self {
+        Self {
+            workers: RwLock::new(Vec::new()),
+            epoch: AtomicUsize::new(0),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn register(&self, handle: ExecutorHandle) {
+        let mut workers = self.workers.write().unwrap();
+        workers.push(handle);
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn current_epoch(&self) -> usize {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn get_all_handles(&self) -> Vec<ExecutorHandle> {
+        self.workers.read().unwrap().clone()
+    }
+
+    /// Spawn a task using Power of Two Choices (P2C)
+    pub fn spawn(&self, job: Job) {
+        let workers = self.workers.read().unwrap();
+        let count = workers.len();
+        if count == 0 {
+            panic!("No workers available in registry");
+        }
+
+        let seed = self.next.fetch_add(1, Ordering::Relaxed);
+        let idx1 = seed % count;
+        let idx2 = {
+            let mut x = seed;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x % count
+        };
+
+        let w1 = &workers[idx1];
+        let w2 = &workers[idx2]; // It's okay if idx1 == idx2
+
+        let load1 = w1.total_load();
+        let load2 = w2.total_load();
+
+        let target = if load1 <= load2 { w1 } else { w2 };
+
+        target.injector.push(job);
+        target.injected_load.fetch_add(1, Ordering::Relaxed);
+        target.waker.wake().expect("Failed to wake worker");
+    }
+}
+
+/// Global spawner that acts as a frontend to the Registry.
+#[derive(Clone)]
+pub struct Spawner {
+    registry: Arc<ExecutorRegistry>,
 }
 
 impl Spawner {
+    pub fn new(registry: Arc<ExecutorRegistry>) -> Self {
+        Self { registry }
+    }
+
     pub fn spawn<F>(&self, future: F) -> crate::runtime::join::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -46,41 +120,7 @@ impl Spawner {
             producer.set(output);
         });
 
-        let workers = self.workers.lock().unwrap();
-        let worker_count = workers.len();
-        if worker_count == 0 {
-            panic!("No workers available in runtime");
-        }
-
-        // Power of Two Choices (P2C)
-        // We use the atomic counter 'next' as a source of randomness
-        let seed = self.next.fetch_add(1, Ordering::Relaxed);
-
-        // Simple hash to get two distinct-ish indices
-        let idx1 = seed % worker_count;
-        let idx2 = {
-            let mut x = seed;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            x % worker_count
-        };
-
-        let worker1 = &workers[idx1];
-        let worker2 = &workers[idx2];
-
-        let load1 = worker1.injected_load.load(Ordering::Relaxed)
-            + worker1.local_load.load(Ordering::Relaxed);
-        let load2 = worker2.injected_load.load(Ordering::Relaxed)
-            + worker2.local_load.load(Ordering::Relaxed);
-
-        let worker = if load1 <= load2 { worker1 } else { worker2 };
-
-        // Push and wake
-        worker.injector.push(job);
-        worker.injected_load.fetch_add(1, Ordering::Relaxed);
-        worker.waker.wake().expect("Failed to wake worker");
-
+        self.registry.spawn(job);
         handle
     }
 }
@@ -89,10 +129,18 @@ pub struct LocalExecutor<P: BufPool> {
     driver: Rc<RefCell<PlatformDriver<P>>>,
     queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
     buffer_pool: Rc<P>,
-    injector: Option<Arc<SegQueue<Job>>>,
-    injected_load: Option<Arc<AtomicUsize>>,
-    local_load: Option<Arc<AtomicUsize>>,
-    spawner: Option<Spawner>,
+
+    // Always present components for task injection
+    injector: Arc<SegQueue<Job>>,
+    injected_load: Arc<AtomicUsize>,
+    local_load: Arc<AtomicUsize>,
+
+    // Optional connection to the global registry
+    registry: Option<Arc<ExecutorRegistry>>,
+
+    // Local cache for work stealing (Lazy Cache)
+    cached_peers: Vec<ExecutorHandle>,
+    local_epoch: usize,
 }
 
 impl<P: BufPool> LocalExecutor<P> {
@@ -100,76 +148,19 @@ impl<P: BufPool> LocalExecutor<P> {
         Rc::downgrade(&self.driver)
     }
 
-    /// Create a new local executor for testing (no global injection).
+    /// Create a new standalone LocalExecutor.
     pub fn new(pool: P) -> Self {
-        Self::create_internal(
-            None,
-            None,
-            None,
-            None,
-            None,
-            pool,
-            crate::config::Config::default(),
-        )
+        let config = crate::config::Config::default();
+        Self::new_with_config(pool, config)
     }
 
-    /// Create a new local executor with global injection support.
-    pub fn with_injector(
-        injector: Arc<SegQueue<Job>>,
-        injected_load: Arc<AtomicUsize>,
-        local_load: Arc<AtomicUsize>,
-        spawner: Spawner,
-        pool: P,
-        config: crate::config::Config,
-    ) -> Self {
-        Self::create_internal(
-            None,
-            Some(injector),
-            Some(injected_load),
-            Some(local_load),
-            Some(spawner),
-            pool,
-            config,
-        )
-    }
-
-    /// Create a new local executor from an existing driver (used for worker threads).
-    pub fn from_driver(
-        driver: PlatformDriver<P>,
-        injector: Arc<SegQueue<Job>>,
-        injected_load: Arc<AtomicUsize>,
-        local_load: Arc<AtomicUsize>,
-        spawner: Spawner,
-        pool: P,
-    ) -> Self {
-        Self::create_internal(
-            Some(driver),
-            Some(injector),
-            Some(injected_load),
-            Some(local_load),
-            Some(spawner),
-            pool,
-            crate::config::Config::default(),
-        )
-    }
-
-    fn create_internal(
-        driver: Option<PlatformDriver<P>>,
-        injector: Option<Arc<SegQueue<Job>>>,
-        injected_load: Option<Arc<AtomicUsize>>,
-        local_load: Option<Arc<AtomicUsize>>,
-        spawner: Option<Spawner>,
-        pool: P,
-        config: crate::config::Config,
-    ) -> Self {
-        // Initialize Driver with config if not provided
-        let driver = Rc::new(RefCell::new(driver.unwrap_or_else(|| {
-            PlatformDriver::new(&config).expect("Failed to create driver")
-        })));
+    pub fn new_with_config(pool: P, config: crate::config::Config) -> Self {
+        let driver = Rc::new(RefCell::new(
+            PlatformDriver::new(&config).expect("Failed to create driver"),
+        ));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let buffer_pool = Rc::new(pool);
 
-        // Register buffer pool with driver
         driver
             .borrow_mut()
             .register_buffer_pool(buffer_pool.as_ref())
@@ -179,10 +170,28 @@ impl<P: BufPool> LocalExecutor<P> {
             driver,
             queue,
             buffer_pool,
-            injector,
-            injected_load,
-            local_load,
-            spawner,
+            injector: Arc::new(SegQueue::new()),
+            injected_load: Arc::new(AtomicUsize::new(0)),
+            local_load: Arc::new(AtomicUsize::new(0)),
+            registry: None,
+            cached_peers: Vec::new(),
+            local_epoch: 0,
+        }
+    }
+
+    /// Attach this executor to a registry.
+    /// This enables the executor to steal tasks from others in the registry.
+    pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    pub fn handle(&self) -> ExecutorHandle {
+        ExecutorHandle {
+            injector: self.injector.clone(),
+            waker: self.driver.borrow().create_waker(),
+            injected_load: self.injected_load.clone(),
+            local_load: self.local_load.clone(),
         }
     }
 
@@ -200,138 +209,114 @@ impl<P: BufPool> LocalExecutor<P> {
             Rc::downgrade(&self.queue),
         );
         self.queue.borrow_mut().push_back(task);
-        if let Some(load) = &self.local_load {
-            load.fetch_add(1, Ordering::Relaxed);
-        }
+        self.local_load.fetch_add(1, Ordering::Relaxed);
         handle
     }
 
-    pub fn block_on<F, Fut>(&self, func: F) -> Fut::Output
+    pub fn block_on<F, Fut>(&mut self, func: F) -> Fut::Output
     where
         F: FnOnce(&RuntimeContext<P>) -> Fut,
         Fut: Future,
     {
-        // Create the runtime context to pass to the future factory
+        let spawner = self.registry.as_ref().map(|reg| Spawner::new(reg.clone()));
+
         let context = RuntimeContext::new(
             Rc::downgrade(&self.driver),
             Rc::downgrade(&self.queue),
             Rc::downgrade(&self.buffer_pool),
-            self.spawner.clone(),
+            spawner,
         );
 
         let future = func(&context);
         let mut pinned_future = Box::pin(future);
-
-        // Create a real waker for the main future.
-        // When woken, it sets the flag to true so we know to poll the main future.
-        let main_woken = Rc::new(RefCell::new(true)); // Start as true to ensure first poll
+        let main_woken = Rc::new(RefCell::new(true));
         let waker = main_task_waker(main_woken.clone());
         let mut cx = Context::from_waker(&waker);
 
-        // Budget for batch polling to reduce syscall overhead
         const BUDGET: usize = 64;
 
         loop {
             let mut executed = 0;
 
-            // Run a batch of tasks before checking IO to allow SQE batching
             while executed < BUDGET {
                 let mut did_work = false;
 
-                // 1. If main future was woken, poll it
+                // 1. Poll Main Future
                 if *main_woken.borrow() {
                     *main_woken.borrow_mut() = false;
                     did_work = true;
-
                     if let Poll::Ready(val) = pinned_future.as_mut().poll(&mut cx) {
                         return val;
                     }
                 }
 
-                // 2. Refill: Check Injector if local queue is empty
-                if self.queue.borrow().is_empty() {
-                    if let Some(injector) = &self.injector {
-                        // Optimistically drain injector to local queue
-                        loop {
-                            match injector.pop() {
-                                Some(job) => {
-                                    if let Some(load) = &self.injected_load {
-                                        load.fetch_sub(1, Ordering::Relaxed);
-                                    }
-                                    if let Some(load) = &self.local_load {
-                                        load.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    let task = Task::new(job, Rc::downgrade(&self.queue));
-                                    self.queue.borrow_mut().push_back(task);
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
-
-                // 3. Refill: Steal tasks if local queue is still empty
-                if self.queue.borrow().is_empty() {
-                    if let Some(spawner) = &self.spawner {
-                        if let Ok(workers) = spawner.workers.try_lock() {
-                            let worker_count = workers.len();
-                            if worker_count > 1 {
-                                let seed = self as *const _ as usize;
-                                let start_idx = seed % worker_count;
-
-                                for i in 0..worker_count {
-                                    let idx = (start_idx + i) % worker_count;
-                                    let target = &workers[idx];
-
-                                    // Don't steal from self check handled implicitly by empty queue check + separate injector logic
-                                    if let Some(job) = target.injector.pop() {
-                                        target.injected_load.fetch_sub(1, Ordering::Relaxed);
-                                        if let Some(load) = &self.local_load {
-                                            load.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        let task = Task::new(job, Rc::downgrade(&self.queue));
-                                        self.queue.borrow_mut().push_back(task);
-                                        break; // Found one, loop back to execute
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 4. Run ONE task
+                // 2. Poll Local Queue
                 let task = self.queue.borrow_mut().pop_front();
                 if let Some(task) = task {
-                    if let Some(load) = &self.local_load {
-                        load.fetch_sub(1, Ordering::Relaxed);
-                    }
+                    self.local_load.fetch_sub(1, Ordering::Relaxed);
                     task.run();
-                    did_work = true;
+                    executed += 1;
+                    continue;
                 }
 
-                if did_work {
-                    executed += 1;
-                } else {
-                    // No work found in this attempt
+                // 3. Poll Injector
+                if let Some(job) = self.injector.pop() {
+                    self.injected_load.fetch_sub(1, Ordering::Relaxed);
+                    self.local_load.fetch_add(1, Ordering::Relaxed);
+                    let task = Task::new(job, Rc::downgrade(&self.queue));
+                    self.queue.borrow_mut().push_back(task);
+                    // Loop back to run it
+                    continue;
+                }
+
+                // 4. Steal from Registry (Work Stealing)
+                if let Some(registry) = &self.registry {
+                    // Lazy Cache Update (Epoch Check)
+                    let current_epoch = registry.current_epoch();
+                    if self.local_epoch != current_epoch {
+                        self.cached_peers = registry.get_all_handles();
+                        self.local_epoch = current_epoch;
+                    }
+
+                    if !self.cached_peers.is_empty() {
+                        // Random start for stealing to reduce contention
+                        let seed = self as *const _ as usize;
+                        let start_idx = seed.wrapping_add(executed); // simple perturb
+                        let count = self.cached_peers.len();
+
+                        for i in 0..count {
+                            let idx = (start_idx + i) % count;
+                            let target = &self.cached_peers[idx];
+
+                            // Don't steal from self
+                            if Arc::ptr_eq(&target.injector, &self.injector) {
+                                continue;
+                            }
+
+                            if let Some(job) = target.injector.pop() {
+                                target.injected_load.fetch_sub(1, Ordering::Relaxed);
+                                self.local_load.fetch_add(1, Ordering::Relaxed);
+                                let task = Task::new(job, Rc::downgrade(&self.queue));
+                                self.queue.borrow_mut().push_back(task);
+                                did_work = true;
+                                break; // Break cache loop, loop back to main while to run
+                            }
+                        }
+                    }
+                }
+
+                if !did_work {
                     break;
                 }
             }
 
-            // 5. Handle IO completions
-            // If we did work, we might have generated IO requests.
-            // If the queue is non-empty (budget exhausted), we just flush and poll casually.
-            // If the queue is empty, we must block.
+            // 5. IO Wait
             let has_pending_tasks = !self.queue.borrow().is_empty() || *main_woken.borrow();
-
             let mut driver = self.driver.borrow_mut();
             if has_pending_tasks {
-                // There are tasks waiting to run, don't block on IO, just flush and check
-                // This call should be fast (non-blocking syscall or just queue logic)
                 driver.submit_queue().unwrap();
                 driver.process_completions();
             } else {
-                // No tasks ready, we MUST wait for IO to make progress
-                // This will block until at least one completion arrives
                 driver.wait().unwrap();
             }
         }
@@ -344,115 +329,64 @@ impl<P: BufPool + Default> Default for LocalExecutor<P> {
     }
 }
 
-/// A Thread-per-Core Runtime that manages multiple independent worker threads.
 pub struct Runtime {
     handles: Vec<std::thread::JoinHandle<()>>,
-    workers: Arc<Mutex<Vec<WorkerHandle>>>,
+    registry: Arc<ExecutorRegistry>,
     config: Arc<crate::config::Config>,
 }
 
 impl Runtime {
-    /// Create a new Runtime.
     pub fn new(config: crate::config::Config) -> Self {
         Self {
             handles: Vec::new(),
-            workers: Arc::new(Mutex::new(Vec::new())),
+            registry: Arc::new(ExecutorRegistry::new()),
             config: Arc::new(config),
         }
     }
 
-    /// Spawn a new worker thread.
-    ///
-    /// The `future_factory` is called inside the new thread to create the main Future for that thread.
-    /// It receives a `RuntimeContext` which can be used to spawn tasks.
     pub fn spawn_worker<F, Fut, P>(&mut self, future_factory: F)
     where
         P: BufPool + Default + 'static,
         F: FnOnce(RuntimeContext<P>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        let injector = Arc::new(SegQueue::new());
-        let injected_load = Arc::new(AtomicUsize::new(0));
-        let local_load = Arc::new(AtomicUsize::new(0));
-
-        // Solution 2: Executor creates driver. Signal back waker.
-        let (waker_tx, waker_rx) = std::sync::mpsc::channel();
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-
-        let workers = self.workers.clone();
-
-        // This spawner shares the same worker list
-        let spawner = Spawner {
-            workers: workers.clone(),
-            next: Arc::new(AtomicUsize::new(0)),
-        };
-
-        let injector_clone = injector.clone();
-        let injected_load_clone = injected_load.clone();
-        let local_load_clone = local_load.clone();
-
+        let registry = self.registry.clone();
         let config = self.config.clone();
 
-        let handle = std::thread::spawn(move || {
-            let executor = LocalExecutor::<P>::with_injector(
-                injector_clone,
-                injected_load_clone,
-                local_load_clone,
-                spawner,
-                P::default(),
-                (*config).clone(),
-            );
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
 
-            // Send waker back to main thread
-            let waker = executor.driver.borrow().create_waker();
-            waker_tx.send(waker).unwrap();
+        let thread_handle = std::thread::spawn(move || {
+            let mut executor = LocalExecutor::<P>::new_with_config(P::default(), (*config).clone());
+            executor = executor.with_registry(registry);
 
-            // Wait for main thread to register us
-            // This prevents "No workers available" race if the worker immediately spawns
-            ack_rx
-                .recv()
-                .expect("Failed to receive ack from main thread");
+            handle_tx.send(executor.handle()).unwrap();
+
+            // Wait for main thread to register us before we start
+            let _ = ack_rx.recv();
 
             executor.block_on(move |cx| future_factory(cx.clone()));
         });
 
-        let waker = waker_rx
-            .recv()
-            .expect("Failed to receive waker from worker");
+        let executor_handle = handle_rx.recv().expect("Worker thread failed to start");
+        self.registry.register(executor_handle);
+        let _ = ack_tx.send(());
 
-        self.handles.push(handle);
-        workers.lock().unwrap().push(WorkerHandle {
-            injector,
-            waker,
-            injected_load,
-            local_load,
-        });
-
-        // Notify worker it can start
-        ack_tx.send(()).unwrap();
+        self.handles.push(thread_handle);
     }
 
     pub fn spawner(&self) -> Spawner {
-        Spawner {
-            workers: self.workers.clone(),
-            next: Arc::new(AtomicUsize::new(0)),
-        }
+        Spawner::new(self.registry.clone())
     }
 
-    /// Spawn a future onto the runtime (round-robin)
     pub fn spawn<Fut>(&self, future: Fut) -> crate::runtime::join::JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        // Simple temporary spawner just for this call
-        // Note: For frequent calls, one should cache spawner or use context access.
-        // But Runtime::spawn() is typically top-level.
-        let spawner = self.spawner();
-        spawner.spawn(future)
+        self.spawner().spawn(future)
     }
 
-    /// Wait for all worker threads to complete.
     pub fn block_on_all(self) {
         for handle in self.handles {
             let _ = handle.join();
@@ -461,8 +395,6 @@ impl Runtime {
 }
 
 // ============ Main Task Waker Implementation ============
-// This waker is used for the main future in block_on.
-// When woken, it sets a flag so the executor knows to poll the main future.
 
 fn main_task_waker(woken: Rc<RefCell<bool>>) -> Waker {
     let ptr = Rc::into_raw(woken) as *const ();
@@ -479,23 +411,22 @@ const MAIN_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 
 unsafe fn main_waker_clone(ptr: *const ()) -> RawWaker {
     let rc = unsafe { Rc::from_raw(ptr as *const RefCell<bool>) };
-    std::mem::forget(rc.clone()); // Increment ref count for new waker
-    std::mem::forget(rc); // Keep original valid
+    std::mem::forget(rc.clone());
+    std::mem::forget(rc);
     RawWaker::new(ptr, &MAIN_WAKER_VTABLE)
 }
 
 unsafe fn main_waker_wake(ptr: *const ()) {
     let rc = unsafe { Rc::from_raw(ptr as *const RefCell<bool>) };
     *rc.borrow_mut() = true;
-    // wake() consumes the waker, so we don't forget - ref count decrements
 }
 
 unsafe fn main_waker_wake_by_ref(ptr: *const ()) {
     let rc = unsafe { Rc::from_raw(ptr as *const RefCell<bool>) };
     *rc.borrow_mut() = true;
-    std::mem::forget(rc); // Keep ref count since wake_by_ref doesn't consume
+    std::mem::forget(rc);
 }
 
 unsafe fn main_waker_drop(ptr: *const ()) {
-    let _ = unsafe { Rc::from_raw(ptr as *const RefCell<bool>) }; // Decrement ref count
+    let _ = unsafe { Rc::from_raw(ptr as *const RefCell<bool>) };
 }
