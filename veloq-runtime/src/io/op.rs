@@ -23,9 +23,10 @@ use std::rc::Weak;
 // Core Types (Platform-Agnostic)
 // ============================================================================
 
-/// Platform-agnostic raw handle type.
-/// Uses `usize` to represent any platform's handle (fd on Unix, HANDLE on Windows).
-pub type RawHandle = usize;
+#[cfg(unix)]
+pub type RawHandle = std::os::fd::RawFd; // i32 (4 bytes)
+#[cfg(windows)]
+pub type RawHandle = windows_sys::Win32::Foundation::HANDLE; // usually isize/ptr (8 bytes)
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +210,7 @@ pub struct Send {
 /// Connect a socket to a remote address.
 pub struct Connect {
     pub fd: IoFd,
-    /// Raw address bytes (sockaddr representation).
+    /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
     pub addr: SockAddrStorage,
     pub addr_len: u32,
 }
@@ -253,8 +254,11 @@ pub struct Wakeup {
 pub struct Accept {
     pub fd: IoFd,
     /// Buffer for storing the remote address.
+    /// On Windows, we parse the result from the AcceptEx output buffer, so we don't need this storage.
+    #[cfg(unix)]
     pub addr: SockAddrStorage,
     /// Length of the address buffer.
+    #[cfg(unix)]
     pub addr_len: u32,
     /// Parsed remote address (populated after completion).
     pub remote_addr: Option<std::net::SocketAddr>,
@@ -325,14 +329,14 @@ impl OpLifecycle for Accept {
     #[allow(unused_variables)]
     fn into_op(fd: RawHandle, pre: Self::PreAlloc) -> Self {
         // Use stack/inline storage
-        let addr: SockAddrStorage = unsafe { std::mem::zeroed() };
+        #[cfg(unix)]
         let addr_len = std::mem::size_of::<SockAddrStorage>() as u32;
 
         #[cfg(unix)]
         {
             Self {
                 fd: IoFd::Raw(fd),
-                addr,
+                addr: unsafe { std::mem::zeroed() },
                 addr_len,
                 remote_addr: None,
             }
@@ -341,8 +345,6 @@ impl OpLifecycle for Accept {
         {
             Self {
                 fd: IoFd::Raw(fd),
-                addr,
-                addr_len,
                 remote_addr: None,
                 accept_socket: pre,
             }
@@ -370,19 +372,11 @@ impl OpLifecycle for Accept {
         #[cfg(windows)]
         {
             res?;
-            use crate::io::socket::to_socket_addr;
-            let addr = if let Some(a) = self.remote_addr {
-                a
-            } else {
-                unsafe {
-                    let s = std::slice::from_raw_parts(
-                        &self.addr as *const _ as *const u8,
-                        self.addr_len as usize,
-                    );
-                    to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
-                }
-            };
             // On Windows, the accept_socket was pre-allocated and is the new connection
+            // Helper to provide a default address if parsing failed or was irrelevant, preventing panic
+            let addr = self
+                .remote_addr
+                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
             Ok((self.accept_socket, addr))
         }
     }

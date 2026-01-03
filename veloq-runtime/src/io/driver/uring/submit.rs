@@ -48,6 +48,17 @@ macro_rules! impl_lifecycle {
             None
         }
     };
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, boxed_nested_fd) => {
+        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
+            }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn(op: &UringOp) -> Option<IoFd> {
+            unsafe { Some((**op.payload.$variant).op.fd) }
+        }
+    };
 }
 
 macro_rules! impl_default_completion {
@@ -245,7 +256,7 @@ impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
 // ============================================================================
 
 pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp) -> squeue::Entry {
-    let accept_op = unsafe { &mut *op.payload.accept };
+    let accept_op = unsafe { &mut (**op.payload.accept).op };
     match accept_op.fd {
         IoFd::Raw(fd) => opcode::Accept::new(
             types::Fd(fd as i32),
@@ -267,7 +278,7 @@ pub(crate) unsafe fn on_complete_accept(
     result: i32,
 ) -> io::Result<usize> {
     if result >= 0 {
-        let accept_op = unsafe { &mut *op.payload.accept };
+        let accept_op = unsafe { &mut (**op.payload.accept).op };
         // Try fallback parsing to populate remote_addr early
         let addr_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -284,14 +295,14 @@ pub(crate) unsafe fn on_complete_accept(
     }
 }
 
-impl_lifecycle!(drop_accept, get_fd_accept, accept, direct_fd);
+impl_lifecycle!(drop_accept, get_fd_accept, accept, boxed_nested_fd);
 
 // ============================================================================
 // SendTo
 // ============================================================================
 
 pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.send_to };
+    let payload = unsafe { &mut **op.payload.send_to };
 
     // Initialize internal pointers
     payload.iovec[0].iov_base = payload.op.buf.as_slice().as_ptr() as *mut _;
@@ -313,14 +324,14 @@ pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
 }
 
 impl_default_completion!(on_complete_send_to);
-impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
+impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, boxed_nested_fd);
 
 // ============================================================================
 // RecvFrom
 // ============================================================================
 
 pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.recv_from };
+    let payload = unsafe { &mut **op.payload.recv_from };
 
     // Initialize internal pointers
     payload.iovec[0].iov_base = payload.op.buf.as_mut_ptr() as *mut _;
@@ -345,7 +356,7 @@ pub(crate) unsafe fn on_complete_recv_from(
     result: i32,
 ) -> io::Result<usize> {
     if result >= 0 {
-        let payload = unsafe { &mut *op.payload.recv_from };
+        let payload = unsafe { &mut **op.payload.recv_from };
         let len = payload.msghdr.msg_namelen as usize;
         let addr_bytes = unsafe {
             std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len)
@@ -359,7 +370,7 @@ pub(crate) unsafe fn on_complete_recv_from(
     }
 }
 
-impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
+impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, boxed_nested_fd);
 
 // ============================================================================
 // Close

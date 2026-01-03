@@ -47,6 +47,17 @@ macro_rules! impl_lifecycle {
             unsafe { Some(op.payload.$variant.op.fd) }
         }
     };
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, boxed_nested_fd) => {
+        pub(crate) unsafe fn $drop_fn(op: &mut IocpOp) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
+            }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn(op: &IocpOp) -> Option<IoFd> {
+            unsafe { Some(op.payload.$variant.op.fd) }
+        }
+    };
     ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, no_fd) => {
         pub(crate) unsafe fn $drop_fn(op: &mut IocpOp) {
             unsafe {
@@ -557,7 +568,7 @@ pub(crate) unsafe fn submit_send_to(
     _ext: &Extensions,
     registered_files: &[Option<HANDLE>],
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut *op.payload.send_to };
+    let payload = unsafe { &mut **op.payload.send_to };
     let handle = resolve_fd(payload.op.fd, registered_files)?;
     unsafe {
         CreateIoCompletionPort(handle, port, 0, 0);
@@ -590,7 +601,7 @@ pub(crate) unsafe fn submit_send_to(
     Ok(SubmissionResult::Pending)
 }
 
-impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
+impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, boxed_nested_fd);
 
 // ============================================================================
 // RecvFrom
@@ -603,7 +614,7 @@ pub(crate) unsafe fn submit_recv_from(
     _ext: &Extensions,
     registered_files: &[Option<HANDLE>],
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut *op.payload.recv_from };
+    let payload = unsafe { &mut **op.payload.recv_from };
     let handle = resolve_fd(payload.op.fd, registered_files)?;
     unsafe {
         CreateIoCompletionPort(handle, port, 0, 0);
@@ -636,7 +647,7 @@ pub(crate) unsafe fn submit_recv_from(
     Ok(SubmissionResult::Pending)
 }
 
-impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
+impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, boxed_nested_fd);
 
 // ============================================================================
 // Open

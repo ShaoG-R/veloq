@@ -111,9 +111,9 @@ pub union IocpOpPayload {
     pub recv: ManuallyDrop<Recv>,
     pub send: ManuallyDrop<OpSend>,
     pub connect: ManuallyDrop<Connect>,
-    pub accept: ManuallyDrop<AcceptPayload>,
-    pub send_to: ManuallyDrop<SendToPayload>,
-    pub recv_from: ManuallyDrop<RecvFromPayload>,
+    pub accept: ManuallyDrop<Box<AcceptPayload>>,
+    pub send_to: ManuallyDrop<Box<SendToPayload>>,
+    pub recv_from: ManuallyDrop<Box<RecvFromPayload>>,
     pub open: ManuallyDrop<OpenPayload>,
     pub close: ManuallyDrop<Close>,
     pub fsync: ManuallyDrop<Fsync>,
@@ -249,10 +249,10 @@ impl IntoPlatformOp<IocpDriver> for Accept {
             get_fd: submit::get_fd_accept,
         };
 
-        let payload = AcceptPayload {
+        let payload = Box::new(AcceptPayload {
             op: self,
             accept_buffer: [0; 288],
-        };
+        });
         IocpOp {
             header: OverlappedEntry::new(0),
             vtable: &TABLE,
@@ -284,14 +284,14 @@ impl IntoPlatformOp<IocpDriver> for SendTo {
         let payload = SendToPayload {
             op: self,
             wsabuf,
-            addr,
+            addr: addr,
             addr_len: addr_len as i32,
         };
         IocpOp {
             header: OverlappedEntry::new(0),
             vtable: &TABLE,
             payload: IocpOpPayload {
-                send_to: ManuallyDrop::new(payload),
+                send_to: ManuallyDrop::new(Box::new(payload)),
             },
         }
     }
@@ -318,14 +318,14 @@ impl IntoPlatformOp<IocpDriver> for RecvFrom {
             op: self,
             wsabuf,
             flags: 0,
-            addr: unsafe { std::mem::zeroed() },
+            addr: SockAddrStorage::default(),
             addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
         };
         IocpOp {
             header: OverlappedEntry::new(0),
             vtable: &TABLE,
             payload: IocpOpPayload {
-                recv_from: ManuallyDrop::new(payload),
+                recv_from: ManuallyDrop::new(Box::new(payload)),
             },
         }
     }

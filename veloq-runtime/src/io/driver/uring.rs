@@ -104,7 +104,7 @@ impl UringDriver {
             return;
         }
 
-        let fd = self.waker_fd as usize;
+        let fd = self.waker_fd;
         let op = crate::io::op::Wakeup { fd: crate::io::op::IoFd::Raw(fd) };
         // Use into_platform_op to convert to UringOp
         let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);

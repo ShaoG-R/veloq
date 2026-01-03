@@ -67,9 +67,9 @@ pub union UringOpPayload {
     pub recv: ManuallyDrop<Recv>,
     pub send: ManuallyDrop<OpSend>,
     pub connect: ManuallyDrop<Connect>,
-    pub accept: ManuallyDrop<Accept>,
-    pub send_to: ManuallyDrop<SendToPayload>,
-    pub recv_from: ManuallyDrop<RecvFromPayload>,
+    pub accept: ManuallyDrop<Box<AcceptPayload>>,
+    pub send_to: ManuallyDrop<Box<SendToPayload>>,
+    pub recv_from: ManuallyDrop<Box<RecvFromPayload>>,
     pub open: ManuallyDrop<OpenPayload>,
     pub close: ManuallyDrop<Close>,
     pub fsync: ManuallyDrop<Fsync>,
@@ -82,6 +82,10 @@ pub union UringOpPayload {
 // ============================================================================
 // Payload Structures for Complex Ops
 // ============================================================================
+
+pub struct AcceptPayload {
+    pub op: Accept,
+}
 
 pub struct SendToPayload {
     pub op: SendTo,
@@ -188,16 +192,31 @@ impl_into_uring_op!(
     drop_fallocate,
     get_fd_fallocate
 );
-impl_into_uring_op!(
-    Accept,
-    accept,
-    make_sqe_accept,
-    on_complete_accept,
-    drop_accept,
-    get_fd_accept
-);
 
 // Manual implementations for ops with extras
+
+impl IntoPlatformOp<UringDriver> for Accept {
+    fn into_platform_op(self) -> UringOp {
+        const TABLE: OpVTable = OpVTable {
+            make_sqe: submit::make_sqe_accept,
+            on_complete: submit::on_complete_accept,
+            drop: submit::drop_accept,
+            get_fd: submit::get_fd_accept,
+        };
+
+        let payload = AcceptPayload { op: self };
+        UringOp {
+            vtable: &TABLE,
+            payload: UringOpPayload {
+                accept: ManuallyDrop::new(Box::new(payload)),
+            },
+        }
+    }
+    fn from_platform_op(op: UringOp) -> Self {
+        let op = ManuallyDrop::new(op);
+        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.accept)).op }
+    }
+}
 
 impl IntoPlatformOp<UringDriver> for SendTo {
     fn into_platform_op(self) -> UringOp {
@@ -220,7 +239,7 @@ impl IntoPlatformOp<UringDriver> for SendTo {
         UringOp {
             vtable: &TABLE,
             payload: UringOpPayload {
-                send_to: ManuallyDrop::new(payload),
+                send_to: ManuallyDrop::new(Box::new(payload)),
             },
         }
     }
@@ -250,7 +269,7 @@ impl IntoPlatformOp<UringDriver> for RecvFrom {
         UringOp {
             vtable: &TABLE,
             payload: UringOpPayload {
-                recv_from: ManuallyDrop::new(payload),
+                recv_from: ManuallyDrop::new(Box::new(payload)),
             },
         }
     }
