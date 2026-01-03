@@ -5,7 +5,6 @@
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
 //! - `IntoPlatformOp` implementations using blind casting
 
-use crate::io::buffer::BufPool;
 use crate::io::driver::PlatformOp;
 use crate::io::driver::iocp::IocpDriver;
 use crate::io::driver::iocp::ext::Extensions;
@@ -162,7 +161,7 @@ pub struct WakeupPayload {
 
 macro_rules! impl_into_iocp_op {
     ($Type:ident, $Field:ident, $Submit:ident, $Complete:expr, $Drop:ident, $GetFd:ident) => {
-        impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for $Type {
+        impl IntoPlatformOp<IocpDriver> for $Type {
             fn into_platform_op(self) -> IocpOp {
                 const TABLE: OpVTable = OpVTable {
                     submit: submit::$Submit,
@@ -241,7 +240,7 @@ impl_into_iocp_op!(
     get_fd_timeout
 );
 
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Accept {
+impl IntoPlatformOp<IocpDriver> for Accept {
     fn into_platform_op(self) -> IocpOp {
         const TABLE: OpVTable = OpVTable {
             submit: submit::submit_accept,
@@ -268,7 +267,7 @@ impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Accept {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for SendTo {
+impl IntoPlatformOp<IocpDriver> for SendTo {
     fn into_platform_op(self) -> IocpOp {
         const TABLE: OpVTable = OpVTable {
             submit: submit::submit_send_to,
@@ -302,7 +301,7 @@ impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for SendTo {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for RecvFrom {
+impl IntoPlatformOp<IocpDriver> for RecvFrom {
     fn into_platform_op(mut self) -> IocpOp {
         const TABLE: OpVTable = OpVTable {
             submit: submit::submit_recv_from,
@@ -344,7 +343,7 @@ impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for RecvFrom {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Open {
+impl IntoPlatformOp<IocpDriver> for Open {
     fn into_platform_op(self) -> IocpOp {
         const TABLE: OpVTable = OpVTable {
             submit: submit::submit_open,
@@ -368,7 +367,7 @@ impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Open {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Wakeup {
+impl IntoPlatformOp<IocpDriver> for Wakeup {
     fn into_platform_op(self) -> IocpOp {
         const TABLE: OpVTable = OpVTable {
             submit: submit::submit_wakeup,

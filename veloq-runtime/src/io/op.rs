@@ -13,7 +13,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::io::buffer::{BufPool, FixedBuf};
+use crate::io::buffer::FixedBuf;
 use crate::io::driver::{Driver, PlatformDriver};
 use crate::io::socket::SockAddrStorage;
 use std::cell::RefCell;
@@ -98,16 +98,16 @@ enum State {
 /// 1. Defined: Operation created but not submitted
 /// 2. Submitted: Operation submitted to the driver
 /// 3. Completed: Operation finished, result available
-pub struct Op<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> {
+pub struct Op<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
     user_data: usize,
-    driver: Weak<RefCell<PlatformDriver<P>>>,
+    driver: Weak<RefCell<PlatformDriver>>,
 }
 
-impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Op<T, P> {
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Op<T> {
     /// Create a new operation with the given data and driver reference.
-    pub fn new(data: T, driver: Weak<RefCell<PlatformDriver<P>>>) -> Self {
+    pub fn new(data: T, driver: Weak<RefCell<PlatformDriver>>) -> Self {
         Self {
             state: State::Defined,
             data: Some(data),
@@ -117,7 +117,7 @@ impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Op<T, P> {
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Future for Op<T, P> {
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
     type Output = (std::io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -166,7 +166,7 @@ impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Future for Op<T
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Drop for Op<T, P> {
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for Op<T> {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
             if let Some(driver_rc) = self.driver.upgrade() {

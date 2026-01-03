@@ -75,7 +75,7 @@ impl OpenOptions {
         &self,
         path: impl AsRef<Path>,
         context: &crate::runtime::context::RuntimeContext<P>,
-    ) -> std::io::Result<super::file::File<P>> {
+    ) -> std::io::Result<super::file::File> {
         // 1. 根据不同平台生成对应的 Op 参数
         let op = self.build_op(path.as_ref(), context).await?;
 

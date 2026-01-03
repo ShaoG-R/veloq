@@ -3,13 +3,13 @@ pub mod driver;
 pub mod op;
 pub(crate) mod socket;
 
-use crate::io::buffer::{BufPool, FixedBuf};
+use crate::io::buffer::FixedBuf;
 use std::future::Future;
 use std::io;
 
 /// Async buffered reading trait.
 /// Suitable for underlying asynchronous read operations that require passing FixedBuf ownership.
-pub trait AsyncBufRead<P: BufPool> {
+pub trait AsyncBufRead {
     /// Read data into the buffer.
     /// Returns the number of bytes read and the original buffer.
     fn read(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)>;

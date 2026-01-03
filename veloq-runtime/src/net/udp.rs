@@ -1,4 +1,4 @@
-use crate::io::buffer::{BufPool, FixedBuf};
+use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
 use crate::io::op::{Connect, IoFd, Op, RawHandle, Recv, RecvFrom, Send, SendTo};
 use crate::io::socket::Socket;
@@ -7,12 +7,12 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Weak;
 
-pub struct UdpSocket<P: BufPool> {
+pub struct UdpSocket {
     fd: RawHandle,
-    driver: Weak<RefCell<PlatformDriver<P>>>,
+    driver: Weak<RefCell<PlatformDriver>>,
 }
 
-impl<P: BufPool> Drop for UdpSocket<P> {
+impl Drop for UdpSocket {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = unsafe { Socket::from_raw(self.fd as i32) };
@@ -21,10 +21,10 @@ impl<P: BufPool> Drop for UdpSocket<P> {
     }
 }
 
-impl<P: BufPool> UdpSocket<P> {
+impl UdpSocket {
     pub fn bind<A: ToSocketAddrs>(
         addr: A,
-        driver: Weak<RefCell<PlatformDriver<P>>>,
+        driver: Weak<RefCell<PlatformDriver>>,
     ) -> io::Result<Self> {
         let addr = addr
             .to_socket_addrs()?
@@ -122,7 +122,7 @@ impl<P: BufPool> UdpSocket<P> {
     }
 }
 
-impl<P: BufPool> crate::io::AsyncBufRead<P> for UdpSocket<P> {
+impl crate::io::AsyncBufRead for UdpSocket {
     fn read(
         &self,
         buf: FixedBuf,
@@ -131,7 +131,7 @@ impl<P: BufPool> crate::io::AsyncBufRead<P> for UdpSocket<P> {
     }
 }
 
-impl<P: BufPool> crate::io::AsyncBufWrite for UdpSocket<P> {
+impl crate::io::AsyncBufWrite for UdpSocket {
     fn write(
         &self,
         buf: FixedBuf,

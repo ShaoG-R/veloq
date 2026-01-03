@@ -34,9 +34,7 @@ pub enum PlatformData {
     None,
 }
 
-use crate::io::buffer::BufPool;
-
-pub struct IocpDriver<P: BufPool> {
+pub struct IocpDriver {
     port: HANDLE,
     ops: OpRegistry<IocpOp, PlatformData>,
     extensions: Extensions,
@@ -44,7 +42,6 @@ pub struct IocpDriver<P: BufPool> {
     registered_files: Vec<Option<HANDLE>>,
     free_slots: Vec<usize>,
     pool: ThreadPool,
-    _marker: std::marker::PhantomData<P>,
 }
 
 struct IocpWaker(HANDLE);
@@ -72,7 +69,7 @@ impl Drop for IocpWaker {
     }
 }
 
-impl<P: BufPool> IocpDriver<P> {
+impl IocpDriver {
     pub fn new(config: &crate::config::Config) -> io::Result<Self> {
         // Create a new completion port.
         let port =
@@ -95,7 +92,6 @@ impl<P: BufPool> IocpDriver<P> {
             registered_files: Vec::new(),
             free_slots: Vec::new(),
             pool: ThreadPool::new(16, 128, 1024, Duration::from_secs(30)),
-            _marker: std::marker::PhantomData,
         })
     }
 
@@ -209,9 +205,8 @@ impl<P: BufPool> IocpDriver<P> {
     }
 }
 
-impl<P: BufPool> Driver for IocpDriver<P> {
+impl Driver for IocpDriver {
     type Op = IocpOp;
-    type Pool = P;
 
     fn reserve_op(&mut self) -> usize {
         self.ops.insert(OpEntry::new(None, PlatformData::None))
@@ -374,10 +369,6 @@ impl<P: BufPool> Driver for IocpDriver<P> {
         }
     }
 
-    fn register_buffer_pool(&mut self, _pool: &Self::Pool) -> io::Result<()> {
-        Ok(())
-    }
-
     fn register_files(
         &mut self,
         files: &[crate::io::op::RawHandle],
@@ -442,7 +433,7 @@ impl<P: BufPool> Driver for IocpDriver<P> {
     }
 }
 
-impl<P: BufPool> Drop for IocpDriver<P> {
+impl Drop for IocpDriver {
     fn drop(&mut self) {
         let mut pending_count = 0;
         for (_user_data, op) in self.ops.iter_mut() {

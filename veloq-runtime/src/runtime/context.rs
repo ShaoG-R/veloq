@@ -23,7 +23,7 @@ use crate::io::buffer::BufPool;
 /// and accessing the IO driver.
 #[derive(Clone)]
 pub struct RuntimeContext<P: BufPool> {
-    pub(crate) driver: Weak<RefCell<PlatformDriver<P>>>,
+    pub(crate) driver: Weak<RefCell<PlatformDriver>>,
     pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     pub(crate) buffer_pool: Weak<P>,
     pub(crate) spawner: Option<Spawner>,
@@ -32,7 +32,7 @@ pub struct RuntimeContext<P: BufPool> {
 impl<P: BufPool> RuntimeContext<P> {
     /// Create a new RuntimeContext.
     pub(crate) fn new(
-        driver: Weak<RefCell<PlatformDriver<P>>>,
+        driver: Weak<RefCell<PlatformDriver>>,
         queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
         buffer_pool: Weak<P>,
         spawner: Option<Spawner>,
@@ -85,7 +85,7 @@ impl<P: BufPool> RuntimeContext<P> {
     }
 
     /// Get a weak reference to the current driver.
-    pub fn driver(&self) -> Weak<RefCell<PlatformDriver<P>>> {
+    pub fn driver(&self) -> Weak<RefCell<PlatformDriver>> {
         self.driver.clone()
     }
 

@@ -1,4 +1,4 @@
-use crate::io::buffer::{BufPool, FixedBuf};
+use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
 use crate::io::op::{Accept, Connect, IoFd, Op, OpLifecycle, RawHandle, Recv, Send};
 use crate::io::socket::Socket;
@@ -7,17 +7,17 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Weak;
 
-pub struct TcpListener<P: BufPool> {
+pub struct TcpListener {
     fd: RawHandle,
-    driver: Weak<RefCell<PlatformDriver<P>>>,
+    driver: Weak<RefCell<PlatformDriver>>,
 }
 
-pub struct TcpStream<P: BufPool> {
+pub struct TcpStream {
     fd: RawHandle,
-    driver: Weak<RefCell<PlatformDriver<P>>>,
+    driver: Weak<RefCell<PlatformDriver>>,
 }
 
-impl<P: BufPool> Drop for TcpListener<P> {
+impl Drop for TcpListener {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = unsafe { Socket::from_raw(self.fd as i32) };
@@ -26,7 +26,7 @@ impl<P: BufPool> Drop for TcpListener<P> {
     }
 }
 
-impl<P: BufPool> Drop for TcpStream<P> {
+impl Drop for TcpStream {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = unsafe { Socket::from_raw(self.fd as i32) };
@@ -35,10 +35,10 @@ impl<P: BufPool> Drop for TcpStream<P> {
     }
 }
 
-impl<P: BufPool> TcpListener<P> {
+impl TcpListener {
     pub fn bind<A: ToSocketAddrs>(
         addr: A,
-        driver: Weak<RefCell<PlatformDriver<P>>>,
+        driver: Weak<RefCell<PlatformDriver>>,
     ) -> io::Result<Self> {
         // Resolve address (take first one)
         let addr = addr
@@ -61,7 +61,7 @@ impl<P: BufPool> TcpListener<P> {
         })
     }
 
-    pub async fn accept(&self) -> io::Result<(TcpStream<P>, SocketAddr)> {
+    pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         // Pre-allocate resources (platform specific)
         let pre_alloc = Accept::pre_alloc(self.fd)?;
 
@@ -95,10 +95,10 @@ impl<P: BufPool> TcpListener<P> {
     }
 }
 
-impl<P: BufPool> TcpStream<P> {
+impl TcpStream {
     pub async fn connect(
         addr: SocketAddr,
-        driver: Weak<RefCell<PlatformDriver<P>>>,
+        driver: Weak<RefCell<PlatformDriver>>,
     ) -> io::Result<Self> {
         let socket = if addr.is_ipv4() {
             Socket::new_tcp_v4()?
@@ -142,7 +142,7 @@ impl<P: BufPool> TcpStream<P> {
     }
 }
 
-impl<P: BufPool> crate::io::AsyncBufRead<P> for TcpStream<P> {
+impl crate::io::AsyncBufRead for TcpStream {
     fn read(
         &self,
         buf: FixedBuf,
@@ -151,7 +151,7 @@ impl<P: BufPool> crate::io::AsyncBufRead<P> for TcpStream<P> {
     }
 }
 
-impl<P: BufPool> crate::io::AsyncBufWrite for TcpStream<P> {
+impl crate::io::AsyncBufWrite for TcpStream {
     fn write(
         &self,
         buf: FixedBuf,

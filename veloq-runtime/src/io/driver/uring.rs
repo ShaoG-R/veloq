@@ -11,7 +11,6 @@ pub mod op;
 pub mod submit;
 
 use crate::io::driver::uring::op::UringOp;
-use crate::io::buffer::BufPool;
 use crate::io::op::IntoPlatformOp;
 
 struct UringWaker(RawFd);
@@ -45,7 +44,7 @@ impl Drop for UringWaker {
 const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 
-pub struct UringDriver<P: BufPool> {
+pub struct UringDriver {
     /// The actual io_uring instance
     ring: IoUring,
     /// Store for in-flight operations.
@@ -53,10 +52,9 @@ pub struct UringDriver<P: BufPool> {
     ops: OpRegistry<UringOp, ()>,
     waker_fd: RawFd,
     waker_token: Option<usize>,
-    _marker: std::marker::PhantomData<P>,
 }
 
-impl<P: BufPool> UringDriver<P> {
+impl UringDriver {
     pub fn new(config: &crate::config::Config) -> io::Result<Self> {
         let entries = config.uring.entries;
         let mut builder = IoUring::builder();
@@ -94,7 +92,6 @@ impl<P: BufPool> UringDriver<P> {
             ops,
             waker_fd,
             waker_token: None,
-            _marker: std::marker::PhantomData,
         };
 
         driver.submit_waker();
@@ -110,7 +107,7 @@ impl<P: BufPool> UringDriver<P> {
         let fd = self.waker_fd as usize;
         let op = crate::io::op::Wakeup { fd: crate::io::op::IoFd::Raw(fd) };
         // Use into_platform_op to convert to UringOp
-        let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver<P>>>::into_platform_op(op);
+        let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
 
         let user_data = self.ops.insert(OpEntry::new(Some(uring_op), ()));
         self.waker_token = Some(user_data);
@@ -244,10 +241,10 @@ impl<P: BufPool> UringDriver<P> {
     }
 
     /// Register buffers with the kernel invocation of io_uring.
-    pub fn register_buffers(&mut self, iovecs: Vec<libc::iovec>) -> io::Result<()> {
+    pub fn register_buffers(&mut self, iovecs: &Vec<libc::iovec>) -> io::Result<()> {
         // Safety: iovecs are valid as long as the caller (BufferPool) keeps them valid.
         // In our case, BufferPool keeps 'memory' alive forever (static/thread_local).
-        unsafe { self.ring.submitter().register_buffers(&iovecs) }
+        unsafe { self.ring.submitter().register_buffers(iovecs) }
     }
 
     /// Called when the Future is dropped.
@@ -273,9 +270,8 @@ impl<P: BufPool> UringDriver<P> {
 
 use crate::io::driver::Driver;
 
-impl<P: BufPool> Driver for UringDriver<P> {
+impl Driver for UringDriver {
     type Op = UringOp;
-    type Pool = P;
 
     fn reserve_op(&mut self) -> usize {
         self.ops.insert(OpEntry::new(None, ()))
@@ -351,9 +347,9 @@ impl<P: BufPool> Driver for UringDriver<P> {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffer_pool(&mut self, pool: &Self::Pool) -> io::Result<()> {
-        let iovecs = pool.get_registration_buffers();
-        self.register_buffers(iovecs)
+    #[cfg(target_os = "linux")]
+    fn register_buffer_pool(&mut self, vec: &Vec<libc::iovec>) -> io::Result<()> {
+        self.register_buffers(vec)
     }
 
     fn register_files(
@@ -404,7 +400,7 @@ impl<P: BufPool> Driver for UringDriver<P> {
     }
 }
 
-impl<P: BufPool> Drop for UringDriver<P> {
+impl Drop for UringDriver {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.waker_fd);

@@ -5,7 +5,6 @@
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
 //! - `IntoPlatformOp` implementations using blind casting
 
-use crate::io::buffer::BufPool;
 use crate::io::driver::PlatformOp;
 use crate::io::driver::uring::UringDriver;
 use crate::io::driver::uring::submit;
@@ -120,7 +119,7 @@ pub struct TimeoutPayload {
 
 macro_rules! impl_into_uring_op {
     ($Type:ident, $Field:ident, $MakeSqe:ident, $OnComplete:ident, $Drop:ident, $GetFd:ident) => {
-        impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for $Type {
+        impl IntoPlatformOp<UringDriver> for $Type {
             fn into_platform_op(self) -> UringOp {
                 const TABLE: OpVTable = OpVTable {
                     make_sqe: submit::$MakeSqe,
@@ -200,7 +199,7 @@ impl_into_uring_op!(
 
 // Manual implementations for ops with extras
 
-impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for SendTo {
+impl IntoPlatformOp<UringDriver> for SendTo {
     fn into_platform_op(self) -> UringOp {
         const TABLE: OpVTable = OpVTable {
             make_sqe: submit::make_sqe_send_to,
@@ -231,7 +230,7 @@ impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for SendTo {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for RecvFrom {
+impl IntoPlatformOp<UringDriver> for RecvFrom {
     fn into_platform_op(self) -> UringOp {
         const TABLE: OpVTable = OpVTable {
             make_sqe: submit::make_sqe_recv_from,
@@ -262,7 +261,7 @@ impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for RecvFrom {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Open {
+impl IntoPlatformOp<UringDriver> for Open {
     fn into_platform_op(self) -> UringOp {
         const TABLE: OpVTable = OpVTable {
             make_sqe: submit::make_sqe_open,
@@ -285,7 +284,7 @@ impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Open {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Wakeup {
+impl IntoPlatformOp<UringDriver> for Wakeup {
     fn into_platform_op(self) -> UringOp {
         const TABLE: OpVTable = OpVTable {
             make_sqe: submit::make_sqe_wakeup,
@@ -311,7 +310,7 @@ impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Wakeup {
     }
 }
 
-impl<P: BufPool> IntoPlatformOp<UringDriver<P>> for Timeout {
+impl IntoPlatformOp<UringDriver> for Timeout {
     fn into_platform_op(self) -> UringOp {
         const TABLE: OpVTable = OpVTable {
             make_sqe: submit::make_sqe_timeout,

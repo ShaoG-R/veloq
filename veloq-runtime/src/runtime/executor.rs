@@ -126,7 +126,7 @@ impl Spawner {
 }
 
 pub struct LocalExecutor<P: BufPool> {
-    driver: Rc<RefCell<PlatformDriver<P>>>,
+    driver: Rc<RefCell<PlatformDriver>>,
     queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
     buffer_pool: Rc<P>,
 
@@ -144,7 +144,7 @@ pub struct LocalExecutor<P: BufPool> {
 }
 
 impl<P: BufPool> LocalExecutor<P> {
-    pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver<P>>> {
+    pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver>> {
         Rc::downgrade(&self.driver)
     }
 
@@ -156,15 +156,19 @@ impl<P: BufPool> LocalExecutor<P> {
 
     pub fn new_with_config(pool: P, config: crate::config::Config) -> Self {
         let driver = Rc::new(RefCell::new(
-            PlatformDriver::<P>::new(&config).expect("Failed to create driver"),
+            PlatformDriver::new(&config).expect("Failed to create driver"),
         ));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let buffer_pool = Rc::new(pool);
 
-        driver
-            .borrow_mut()
-            .register_buffer_pool(buffer_pool.as_ref())
-            .expect("Failed to register buffer pool");
+        #[cfg(target_os = "linux")]
+        {
+            let iovecs = buffer_pool.get_registration_buffers();
+            driver
+                .borrow_mut()
+                .register_buffer_pool(&iovecs)
+                .expect("Failed to register buffer pool");
+        }
 
         Self {
             driver,

@@ -27,14 +27,13 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let driver: Result<IocpDriver<HybridPool>, io::Error> =
-        IocpDriver::new(&crate::config::Config::default());
+    let driver: Result<IocpDriver, io::Error> = IocpDriver::new(&crate::config::Config::default());
     assert!(driver.is_ok(), "Driver should be created");
 }
 
 #[test]
 fn test_iocp_accept() {
-    let mut driver: IocpDriver<HybridPool> =
+    let mut driver: IocpDriver =
         IocpDriver::new(&crate::config::Config::default()).expect("Driver creation failed");
 
     // Listener (Bind to random port)
@@ -50,7 +49,7 @@ fn test_iocp_accept() {
     let mut accept_op = Accept::into_op(listener_handle, acceptor_handle);
     accept_op.accept_socket = acceptor_handle;
 
-    let iocp_op = IntoPlatformOp::<IocpDriver<HybridPool>>::into_platform_op(accept_op);
+    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op);
 
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
@@ -76,7 +75,9 @@ fn test_iocp_accept() {
         match driver.poll_op(user_data, &mut cx) {
             Poll::Ready((res, iocp_op)) => {
                 assert!(res.is_ok(), "Accept failed: {:?}", res.err());
-                let op = <Accept as crate::io::op::IntoPlatformOp<IocpDriver<HybridPool>>>::from_platform_op(iocp_op);
+                let op = <Accept as crate::io::op::IntoPlatformOp<IocpDriver>>::from_platform_op(
+                    iocp_op,
+                );
                 assert!(op.remote_addr.is_some(), "Remote addr should be populated");
                 unsafe {
                     if let Some(fd) = op.fd.raw() {
@@ -96,8 +97,7 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_connect() {
-    let mut driver: IocpDriver<HybridPool> =
-        IocpDriver::new(&crate::config::Config::default()).unwrap();
+    let mut driver: IocpDriver = IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     // Listener
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -117,7 +117,7 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    let iocp_op = IntoPlatformOp::<IocpDriver<HybridPool>>::into_platform_op(connect_op);
+    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op);
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -144,14 +144,13 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_timeout() {
-    let mut driver: IocpDriver<HybridPool> =
-        IocpDriver::new(&crate::config::Config::default()).unwrap();
+    let mut driver: IocpDriver = IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     let timeout_op = Timeout {
         duration: std::time::Duration::from_millis(100),
     };
 
-    let iocp_op = IntoPlatformOp::<IocpDriver<HybridPool>>::into_platform_op(timeout_op);
+    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(timeout_op);
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -187,7 +186,7 @@ fn test_iocp_timeout() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    let mut driver = IocpDriver::<HybridPool>::new(&crate::config::Config::default()).unwrap();
+    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
     let pool = HybridPool::new();
 
     // Setup connection
@@ -214,7 +213,7 @@ fn test_iocp_recv_with_buffer_pool() {
         buf,
     };
 
-    let iocp_op = IntoPlatformOp::<IocpDriver<HybridPool>>::into_platform_op(recv_op);
+    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op);
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -235,7 +234,8 @@ fn test_iocp_recv_with_buffer_pool() {
                 let bytes_read = res.unwrap();
                 assert_eq!(bytes_read, 12);
 
-                let mut op = <Recv as crate::io::op::IntoPlatformOp<IocpDriver<HybridPool>>>::from_platform_op(iocp_op);
+                let mut op =
+                    <Recv as crate::io::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
                 op.buf.set_len(bytes_read);
                 assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
