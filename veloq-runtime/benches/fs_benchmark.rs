@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
+use veloq_runtime::fs::File;
 use veloq_runtime::io::buffer::BuddyPool;
 use veloq_runtime::io::buffer::buddy::BufferSize;
-use veloq_runtime::io::fs::File;
 
 fn benchmark_1gb_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("fs_throughput");

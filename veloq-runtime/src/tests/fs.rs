@@ -1,5 +1,5 @@
+use crate::fs::File;
 use crate::io::buffer::HybridPool;
-use crate::io::fs::File;
 use std::fs;
 use std::path::Path;
 

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod fs;
 pub mod io;
 pub mod macros;
 pub mod net;
