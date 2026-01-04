@@ -1,5 +1,6 @@
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
 use io_uring::{IoUring, opcode, squeue};
+use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::task::{Context, Poll};
@@ -12,6 +13,18 @@ pub mod submit;
 
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IntoPlatformOp;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UringOpState {
+    pub submitted: bool,
+    pub next: Option<usize>,
+}
+
+impl UringOpState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 struct UringWaker(RawFd);
 
@@ -49,7 +62,15 @@ pub struct UringDriver {
     ring: IoUring,
     /// Store for in-flight operations.
     /// The key (usize) is used as the io_uring user_data.
-    ops: OpRegistry<UringOp, ()>,
+    /// Payload (UringOpState) tracks submission state and backlog list.
+    ops: OpRegistry<UringOp, UringOpState>,
+    /// Head of the intrusive backlog list.
+    backlog_head: Option<usize>,
+    /// Tail of the intrusive backlog list.
+    backlog_tail: Option<usize>,
+    /// Queue for cancellation requests that failed to submit.
+    pending_cancellations: VecDeque<usize>,
+
     waker_fd: RawFd,
     waker_token: Option<usize>,
 }
@@ -72,8 +93,6 @@ impl UringDriver {
             // Fallback for older kernels if flags are unsupported (EINVAL)
             if e.raw_os_error() == Some(libc::EINVAL) {
                 // If the optimized build failed, try a basic one.
-                // Note: This might degrade from Polling to Interrupt if Polling was requested but unsupported.
-                // A production system might want to log a warning here.
                 IoUring::new(entries)
             } else {
                 Err(e)
@@ -90,6 +109,9 @@ impl UringDriver {
         let mut driver = Self {
             ring,
             ops,
+            backlog_head: None,
+            backlog_tail: None,
+            pending_cancellations: VecDeque::new(),
             waker_fd,
             waker_token: None,
         };
@@ -111,15 +133,30 @@ impl UringDriver {
         // Use into_platform_op to convert to UringOp
         let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
 
-        let user_data = self.ops.insert(OpEntry::new(Some(uring_op), ()));
+        let user_data = self
+            .ops
+            .insert(OpEntry::new(Some(uring_op), UringOpState::new()));
         self.waker_token = Some(user_data);
 
-        // Generate and push SQE
-        if let Some(entry) = self.ops.get_mut(user_data) {
+        // Generate SQE
+        let sqe = if let Some(entry) = self.ops.get_mut(user_data) {
             if let Some(ref mut resources) = entry.resources {
-                let sqe =
-                    unsafe { (resources.vtable.make_sqe)(resources).user_data(user_data as u64) };
-                self.push_entry(sqe);
+                Some(unsafe { (resources.vtable.make_sqe)(resources).user_data(user_data as u64) })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(sqe) = sqe {
+            if self.push_entry(sqe) {
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.platform_data.submitted = true;
+                }
+            } else {
+                // Waker failed to submit. This is bad but handled by backlog logic.
+                self.push_backlog(user_data);
             }
         }
     }
@@ -132,17 +169,21 @@ impl UringDriver {
         } else {
             self.ring.submit()?;
         }
+        // Always try to flush backlog after submit, as submit likely freed up SQ space
+        self.flush_backlog();
         Ok(())
     }
 
     /// Wait for completions.
     pub fn wait(&mut self) -> io::Result<()> {
+        // Try to flush backlog first before waiting
+        self.flush_cancellations();
+        self.flush_backlog();
+
         if self.ops.is_empty() {
             return Ok(());
         }
 
-        // Optimization: check if we have completions available in userspace queue
-        // before issuing a syscall to wait.
         if !self.ring.completion().is_empty() {
             self.process_completions_internal();
             return Ok(());
@@ -150,6 +191,10 @@ impl UringDriver {
 
         self.ring.submit_and_wait(1)?;
         self.process_completions_internal();
+
+        // After wait (which implies submit), we might have space
+        self.flush_cancellations();
+        self.flush_backlog();
         Ok(())
     }
 
@@ -164,10 +209,6 @@ impl UringDriver {
             for cqe in cqe_kicker {
                 let user_data = cqe.user_data() as usize;
 
-                // Skip special user_data values:
-                // - u64::MAX: reserved/special
-                // - CANCEL_USER_DATA: completion of our cancel requests (we don't need to handle these)
-                // - BACKGROUND_USER_DATA: fire-and-forget background ops (e.g. Close)
                 if user_data == u64::MAX as usize
                     || user_data == CANCEL_USER_DATA as usize
                     || user_data == BACKGROUND_USER_DATA as usize
@@ -183,11 +224,9 @@ impl UringDriver {
                 if self.ops.contains(user_data) {
                     let op = &mut self.ops[user_data];
 
-                    // Call on_complete on the resources
                     let res = if let Some(ref mut resources) = op.resources {
                         unsafe { (resources.vtable.on_complete)(resources, cqe.result()) }
                     } else {
-                        // No resources, just convert result
                         if cqe.result() >= 0 {
                             Ok(cqe.result() as usize)
                         } else {
@@ -196,11 +235,8 @@ impl UringDriver {
                     };
 
                     if op.cancelled {
-                        // Future is gone. Cleanup.
-                        // 'resources' will be dropped when we remove from slab.
                         self.ops.remove(user_data);
                     } else {
-                        // Store result and wake future
                         op.result = Some(res);
                         if let Some(waker) = op.waker.take() {
                             waker.wake();
@@ -218,56 +254,183 @@ impl UringDriver {
         }
     }
 
-    /// Get a submission queue entry to fill.
-    fn push_entry(&mut self, entry: squeue::Entry) {
+    /// Try to push an entry to the submission queue.
+    /// Returns true if successful, false if SQ is full.
+    fn push_entry(&mut self, entry: squeue::Entry) -> bool {
         let mut sq = self.ring.submission();
 
-        // Attempt to push the entry
-        if unsafe { sq.push(&entry) }.is_err() {
-            // SQ is full. We must submit current entries to clear space.
-            drop(sq); // Drop mutable borrow to call submit
-            if let Err(e) = self.ring.submit() {
-                // If submit fails, we have a serious problem.
-                // Panic is appropriate here as we can't recover easily and maintaining consistency is hard.
-                panic!("io_uring submit failed during push recovery: {}", e);
-            }
+        if unsafe { sq.push(&entry) }.is_ok() {
+            return true;
+        }
 
-            // Retry push
-            let mut sq = self.ring.submission();
-            if unsafe { sq.push(&entry) }.is_err() {
-                // If it still fails, it essentially means the kernel isn't consuming SQEs fast enough
-                // or we are trying to push more than the ring size at once without processing completions.
-                // For a robust runtime, we might want to wait/park, but for now panicking prevents hidden deadlocks.
-                panic!("io_uring submission queue is full and cannot be cleared");
+        // SQ full, try to submit (flush)
+        drop(sq);
+        let _ = self.ring.submit(); // Ignore error here, we retry push anyway
+
+        let mut sq = self.ring.submission();
+        if unsafe { sq.push(&entry) }.is_ok() {
+            return true;
+        }
+
+        false
+    }
+
+    /// Try to submit pending cancellations
+    fn flush_cancellations(&mut self) {
+        let mut submitted_count = 0;
+        let limit = self.pending_cancellations.len();
+
+        while submitted_count < limit {
+            if let Some(user_data) = self.pending_cancellations.front().cloned() {
+                // If the operation is gone or completed, we don't need to cancel anymore
+                if !self.ops.contains(user_data) {
+                    self.pending_cancellations.pop_front();
+                    continue;
+                }
+
+                let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
+                    .build()
+                    .user_data(CANCEL_USER_DATA);
+
+                if self.push_entry(cancel_sqe) {
+                    self.pending_cancellations.pop_front();
+                    submitted_count += 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
             }
         }
     }
 
-    /// Register buffers with the kernel invocation of io_uring.
+    /// Attempt to submit operations from the backlog.
+    fn flush_backlog(&mut self) {
+        loop {
+            let user_data = match self.backlog_head {
+                Some(ud) => ud,
+                None => break,
+            };
+
+            // 1. Check state
+            let (is_cancelled, is_submitted, has_resources) =
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    (
+                        entry.cancelled,
+                        entry.platform_data.submitted,
+                        entry.resources.is_some(),
+                    )
+                } else {
+                    // Op missing? Pop and continue
+                    self.pop_backlog();
+                    continue;
+                };
+
+            // Optimize: If cancelled, do NOT submit.
+            if is_cancelled {
+                self.pop_backlog();
+                // Complete with ECANCELED
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.result = Some(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    if let Some(waker) = entry.waker.take() {
+                        waker.wake();
+                    }
+                }
+                continue;
+            }
+
+            if is_submitted {
+                self.pop_backlog();
+                continue;
+            }
+
+            if !has_resources {
+                self.pop_backlog();
+                continue;
+            }
+
+            // 2. Generate SQE
+            let sqe = {
+                let entry = self.ops.get_mut(user_data).unwrap();
+                let res = entry.resources.as_mut().unwrap();
+                unsafe { (res.vtable.make_sqe)(res).user_data(user_data as u64) }
+            };
+
+            // 3. Push
+            if self.push_entry(sqe) {
+                self.pop_backlog();
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.platform_data.submitted = true;
+                    if let Some(waker) = entry.waker.take() {
+                        waker.wake();
+                    }
+                }
+            } else {
+                // Full
+                break;
+            }
+        }
+    }
+
+    fn push_backlog(&mut self, user_data: usize) {
+        if let Some(tail) = self.backlog_tail {
+            // Update old tail
+            if let Some(entry) = self.ops.get_mut(tail) {
+                entry.platform_data.next = Some(user_data);
+            }
+            self.backlog_tail = Some(user_data);
+        } else {
+            // Empty
+            self.backlog_head = Some(user_data);
+            self.backlog_tail = Some(user_data);
+        }
+        // Ensure new node terminates
+        if let Some(entry) = self.ops.get_mut(user_data) {
+            entry.platform_data.next = None;
+        }
+    }
+
+    fn pop_backlog(&mut self) -> Option<usize> {
+        let head = self.backlog_head?;
+        // get next
+        let next = if let Some(entry) = self.ops.get_mut(head) {
+            entry.platform_data.next
+        } else {
+            None
+        };
+
+        self.backlog_head = next;
+        if next.is_none() {
+            self.backlog_tail = None;
+        }
+
+        if let Some(entry) = self.ops.get_mut(head) {
+            entry.platform_data.next = None;
+        }
+
+        Some(head)
+    }
+
     pub fn register_buffers(&mut self, iovecs: &Vec<libc::iovec>) -> io::Result<()> {
-        // Safety: iovecs are valid as long as the caller (BufferPool) keeps them valid.
-        // In our case, BufferPool keeps 'memory' alive forever (static/thread_local).
         unsafe { self.ring.submitter().register_buffers(iovecs) }
     }
 
-    /// Called when the Future is dropped.
     fn cancel_op_internal(&mut self, user_data: usize) {
         if let Some(op) = self.ops.get_mut(user_data) {
-            // We cannot remove it yet, because the kernel still has the pointer!
-            // We just mark it cancelled. When CQE arrives, we'll drop resources.
             op.cancelled = true;
             op.waker = None;
 
-            // Submit a cancel SQE to kernel to speed up cancellation.
-            // This tells the kernel to try to cancel the operation identified by user_data.
-            // Note: Cancellation is best-effort; the operation might complete before
-            // the cancel request is processed. Either way, we'll get a CQE for the
-            // original operation (possibly with -ECANCELED) and can clean up then.
             let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
                 .build()
                 .user_data(CANCEL_USER_DATA);
-            self.push_entry(cancel_sqe);
+
+            if !self.push_entry(cancel_sqe) {
+                // Store for later retry
+                self.pending_cancellations.push_back(user_data);
+            }
         }
+        // Remove from backlog if present? O(N).
+        // We let flush_backlog handle it (it checks cancelled).
     }
 }
 
@@ -277,45 +440,48 @@ impl Driver for UringDriver {
     type Op = UringOp;
 
     fn reserve_op(&mut self) -> usize {
-        self.ops.insert(OpEntry::new(None, ()))
+        self.ops.insert(OpEntry::new(None, UringOpState::new()))
     }
 
-    fn submit(&mut self, user_data: usize, op: Self::Op) {
-        // 1. Store resources (Move to Stable Memory first)
+    fn submit(
+        &mut self,
+        user_data: usize,
+        op: Self::Op,
+    ) -> Result<Poll<()>, (io::Error, Self::Op)> {
+        // 1. Store resources
         if let Some(entry) = self.ops.get_mut(user_data) {
             entry.resources = Some(op);
         }
 
-        // 2. Generate SQE using the Op in its final memory location
-        // This ensures that any pointers to 'self' passed to the kernel (e.g. msghdr, iovec)
-        // refer to the stable address in the slab, not a temporary stack address.
+        // 2. Generate SQE
         let sqe = {
             let entry = self.ops.get_mut(user_data).expect("invalid user_data");
             let op = entry.resources.as_mut().expect("resources missing");
             unsafe { (op.vtable.make_sqe)(op).user_data(user_data as u64) }
         };
 
-        // 3. Push to ring
-        self.push_entry(sqe);
+        // 3. Push
+        if self.push_entry(sqe) {
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                entry.platform_data.submitted = true;
+            }
+            Ok(Poll::Ready(()))
+        } else {
+            // SQ Full. Add to backlog.
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                entry.platform_data.submitted = false;
+            }
+            self.push_backlog(user_data);
+            Ok(Poll::Pending)
+        }
     }
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
-        // Verify it is a Close op by checking the vtable function pointer
         if op.vtable.make_sqe as usize == submit::make_sqe_close as usize {
             let sqe = unsafe { (op.vtable.make_sqe)(&mut op).user_data(BACKGROUND_USER_DATA) };
 
-            // Try to push
-            // Optimization: direct access to ring submission to handle full queue
-            let mut sq = self.ring.submission();
-            if unsafe { sq.push(&sqe) }.is_err() {
-                // Queue is full. Try to submit existing to clear space.
-                drop(sq); // mutable borrow end
-                self.ring.submit()?;
-
-                let mut sq = self.ring.submission();
-                if unsafe { sq.push(&sqe) }.is_err() {
-                    return Err(io::Error::new(io::ErrorKind::Other, "sq full"));
-                }
+            if !self.push_entry(sqe) {
+                return Err(io::Error::new(io::ErrorKind::Other, "sq full"));
             }
             Ok(())
         } else {
@@ -331,10 +497,30 @@ impl Driver for UringDriver {
         user_data: usize,
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<usize>, Self::Op)> {
+        // First check if stored in backlog (not submitted)
+        if let Some(entry) = self.ops.get_mut(user_data) {
+            if !entry.platform_data.submitted {
+                // Not in ring yet. Try to flush backlog.
+                self.flush_backlog();
+                self.flush_cancellations();
+
+                // Check again
+                let entry = self.ops.get_mut(user_data).unwrap();
+                if !entry.platform_data.submitted {
+                    // Still not in ring. Register waker.
+                    entry.waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // Delegate to ops registry for result check
         self.ops.poll_op(user_data, cx)
     }
 
     fn submit_queue(&mut self) -> io::Result<()> {
+        self.flush_cancellations();
+        self.flush_backlog();
         self.submit_to_kernel()
     }
 
@@ -344,6 +530,8 @@ impl Driver for UringDriver {
 
     fn process_completions(&mut self) {
         self.process_completions_internal();
+        self.flush_cancellations();
+        self.flush_backlog();
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -358,11 +546,6 @@ impl Driver for UringDriver {
         &mut self,
         files: &[crate::io::op::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
-        // Note: this replaces the entire file table in io_uring currently.
-        // A more advanced implementation would use IORING_REGISTER_FILES_UPDATE
-        // to incrementally add files, or manage a sparse table.
-        // For now, we assume this is called once or manages the full set.
-        // Convert usize to i32 for io_uring
         let fds: Vec<i32> = files.iter().map(|&f| f as i32).collect();
         self.ring.submitter().register_files(&fds)?;
 
@@ -374,9 +557,6 @@ impl Driver for UringDriver {
     }
 
     fn unregister_files(&mut self, _files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
-        // specific file unregistration not strictly supported by raw unregister_files (which kills all)
-        // unless we use update with -1.
-        // For now, unregister all.
         self.ring.submitter().unregister_files()
     }
 

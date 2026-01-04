@@ -52,7 +52,7 @@ fn test_iocp_accept() {
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op);
 
     let user_data = driver.reserve_op();
-    driver.submit(user_data, iocp_op);
+    let _ = driver.submit(user_data, iocp_op);
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -119,7 +119,7 @@ fn test_iocp_connect() {
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op);
     let user_data = driver.reserve_op();
-    driver.submit(user_data, iocp_op);
+    let _ = driver.submit(user_data, iocp_op);
 
     // Poll
     let waker = noop_waker();
@@ -152,7 +152,7 @@ fn test_iocp_timeout() {
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(timeout_op);
     let user_data = driver.reserve_op();
-    driver.submit(user_data, iocp_op);
+    let _ = driver.submit(user_data, iocp_op);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -215,7 +215,7 @@ fn test_iocp_recv_with_buffer_pool() {
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op);
     let user_data = driver.reserve_op();
-    driver.submit(user_data, iocp_op);
+    let _ = driver.submit(user_data, iocp_op);
 
     // Poll
     let waker = noop_waker();

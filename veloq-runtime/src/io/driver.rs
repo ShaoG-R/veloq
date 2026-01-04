@@ -16,7 +16,10 @@ pub trait Driver {
     fn reserve_op(&mut self) -> usize;
 
     /// Submit an operation with its resources directly.
-    fn submit(&mut self, user_data: usize, op: Self::Op);
+    /// Returns `Ok(Poll::...)` on success (Ready or Pending/Queued).
+    /// Returns `Err((Error, Op))` if submission failed and the Op was NOT consumed/stored.
+    fn submit(&mut self, user_data: usize, op: Self::Op)
+    -> Result<Poll<()>, (io::Error, Self::Op)>;
 
     /// Poll operation status.
     fn poll_op(

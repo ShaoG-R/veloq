@@ -172,24 +172,25 @@ impl IocpDriver {
             let mut result_is_ready = false;
 
             if op.result.is_none()
-                && let Some(iocp_op) = op.resources.as_mut() {
-                    // Check for blocking result first
-                    if let Some(entry) = iocp_op.header.blocking_result.take() {
-                        op.result = Some(entry);
-                        result_is_ready = true;
-                    } else {
-                        // Normal IO completion
-                        let mut result = Ok(bytes_transferred as usize);
-                        // Use VTable on_complete if available
-                        if let Some(on_comp) = iocp_op.vtable.on_complete {
-                            result = unsafe {
-                                (on_comp)(iocp_op, bytes_transferred as usize, &self.extensions)
-                            };
-                        }
-                        op.result = Some(result);
-                        result_is_ready = true;
+                && let Some(iocp_op) = op.resources.as_mut()
+            {
+                // Check for blocking result first
+                if let Some(entry) = iocp_op.header.blocking_result.take() {
+                    op.result = Some(entry);
+                    result_is_ready = true;
+                } else {
+                    // Normal IO completion
+                    let mut result = Ok(bytes_transferred as usize);
+                    // Use VTable on_complete if available
+                    if let Some(on_comp) = iocp_op.vtable.on_complete {
+                        result = unsafe {
+                            (on_comp)(iocp_op, bytes_transferred as usize, &self.extensions)
+                        };
                     }
+                    op.result = Some(result);
+                    result_is_ready = true;
                 }
+            }
 
             if result_is_ready {
                 // Clean up resources
@@ -211,7 +212,11 @@ impl Driver for IocpDriver {
         self.ops.insert(OpEntry::new(None, PlatformData::None))
     }
 
-    fn submit(&mut self, user_data: usize, op: Self::Op) {
+    fn submit(
+        &mut self,
+        user_data: usize,
+        op: Self::Op,
+    ) -> Result<Poll<()>, (io::Error, Self::Op)> {
         if let Some(op_entry) = self.ops.get_mut(user_data) {
             // Important: we must pin the op in resources first, then get pointers
             op_entry.resources = Some(op);
@@ -237,9 +242,7 @@ impl Driver for IocpDriver {
                 }
                 Ok(SubmissionResult::Offload(task)) => {
                     if self.pool.execute(task).is_err() {
-                        op_entry.result = Some(Err(io::Error::other(
-                            "Thread pool overloaded",
-                        )));
+                        op_entry.result = Some(Err(io::Error::other("Thread pool overloaded")));
                         if let Some(waker) = op_entry.waker.take() {
                             waker.wake();
                         }
@@ -257,6 +260,7 @@ impl Driver for IocpDriver {
                 }
             }
         }
+        Ok(Poll::Ready(()))
     }
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
@@ -279,9 +283,7 @@ impl Driver for IocpDriver {
                     if self.pool.execute(task).is_err() {
                         // Failed to submit background task
                         self.ops.remove(user_data);
-                        return Err(io::Error::other(
-                            "Thread pool overloaded",
-                        ));
+                        return Err(io::Error::other("Thread pool overloaded"));
                     }
                 }
                 Ok(_) => {
@@ -335,14 +337,15 @@ impl Driver for IocpDriver {
                     // Try to CancelIoEx if resources exist
                     if let Some(res) = &mut op.resources
                         && let Some(fd) = res.get_fd()
-                            && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
-                                // Direct access to header
-                                let entry = &mut res.header;
-                                unsafe {
-                                    use windows_sys::Win32::System::IO::CancelIoEx;
-                                    let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
-                                }
-                            }
+                        && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
+                    {
+                        // Direct access to header
+                        let entry = &mut res.header;
+                        unsafe {
+                            use windows_sys::Win32::System::IO::CancelIoEx;
+                            let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
+                        }
+                    }
                 }
             }
         }
@@ -386,11 +389,10 @@ impl Driver for IocpDriver {
         for fd in files {
             if let crate::io::op::IoFd::Fixed(idx) = fd {
                 let idx = idx as usize;
-                if idx < self.registered_files.len()
-                    && self.registered_files[idx].is_some() {
-                        self.registered_files[idx] = None;
-                        self.free_slots.push(idx);
-                    }
+                if idx < self.registered_files.len() && self.registered_files[idx].is_some() {
+                    self.registered_files[idx] = None;
+                    self.free_slots.push(idx);
+                }
             }
         }
         Ok(())
@@ -434,15 +436,16 @@ impl Drop for IocpDriver {
             if op.resources.is_some() && op.result.is_none() {
                 if !op.cancelled
                     && let Some(res) = op.resources.as_mut()
-                        && let Some(fd) = res.get_fd()
-                            && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
-                                // Direct access to header
-                                let entry = &mut res.header;
-                                unsafe {
-                                    use windows_sys::Win32::System::IO::CancelIoEx;
-                                    let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
-                                }
-                            }
+                    && let Some(fd) = res.get_fd()
+                    && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
+                {
+                    // Direct access to header
+                    let entry = &mut res.header;
+                    unsafe {
+                        use windows_sys::Win32::System::IO::CancelIoEx;
+                        let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
+                    }
+                }
                 pending_count += 1;
             }
         }

@@ -134,7 +134,17 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
                 let driver_op = data.into_platform_op();
                 let user_data = driver.reserve_op();
                 op.user_data = user_data;
-                driver.submit(user_data, driver_op);
+
+                // Submit to driver.
+                // Whether Ready or Pending, the op is now owned by the driver.
+                // If Pending, it effectively means "Accepted but queued".
+                // If Err((e, op)), driver rejected it and returned ownership.
+                if let Err((e, val)) = driver.submit(user_data, driver_op) {
+                    // Driver rejected submission and returned the op.
+                    // Recover data and return error immediately.
+                    let data = T::from_platform_op(val);
+                    return Poll::Ready((Err(e), data));
+                }
 
                 op.state = State::Submitted;
 
@@ -170,9 +180,10 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for Op<T> {
     fn drop(&mut self) {
         if let State::Submitted = self.state
-            && let Some(driver_rc) = self.driver.upgrade() {
-                driver_rc.borrow_mut().cancel_op(self.user_data);
-            }
+            && let Some(driver_rc) = self.driver.upgrade()
+        {
+            driver_rc.borrow_mut().cancel_op(self.user_data);
+        }
     }
 }
 
