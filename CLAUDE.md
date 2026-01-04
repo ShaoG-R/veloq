@@ -46,6 +46,18 @@
     - `Runtime`: 主运行时接口（通常包装了执行器）。
   - **Driver (`src/io/driver.rs`)**:
     - 平台特定 I/O 的抽象层（Linux 上使用 io_uring，Windows 上使用 IOCP）。
+    - **Windows IOCP (`src/io/driver/iocp/`)**:
+      - `IocpDriver` (`iocp.rs`): 核心驱动，管理完成端口 (IOCP)、时间轮和线程池。
+      - `submit.rs`: 处理 I/O 操作的提交，支持原生 IOCP 操作（如 `ReadFile`, `WSASendTo`）和阻塞任务的分流。
+      - `blocking.rs`: 线程池实现，用于处理阻塞文件操作（`Open`, `Close`, `Fsync` 等），通过 `PostQueuedCompletionStatus` 通知完成。
+      - `op.rs`: 定义 `IocpOp` 和 VTable，使用 `OVERLAPPED` 结构与内核交互。
+      - `ext.rs`: 加载 Winsock 扩展函数指针（如 `ConnectEx`, `AcceptEx`）。
+    - **Linux io_uring (`src/io/driver/uring/`)**:
+      - `UringDriver` (`uring.rs`): 核心驱动，管理 `io_uring` 实例 (`IoUring`) 和操作注册表。
+      - `submit.rs`: 实现了各操作的提交逻辑 (`make_sqe_*`) 和完成回调 (`on_complete_*`)。使用宏 (`impl_lifecycle!`) 简化了代码。
+      - `op.rs`: 定义 `UringOp` 和 VTable (`OpVTable`)。使用 `union UringOpPayload` 存储不同操作的负载，并通过 `ManuallyDrop` 管理生命周期，实现了类型擦除和动态分发。
+    - **StableSlab (`src/io/driver/stable_slab.rs`)**: 提供地址稳定的内存分配，用于存储 I/O 操作对象，确保异步回调安全。
+    - **OpRegistry (`src/io/driver/op_registry.rs`)**: 管理飞行中的 I/O 操作。
     - 关键操作: `submit_op`, `poll_op`, `process_completions`.
   - **Buffers (`src/io/buffer.rs`)**:
     - `BufPool`: 内存池 Trait。
