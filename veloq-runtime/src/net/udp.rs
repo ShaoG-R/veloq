@@ -1,6 +1,6 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
-use crate::io::op::{Connect, IoFd, Op, RawHandle, Recv, RecvFrom, Send, SendTo};
+use crate::io::op::{Connect, IoFd, Op, RawHandle, ReadFixed, RecvFrom, SendTo, WriteFixed};
 use crate::io::socket::Socket;
 use std::cell::RefCell;
 use std::io;
@@ -102,9 +102,10 @@ impl UdpSocket {
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = Send {
+        let op = WriteFixed {
             fd: IoFd::Raw(self.fd),
             buf,
+            offset: 0,
         };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;
@@ -112,9 +113,10 @@ impl UdpSocket {
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = Recv {
+        let op = ReadFixed {
             fd: IoFd::Raw(self.fd),
             buf,
+            offset: 0,
         };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;

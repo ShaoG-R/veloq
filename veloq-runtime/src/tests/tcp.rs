@@ -204,7 +204,6 @@ fn test_tcp_large_data_transfer() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::<HybridPool>::default();
         let driver = exec.driver_handle();
-        let pool = Rc::new(HybridPool::new());
 
         let listener =
             TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
@@ -215,11 +214,14 @@ fn test_tcp_large_data_transfer() {
 
         let listener_rc = Rc::new(listener);
         let listener_clone = listener_rc.clone();
-        let pool_clone = pool.clone();
 
         exec.block_on(|cx| {
             let cx = cx.clone();
             async move {
+                // Get the registered buffer pool from the context
+                let pool = cx.buffer_pool().upgrade().expect("Buffer pool gone");
+                let pool_clone = pool.clone();
+
                 // Server task
                 let server_h = cx.spawn_local(async move {
                     let (stream, _) = listener_clone.accept().await.expect("Accept failed");

@@ -1,6 +1,6 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
-use crate::io::op::{Accept, Connect, IoFd, Op, OpLifecycle, RawHandle, Recv, Send};
+use crate::io::op::{Accept, Connect, IoFd, Op, OpLifecycle, RawHandle, ReadFixed, WriteFixed};
 use crate::io::socket::Socket;
 use std::cell::RefCell;
 use std::io;
@@ -122,9 +122,10 @@ impl TcpStream {
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = Recv {
+        let op = ReadFixed {
             fd: IoFd::Raw(self.fd),
             buf,
+            offset: 0,
         };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;
@@ -132,9 +133,10 @@ impl TcpStream {
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = Send {
+        let op = WriteFixed {
             fd: IoFd::Raw(self.fd),
             buf,
+            offset: 0,
         };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;
