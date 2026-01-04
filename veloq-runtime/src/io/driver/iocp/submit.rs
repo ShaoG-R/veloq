@@ -3,6 +3,7 @@
 //! This module implements the logic for submitting operations, handling completions,
 //! and accessing FDs, exposed as static functions for VTable construction.
 
+use crate::io::buffer::FixedBuf;
 use crate::io::driver::iocp::blocking::{BlockingTask, CompletionInfo};
 use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::op::IocpOp;
@@ -37,17 +38,6 @@ macro_rules! impl_lifecycle {
         }
     };
     ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, nested_fd) => {
-        pub(crate) unsafe fn $drop_fn(op: &mut IocpOp) {
-            unsafe {
-                ManuallyDrop::drop(&mut op.payload.$variant);
-            }
-        }
-
-        pub(crate) unsafe fn $get_fd_fn(op: &IocpOp) -> Option<IoFd> {
-            unsafe { Some(op.payload.$variant.op.fd) }
-        }
-    };
-    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, boxed_nested_fd) => {
         pub(crate) unsafe fn $drop_fn(op: &mut IocpOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
@@ -99,34 +89,6 @@ macro_rules! impl_blocking_offload {
             Ok(SubmissionResult::Offload(task))
         }
     };
-    ($fn_name:ident, $variant:ident, $task_variant:ident, $payload_name:ident, { $($field:ident : $val:expr),* }) => {
-        pub(crate) unsafe fn $fn_name(
-            op: &mut IocpOp,
-            port: HANDLE,
-            overlapped: *mut OVERLAPPED,
-            _ext: &Extensions,
-            registered_files: &[Option<HANDLE>],
-        ) -> io::Result<SubmissionResult> {
-            let $payload_name = unsafe { &*op.payload.$variant };
-            let handle = resolve_fd($payload_name.fd, registered_files)?;
-
-            let entry = &op.header;
-            let user_data = entry.user_data;
-
-            let completion = CompletionInfo {
-                port: port as usize,
-                user_data,
-                overlapped: overlapped as usize,
-            };
-
-            let task = BlockingTask::$task_variant {
-                handle: handle as usize,
-                completion,
-                $($field: $val),*
-            };
-            Ok(SubmissionResult::Offload(task))
-        }
-    };
 }
 
 // ============================================================================
@@ -161,175 +123,131 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
 }
 
 // ============================================================================
-// ReadFixed
+// Read/Write/Recv/Send
 // ============================================================================
 
-pub(crate) unsafe fn submit_read_fixed(
-    op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
-) -> io::Result<SubmissionResult> {
-    let read_op = unsafe { &mut *op.payload.read };
-    let entry = &mut op.header;
+macro_rules! submit_io_op {
+    ($fn_name:ident, $field:ident, $win_api:ident, offset, $ptr_fn:expr) => {
+        pub(crate) unsafe fn $fn_name(
+            op: &mut IocpOp,
+            port: HANDLE,
+            overlapped: *mut OVERLAPPED,
+            _ext: &Extensions,
+            registered_files: &[Option<HANDLE>],
+        ) -> io::Result<SubmissionResult> {
+            let val = unsafe { &mut *op.payload.$field };
+            let entry = &mut op.header;
 
-    entry.inner.Anonymous.Anonymous.Offset = read_op.offset as u32;
-    entry.inner.Anonymous.Anonymous.OffsetHigh = (read_op.offset >> 32) as u32;
+            entry.inner.Anonymous.Anonymous.Offset = val.offset as u32;
+            entry.inner.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
 
-    let handle = resolve_fd(read_op.fd, registered_files)?;
-    unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
-    }
+            let handle = resolve_fd(val.fd, registered_files)?;
+            unsafe {
+                CreateIoCompletionPort(handle, port, 0, 0);
+            }
 
-    let mut bytes = 0;
-    let ret = unsafe {
-        ReadFile(
-            handle,
-            read_op.buf.as_mut_ptr() as *mut _,
-            read_op.buf.capacity() as u32,
-            &mut bytes,
-            overlapped,
-        )
-    };
+            let mut bytes = 0;
+            // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
+            let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
+            let ptr = get_ptr(&mut val.buf);
 
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
+            let ret = unsafe {
+                $win_api(
+                    handle,
+                    ptr as _,
+                    val.buf.len() as u32, // using len() which is common for buf/slice
+                    &mut bytes,
+                    overlapped,
+                )
+            };
+
+            if ret == 0 {
+                let err = unsafe { GetLastError() };
+                if err != ERROR_IO_PENDING {
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
+            }
+            Ok(SubmissionResult::Pending)
         }
-    }
-    Ok(SubmissionResult::Pending)
+    };
+    ($fn_name:ident, $field:ident, $win_api:ident, no_offset, $ptr_fn:expr) => {
+        pub(crate) unsafe fn $fn_name(
+            op: &mut IocpOp,
+            port: HANDLE,
+            overlapped: *mut OVERLAPPED,
+            _ext: &Extensions,
+            registered_files: &[Option<HANDLE>],
+        ) -> io::Result<SubmissionResult> {
+            let val = unsafe { &mut *op.payload.$field };
+            op.header.inner.Anonymous.Anonymous.Offset = 0;
+            op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
+
+            let handle = resolve_fd(val.fd, registered_files)?;
+            unsafe {
+                CreateIoCompletionPort(handle, port, 0, 0);
+            }
+
+            let mut bytes = 0;
+            let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
+            let ptr = get_ptr(&mut val.buf);
+
+            let ret = unsafe {
+                $win_api(
+                    handle,
+                    ptr as _,
+                    val.buf.len() as u32,
+                    &mut bytes,
+                    overlapped,
+                )
+            };
+
+            if ret == 0 {
+                let err = unsafe { GetLastError() };
+                if err != ERROR_IO_PENDING {
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
+            }
+            Ok(SubmissionResult::Pending)
+        }
+    };
 }
 
+submit_io_op!(
+    submit_read_fixed,
+    read,
+    ReadFile,
+    offset,
+    |b: &mut FixedBuf| b.as_mut_ptr()
+);
 impl_lifecycle!(drop_read_fixed, get_fd_read_fixed, read, direct_fd);
 
-// ============================================================================
-// WriteFixed
-// ============================================================================
-
-pub(crate) unsafe fn submit_write_fixed(
-    op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
-) -> io::Result<SubmissionResult> {
-    let write_op = unsafe { &mut *op.payload.write };
-    let entry = &mut op.header;
-
-    entry.inner.Anonymous.Anonymous.Offset = write_op.offset as u32;
-    entry.inner.Anonymous.Anonymous.OffsetHigh = (write_op.offset >> 32) as u32;
-
-    let handle = resolve_fd(write_op.fd, registered_files)?;
-    unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
-    }
-
-    let mut bytes = 0;
-    let ret = unsafe {
-        WriteFile(
-            handle,
-            write_op.buf.as_slice().as_ptr() as *const _,
-            write_op.buf.len() as u32,
-            &mut bytes,
-            overlapped,
-        )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
-}
-
+submit_io_op!(
+    submit_write_fixed,
+    write,
+    WriteFile,
+    offset,
+    |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
+);
 impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
 
-// ============================================================================
-// Recv
-// ============================================================================
-
-pub(crate) unsafe fn submit_recv(
-    op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
-) -> io::Result<SubmissionResult> {
-    let recv_op = unsafe { &mut *op.payload.recv };
-    op.header.inner.Anonymous.Anonymous.Offset = 0;
-    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
-
-    let handle = resolve_fd(recv_op.fd, registered_files)?;
-    unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
-    }
-
-    let mut bytes = 0;
-    let ret = unsafe {
-        ReadFile(
-            handle,
-            recv_op.buf.as_mut_ptr() as *mut _,
-            recv_op.buf.capacity() as u32,
-            &mut bytes,
-            overlapped,
-        )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
-}
-
+// Note: Recv/Send for IOCP usually use ReadFile/WriteFile for streams?
+// The original code used ReadFile for Recv and WriteFile for Send.
+submit_io_op!(
+    submit_recv,
+    recv,
+    ReadFile,
+    no_offset,
+    |b: &mut FixedBuf| b.as_mut_ptr()
+);
 impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 
-// ============================================================================
-// Send (OpSend)
-// ============================================================================
-
-pub(crate) unsafe fn submit_send(
-    op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
-) -> io::Result<SubmissionResult> {
-    let send_op = unsafe { &mut *op.payload.send };
-    op.header.inner.Anonymous.Anonymous.Offset = 0;
-    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
-
-    let handle = resolve_fd(send_op.fd, registered_files)?;
-    unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
-    }
-
-    let mut bytes = 0;
-    let ret = unsafe {
-        WriteFile(
-            handle,
-            send_op.buf.as_slice().as_ptr() as *const _,
-            send_op.buf.len() as u32,
-            &mut bytes,
-            overlapped,
-        )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
-}
-
+submit_io_op!(
+    submit_send,
+    send,
+    WriteFile,
+    no_offset,
+    |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
+);
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
 // ============================================================================
@@ -343,7 +261,7 @@ pub(crate) unsafe fn submit_connect(
     ext: &Extensions,
     registered_files: &[Option<HANDLE>],
 ) -> io::Result<SubmissionResult> {
-    let connect_op = unsafe { &mut **op.payload.connect };
+    let connect_op = unsafe { &mut *op.payload.connect };
     let handle = resolve_fd(connect_op.fd, registered_files)?;
     unsafe {
         CreateIoCompletionPort(handle, port, 0, 0);
@@ -426,7 +344,7 @@ pub(crate) unsafe fn on_complete_connect(
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
-    let connect_op = unsafe { &**op.payload.connect };
+    let connect_op = unsafe { &*op.payload.connect };
     if let Some(fd) = connect_op.fd.raw() {
         let ret = unsafe {
             setsockopt(
@@ -568,7 +486,7 @@ pub(crate) unsafe fn submit_send_to(
     _ext: &Extensions,
     registered_files: &[Option<HANDLE>],
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut **op.payload.send_to };
+    let payload = unsafe { &mut *op.payload.send_to };
     let handle = resolve_fd(payload.op.fd, registered_files)?;
     unsafe {
         CreateIoCompletionPort(handle, port, 0, 0);
@@ -601,7 +519,7 @@ pub(crate) unsafe fn submit_send_to(
     Ok(SubmissionResult::Pending)
 }
 
-impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, boxed_nested_fd);
+impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 
 // ============================================================================
 // RecvFrom
@@ -614,7 +532,7 @@ pub(crate) unsafe fn submit_recv_from(
     _ext: &Extensions,
     registered_files: &[Option<HANDLE>],
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut **op.payload.recv_from };
+    let payload = unsafe { &mut *op.payload.recv_from };
     let handle = resolve_fd(payload.op.fd, registered_files)?;
     unsafe {
         CreateIoCompletionPort(handle, port, 0, 0);
@@ -647,7 +565,7 @@ pub(crate) unsafe fn submit_recv_from(
     Ok(SubmissionResult::Pending)
 }
 
-impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, boxed_nested_fd);
+impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
 
 // ============================================================================
 // Open
@@ -708,11 +626,34 @@ impl_lifecycle!(drop_sync_range, get_fd_sync_range, sync_range, direct_fd);
 // Fallocate
 // ============================================================================
 
-impl_blocking_offload!(submit_fallocate, fallocate, Fallocate, payload, {
-    mode: payload.mode,
-    offset: payload.offset,
-    len: payload.len
-});
+pub(crate) unsafe fn submit_fallocate(
+    op: &mut IocpOp,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let payload = unsafe { &*op.payload.fallocate };
+    let handle = resolve_fd(payload.fd, registered_files)?;
+
+    let entry = &op.header;
+    let user_data = entry.user_data;
+
+    let completion = CompletionInfo {
+        port: port as usize,
+        user_data,
+        overlapped: overlapped as usize,
+    };
+
+    let task = BlockingTask::Fallocate {
+        handle: handle as usize,
+        completion,
+        mode: payload.mode,
+        offset: payload.offset,
+        len: payload.len,
+    };
+    Ok(SubmissionResult::Offload(task))
+}
 impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
 
 // ============================================================================

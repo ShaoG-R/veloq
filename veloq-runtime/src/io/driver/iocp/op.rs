@@ -110,10 +110,10 @@ pub union IocpOpPayload {
     pub write: ManuallyDrop<WriteFixed>,
     pub recv: ManuallyDrop<Recv>,
     pub send: ManuallyDrop<OpSend>,
-    pub connect: ManuallyDrop<Box<Connect>>,
-    pub accept: ManuallyDrop<Box<AcceptPayload>>,
-    pub send_to: ManuallyDrop<Box<SendToPayload>>,
-    pub recv_from: ManuallyDrop<Box<RecvFromPayload>>,
+    pub connect: ManuallyDrop<Connect>,
+    pub accept: ManuallyDrop<AcceptPayload>,
+    pub send_to: ManuallyDrop<SendToPayload>,
+    pub recv_from: ManuallyDrop<RecvFromPayload>,
     pub open: ManuallyDrop<OpenPayload>,
     pub close: ManuallyDrop<Close>,
     pub fsync: ManuallyDrop<Fsync>,
@@ -184,6 +184,33 @@ macro_rules! impl_into_iocp_op {
             }
         }
     };
+    ($Type:ident, $Field:ident, $Submit:ident, $Complete:expr, $Drop:ident, $GetFd:ident, $Payload:ident, $Constructor:expr) => {
+        impl IntoPlatformOp<IocpDriver> for $Type {
+            fn into_platform_op(self) -> IocpOp {
+                const TABLE: OpVTable = OpVTable {
+                    submit: submit::$Submit,
+                    on_complete: $Complete,
+                    drop: submit::$Drop,
+                    get_fd: submit::$GetFd,
+                };
+
+                let construct: fn($Type) -> $Payload = $Constructor;
+                let payload = construct(self);
+
+                IocpOp {
+                    header: OverlappedEntry::new(0),
+                    vtable: &TABLE,
+                    payload: IocpOpPayload {
+                        $Field: ManuallyDrop::new(payload),
+                    },
+                }
+            }
+            fn from_platform_op(op: IocpOp) -> Self {
+                let op = ManuallyDrop::new(op);
+                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)).op }
+            }
+        }
+    };
 }
 
 impl_into_iocp_op!(
@@ -232,91 +259,76 @@ impl_into_iocp_op!(
     drop_timeout,
     get_fd_timeout
 );
+impl_into_iocp_op!(
+    Connect,
+    connect,
+    submit_connect,
+    Some(submit::on_complete_connect),
+    drop_connect,
+    get_fd_connect
+);
 
-impl IntoPlatformOp<IocpDriver> for Accept {
-    fn into_platform_op(self) -> IocpOp {
-        const TABLE: OpVTable = OpVTable {
-            submit: submit::submit_accept,
-            on_complete: Some(submit::on_complete_accept),
-            drop: submit::drop_accept,
-            get_fd: submit::get_fd_accept,
-        };
-
-        let payload = Box::new(AcceptPayload {
-            op: self,
-            accept_buffer: [0; 288],
-        });
-        IocpOp {
-            header: OverlappedEntry::new(0),
-            vtable: &TABLE,
-            payload: IocpOpPayload {
-                accept: ManuallyDrop::new(payload),
-            },
-        }
+impl_into_iocp_op!(
+    Accept,
+    accept,
+    submit_accept,
+    Some(submit::on_complete_accept),
+    drop_accept,
+    get_fd_accept,
+    AcceptPayload,
+    |op| AcceptPayload {
+        op,
+        accept_buffer: [0; 288],
     }
-    fn from_platform_op(op: IocpOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.accept)).op }
-    }
-}
+);
 
-impl IntoPlatformOp<IocpDriver> for SendTo {
-    fn into_platform_op(self) -> IocpOp {
-        const TABLE: OpVTable = OpVTable {
-            submit: submit::submit_send_to,
-            on_complete: None,
-            drop: submit::drop_send_to,
-            get_fd: submit::get_fd_send_to,
-        };
-
-        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(self.addr);
+impl_into_iocp_op!(
+    SendTo,
+    send_to,
+    submit_send_to,
+    None,
+    drop_send_to,
+    get_fd_send_to,
+    SendToPayload,
+    |op| {
+        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(op.addr);
         let wsabuf = WSABUF {
-            len: self.buf.len() as u32,
-            buf: self.buf.as_slice().as_ptr() as *mut u8,
+            len: op.buf.len() as u32,
+            buf: op.buf.as_slice().as_ptr() as *mut u8,
         };
-        let payload = SendToPayload {
-            op: self,
+        SendToPayload {
+            op,
             wsabuf,
-            addr: addr,
+            addr,
             addr_len: addr_len as i32,
-        };
-        IocpOp {
-            header: OverlappedEntry::new(0),
-            vtable: &TABLE,
-            payload: IocpOpPayload {
-                send_to: ManuallyDrop::new(Box::new(payload)),
-            },
         }
     }
-    fn from_platform_op(op: IocpOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.send_to)).op }
-    }
-}
+);
 
-impl IntoPlatformOp<IocpDriver> for Connect {
-    fn into_platform_op(self) -> IocpOp {
-        const TABLE: OpVTable = OpVTable {
-            submit: submit::submit_connect,
-            on_complete: Some(submit::on_complete_connect),
-            drop: submit::drop_connect,
-            get_fd: submit::get_fd_connect,
-        };
+impl_into_iocp_op!(
+    Open,
+    open,
+    submit_open,
+    None,
+    drop_open,
+    get_fd_open,
+    OpenPayload,
+    |op| OpenPayload { op }
+);
 
-        IocpOp {
-            header: OverlappedEntry::new(0),
-            vtable: &TABLE,
-            payload: IocpOpPayload {
-                connect: ManuallyDrop::new(Box::new(self)),
-            },
-        }
-    }
-    fn from_platform_op(op: IocpOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { *ManuallyDrop::into_inner(std::ptr::read(&op.payload.connect)) }
-    }
-}
+impl_into_iocp_op!(
+    Wakeup,
+    wakeup,
+    submit_wakeup,
+    None,
+    drop_wakeup,
+    get_fd_wakeup,
+    WakeupPayload,
+    |op| WakeupPayload { op }
+);
 
+// RecvFrom requires complex reconstruction so we keep it logic here,
+// OR we implement it manually. Kept manual to match logic.
 impl IntoPlatformOp<IocpDriver> for RecvFrom {
     fn into_platform_op(mut self) -> IocpOp {
         const TABLE: OpVTable = OpVTable {
@@ -341,7 +353,7 @@ impl IntoPlatformOp<IocpDriver> for RecvFrom {
             header: OverlappedEntry::new(0),
             vtable: &TABLE,
             payload: IocpOpPayload {
-                recv_from: ManuallyDrop::new(Box::new(payload)),
+                recv_from: ManuallyDrop::new(payload),
             },
         }
     }
@@ -356,53 +368,5 @@ impl IntoPlatformOp<IocpDriver> for RecvFrom {
         };
         val.addr = addr;
         val
-    }
-}
-
-impl IntoPlatformOp<IocpDriver> for Open {
-    fn into_platform_op(self) -> IocpOp {
-        const TABLE: OpVTable = OpVTable {
-            submit: submit::submit_open,
-            on_complete: None,
-            drop: submit::drop_open,
-            get_fd: submit::get_fd_open,
-        };
-
-        let payload = OpenPayload { op: self };
-        IocpOp {
-            header: OverlappedEntry::new(0),
-            vtable: &TABLE,
-            payload: IocpOpPayload {
-                open: ManuallyDrop::new(payload),
-            },
-        }
-    }
-    fn from_platform_op(op: IocpOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.open)).op }
-    }
-}
-
-impl IntoPlatformOp<IocpDriver> for Wakeup {
-    fn into_platform_op(self) -> IocpOp {
-        const TABLE: OpVTable = OpVTable {
-            submit: submit::submit_wakeup,
-            on_complete: None,
-            drop: submit::drop_wakeup,
-            get_fd: submit::get_fd_wakeup,
-        };
-
-        let payload = WakeupPayload { op: self };
-        IocpOp {
-            header: OverlappedEntry::new(0),
-            vtable: &TABLE,
-            payload: IocpOpPayload {
-                wakeup: ManuallyDrop::new(payload),
-            },
-        }
-    }
-    fn from_platform_op(op: IocpOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.wakeup)).op }
     }
 }

@@ -66,10 +66,10 @@ pub union UringOpPayload {
     pub write: ManuallyDrop<WriteFixed>,
     pub recv: ManuallyDrop<Recv>,
     pub send: ManuallyDrop<OpSend>,
-    pub connect: ManuallyDrop<Box<Connect>>,
-    pub accept: ManuallyDrop<Box<AcceptPayload>>,
-    pub send_to: ManuallyDrop<Box<SendToPayload>>,
-    pub recv_from: ManuallyDrop<Box<RecvFromPayload>>,
+    pub connect: ManuallyDrop<Connect>,
+    pub accept: ManuallyDrop<AcceptPayload>,
+    pub send_to: ManuallyDrop<SendToPayload>,
+    pub recv_from: ManuallyDrop<RecvFromPayload>,
     pub open: ManuallyDrop<OpenPayload>,
     pub close: ManuallyDrop<Close>,
     pub fsync: ManuallyDrop<Fsync>,
@@ -145,6 +145,32 @@ macro_rules! impl_into_uring_op {
             }
         }
     };
+    ($Type:ident, $Field:ident, $MakeSqe:ident, $OnComplete:ident, $Drop:ident, $GetFd:ident, $Payload:ident, $Constructor:expr) => {
+        impl IntoPlatformOp<UringDriver> for $Type {
+            fn into_platform_op(self) -> UringOp {
+                const TABLE: OpVTable = OpVTable {
+                    make_sqe: submit::$MakeSqe,
+                    on_complete: submit::$OnComplete,
+                    drop: submit::$Drop,
+                    get_fd: submit::$GetFd,
+                };
+
+                let construct: fn($Type) -> $Payload = $Constructor;
+                let payload = construct(self);
+
+                UringOp {
+                    vtable: &TABLE,
+                    payload: UringOpPayload {
+                        $Field: ManuallyDrop::new(payload),
+                    },
+                }
+            }
+            fn from_platform_op(op: UringOp) -> Self {
+                let op = ManuallyDrop::new(op);
+                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)).op }
+            }
+        }
+    };
 }
 
 impl_into_uring_op!(
@@ -178,6 +204,14 @@ impl_into_uring_op!(
     on_complete_send,
     drop_send,
     get_fd_send
+);
+impl_into_uring_op!(
+    Connect,
+    connect,
+    make_sqe_connect,
+    on_complete_connect,
+    drop_connect,
+    get_fd_connect
 );
 
 impl_into_uring_op!(
@@ -214,186 +248,83 @@ impl_into_uring_op!(
 );
 
 // Manual implementations for ops with extras
+impl_into_uring_op!(
+    Accept,
+    accept,
+    make_sqe_accept,
+    on_complete_accept,
+    drop_accept,
+    get_fd_accept,
+    AcceptPayload,
+    |op| AcceptPayload { op }
+);
 
-impl IntoPlatformOp<UringDriver> for Accept {
-    fn into_platform_op(self) -> UringOp {
-        const TABLE: OpVTable = OpVTable {
-            make_sqe: submit::make_sqe_accept,
-            on_complete: submit::on_complete_accept,
-            drop: submit::drop_accept,
-            get_fd: submit::get_fd_accept,
-        };
-
-        let payload = AcceptPayload { op: self };
-        UringOp {
-            vtable: &TABLE,
-            payload: UringOpPayload {
-                accept: ManuallyDrop::new(Box::new(payload)),
-            },
-        }
-    }
-    fn from_platform_op(op: UringOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.accept)).op }
-    }
-}
-
-impl IntoPlatformOp<UringDriver> for SendTo {
-    fn into_platform_op(self) -> UringOp {
-        const TABLE: OpVTable = OpVTable {
-            make_sqe: submit::make_sqe_send_to,
-            on_complete: submit::on_complete_send_to,
-            drop: submit::drop_send_to,
-            get_fd: submit::get_fd_send_to,
-        };
-
-        let (msg_name, msg_namelen) = crate::io::socket::socket_addr_to_storage(self.addr);
-        let payload = SendToPayload {
-            op: self,
+impl_into_uring_op!(
+    SendTo,
+    send_to,
+    make_sqe_send_to,
+    on_complete_send_to,
+    drop_send_to,
+    get_fd_send_to,
+    SendToPayload,
+    |op| {
+        let (msg_name, msg_namelen) = crate::io::socket::socket_addr_to_storage(op.addr);
+        SendToPayload {
+            op,
             msg_name,
             msg_namelen: msg_namelen as libc::socklen_t,
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
-        };
-
-        UringOp {
-            vtable: &TABLE,
-            payload: UringOpPayload {
-                send_to: ManuallyDrop::new(Box::new(payload)),
-            },
         }
     }
-    fn from_platform_op(op: UringOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.send_to)).op }
-    }
-}
+);
 
-impl IntoPlatformOp<UringDriver> for Connect {
-    fn into_platform_op(self) -> UringOp {
-        const TABLE: OpVTable = OpVTable {
-            make_sqe: submit::make_sqe_connect,
-            on_complete: submit::on_complete_connect,
-            drop: submit::drop_connect,
-            get_fd: submit::get_fd_connect,
-        };
-
-        UringOp {
-            vtable: &TABLE,
-            payload: UringOpPayload {
-                connect: ManuallyDrop::new(Box::new(self)),
-            },
-        }
+impl_into_uring_op!(
+    RecvFrom,
+    recv_from,
+    make_sqe_recv_from,
+    on_complete_recv_from,
+    drop_recv_from,
+    get_fd_recv_from,
+    RecvFromPayload,
+    |op| RecvFromPayload {
+        op,
+        msg_name: unsafe { std::mem::zeroed() },
+        msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+        iovec: [unsafe { std::mem::zeroed() }],
+        msghdr: unsafe { std::mem::zeroed() },
     }
-    fn from_platform_op(op: UringOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { *ManuallyDrop::into_inner(std::ptr::read(&op.payload.connect)) }
-    }
-}
+);
 
-impl IntoPlatformOp<UringDriver> for RecvFrom {
-    fn into_platform_op(self) -> UringOp {
-        const TABLE: OpVTable = OpVTable {
-            make_sqe: submit::make_sqe_recv_from,
-            on_complete: submit::on_complete_recv_from,
-            drop: submit::drop_recv_from,
-            get_fd: submit::get_fd_recv_from,
-        };
+impl_into_uring_op!(
+    Open,
+    open,
+    make_sqe_open,
+    on_complete_open,
+    drop_open,
+    get_fd_open,
+    OpenPayload,
+    |op| OpenPayload { op }
+);
 
-        let payload = RecvFromPayload {
-            op: self,
-            msg_name: unsafe { std::mem::zeroed() },
-            msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-            iovec: [unsafe { std::mem::zeroed() }],
-            msghdr: unsafe { std::mem::zeroed() },
-        };
+impl_into_uring_op!(
+    Wakeup,
+    wakeup,
+    make_sqe_wakeup,
+    on_complete_wakeup,
+    drop_wakeup,
+    get_fd_wakeup,
+    WakeupPayload,
+    |op| WakeupPayload { op, buf: [0; 8] }
+);
 
-        UringOp {
-            vtable: &TABLE,
-            payload: UringOpPayload {
-                recv_from: ManuallyDrop::new(Box::new(payload)),
-            },
-        }
-    }
-    fn from_platform_op(op: UringOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        let payload = unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.recv_from)) };
-        payload.op
-    }
-}
-
-impl IntoPlatformOp<UringDriver> for Open {
-    fn into_platform_op(self) -> UringOp {
-        const TABLE: OpVTable = OpVTable {
-            make_sqe: submit::make_sqe_open,
-            on_complete: submit::on_complete_open,
-            drop: submit::drop_open,
-            get_fd: submit::get_fd_open,
-        };
-
-        let payload = OpenPayload { op: self };
-        UringOp {
-            vtable: &TABLE,
-            payload: UringOpPayload {
-                open: ManuallyDrop::new(payload),
-            },
-        }
-    }
-    fn from_platform_op(op: UringOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.open)).op }
-    }
-}
-
-impl IntoPlatformOp<UringDriver> for Wakeup {
-    fn into_platform_op(self) -> UringOp {
-        const TABLE: OpVTable = OpVTable {
-            make_sqe: submit::make_sqe_wakeup,
-            on_complete: submit::on_complete_wakeup,
-            drop: submit::drop_wakeup,
-            get_fd: submit::get_fd_wakeup,
-        };
-
-        let payload = WakeupPayload {
-            op: self,
-            buf: [0; 8],
-        };
-        UringOp {
-            vtable: &TABLE,
-            payload: UringOpPayload {
-                wakeup: ManuallyDrop::new(payload),
-            },
-        }
-    }
-    fn from_platform_op(op: UringOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.wakeup)).op }
-    }
-}
-
-impl IntoPlatformOp<UringDriver> for Timeout {
-    fn into_platform_op(self) -> UringOp {
-        const TABLE: OpVTable = OpVTable {
-            make_sqe: submit::make_sqe_timeout,
-            on_complete: submit::on_complete_timeout,
-            drop: submit::drop_timeout,
-            get_fd: submit::get_fd_timeout,
-        };
-
-        // We can just initialize ts with zeros, will be filled in make_sqe
-        let payload = TimeoutPayload {
-            op: self,
-            ts: [0; 2],
-        };
-        UringOp {
-            vtable: &TABLE,
-            payload: UringOpPayload {
-                timeout: ManuallyDrop::new(payload),
-            },
-        }
-    }
-    fn from_platform_op(op: UringOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.timeout)).op }
-    }
-}
+impl_into_uring_op!(
+    Timeout,
+    timeout,
+    make_sqe_timeout,
+    on_complete_timeout,
+    drop_timeout,
+    get_fd_timeout,
+    TimeoutPayload,
+    |op| TimeoutPayload { op, ts: [0; 2] }
+);

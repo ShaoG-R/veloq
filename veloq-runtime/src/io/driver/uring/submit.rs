@@ -48,17 +48,6 @@ macro_rules! impl_lifecycle {
             None
         }
     };
-    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, boxed_nested_fd) => {
-        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
-            unsafe {
-                ManuallyDrop::drop(&mut op.payload.$variant);
-            }
-        }
-
-        pub(crate) unsafe fn $get_fd_fn(op: &UringOp) -> Option<IoFd> {
-            unsafe { Some((**op.payload.$variant).op.fd) }
-        }
-    };
 }
 
 macro_rules! impl_default_completion {
@@ -74,197 +63,174 @@ macro_rules! impl_default_completion {
 }
 
 // ============================================================================
-// ReadFixed
+// ReadFixed / WriteFixed
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_read_fixed(op: &mut UringOp) -> squeue::Entry {
-    let read_op = unsafe { &mut *op.payload.read };
-    let buf_index = read_op.buf.buf_index();
+macro_rules! make_rw_fixed {
+    ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path) => {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+            let rw_op = unsafe { &mut *op.payload.$field };
+            let buf_index = rw_op.buf.buf_index();
+            let ptr = rw_op.buf.as_mut_ptr();
+            let len = rw_op.buf.capacity() as u32;
 
-    if buf_index == NO_REGISTRATION_INDEX {
-        match read_op.fd {
-            IoFd::Raw(fd) => opcode::Read::new(
-                types::Fd(fd as i32),
-                read_op.buf.as_mut_ptr(),
-                read_op.buf.capacity() as u32,
-            )
-            .offset(read_op.offset)
-            .build(),
-            IoFd::Fixed(idx) => opcode::Read::new(
-                types::Fixed(idx),
-                read_op.buf.as_mut_ptr(),
-                read_op.buf.capacity() as u32,
-            )
-            .offset(read_op.offset)
-            .build(),
+            if buf_index == NO_REGISTRATION_INDEX {
+                match rw_op.fd {
+                    IoFd::Raw(fd) => $type_raw(types::Fd(fd as i32), ptr, len)
+                        .offset(rw_op.offset)
+                        .build(),
+                    IoFd::Fixed(idx) => $type_raw(types::Fixed(idx), ptr, len)
+                        .offset(rw_op.offset)
+                        .build(),
+                }
+            } else {
+                match rw_op.fd {
+                    IoFd::Raw(fd) => $type_fixed(types::Fd(fd as i32), ptr, len, buf_index)
+                        .offset(rw_op.offset)
+                        .build(),
+                    IoFd::Fixed(idx) => $type_fixed(types::Fixed(idx), ptr, len, buf_index)
+                        .offset(rw_op.offset)
+                        .build(),
+                }
+            }
         }
-    } else {
-        match read_op.fd {
-            IoFd::Raw(fd) => opcode::ReadFixed::new(
-                types::Fd(fd as i32),
-                read_op.buf.as_mut_ptr(),
-                read_op.buf.capacity() as u32,
-                buf_index,
-            )
-            .offset(read_op.offset)
-            .build(),
-            IoFd::Fixed(idx) => opcode::ReadFixed::new(
-                types::Fixed(idx),
-                read_op.buf.as_mut_ptr(),
-                read_op.buf.capacity() as u32,
-                buf_index,
-            )
-            .offset(read_op.offset)
-            .build(),
+    };
+    ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path, write) => {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+            let rw_op = unsafe { &mut *op.payload.$field };
+            let buf_index = rw_op.buf.buf_index();
+            let ptr = rw_op.buf.as_slice().as_ptr();
+            let len = rw_op.buf.len() as u32;
+
+            if buf_index == NO_REGISTRATION_INDEX {
+                match rw_op.fd {
+                    IoFd::Raw(fd) => $type_raw(types::Fd(fd as i32), ptr, len)
+                        .offset(rw_op.offset)
+                        .build(),
+                    IoFd::Fixed(idx) => $type_raw(types::Fixed(idx), ptr, len)
+                        .offset(rw_op.offset)
+                        .build(),
+                }
+            } else {
+                match rw_op.fd {
+                    IoFd::Raw(fd) => $type_fixed(types::Fd(fd as i32), ptr, len, buf_index)
+                        .offset(rw_op.offset)
+                        .build(),
+                    IoFd::Fixed(idx) => $type_fixed(types::Fixed(idx), ptr, len, buf_index)
+                        .offset(rw_op.offset)
+                        .build(),
+                }
+            }
         }
-    }
+    };
 }
+
+make_rw_fixed!(
+    make_sqe_read_fixed,
+    read,
+    opcode::Read::new,
+    opcode::ReadFixed::new
+);
+make_rw_fixed!(
+    make_sqe_write_fixed,
+    write,
+    opcode::Write::new,
+    opcode::WriteFixed::new,
+    write
+);
 
 impl_default_completion!(on_complete_read_fixed);
 impl_lifecycle!(drop_read_fixed, get_fd_read_fixed, read, direct_fd);
-
-// ============================================================================
-// WriteFixed
-// ============================================================================
-
-pub(crate) unsafe fn make_sqe_write_fixed(op: &mut UringOp) -> squeue::Entry {
-    let write_op = unsafe { &mut *op.payload.write };
-    let buf_index = write_op.buf.buf_index();
-
-    if buf_index == NO_REGISTRATION_INDEX {
-        match write_op.fd {
-            IoFd::Raw(fd) => opcode::Write::new(
-                types::Fd(fd as i32),
-                write_op.buf.as_slice().as_ptr(),
-                write_op.buf.len() as u32,
-            )
-            .offset(write_op.offset)
-            .build(),
-            IoFd::Fixed(idx) => opcode::Write::new(
-                types::Fixed(idx),
-                write_op.buf.as_slice().as_ptr(),
-                write_op.buf.len() as u32,
-            )
-            .offset(write_op.offset)
-            .build(),
-        }
-    } else {
-        match write_op.fd {
-            IoFd::Raw(fd) => opcode::WriteFixed::new(
-                types::Fd(fd as i32),
-                write_op.buf.as_slice().as_ptr(),
-                write_op.buf.len() as u32,
-                buf_index,
-            )
-            .offset(write_op.offset)
-            .build(),
-            IoFd::Fixed(idx) => opcode::WriteFixed::new(
-                types::Fixed(idx),
-                write_op.buf.as_slice().as_ptr(),
-                write_op.buf.len() as u32,
-                buf_index,
-            )
-            .offset(write_op.offset)
-            .build(),
-        }
-    }
-}
 
 impl_default_completion!(on_complete_write_fixed);
 impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
 
 // ============================================================================
-// Recv
+// Recv / Send / Connect / Accept
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_recv(op: &mut UringOp) -> squeue::Entry {
-    let recv_op = unsafe { &mut *op.payload.recv };
-    match recv_op.fd {
-        IoFd::Raw(fd) => opcode::Recv::new(
-            types::Fd(fd as i32),
-            recv_op.buf.as_mut_ptr(),
-            recv_op.buf.capacity() as u32,
-        )
-        .build(),
-        IoFd::Fixed(idx) => opcode::Recv::new(
-            types::Fixed(idx),
-            recv_op.buf.as_mut_ptr(),
-            recv_op.buf.capacity() as u32,
-        )
-        .build(),
-    }
+macro_rules! make_buf_op {
+    ($fn_name:ident, $field:ident, $opcode:path, recv_args) => {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+            let val = unsafe { &mut *op.payload.$field };
+            match val.fd {
+                IoFd::Raw(fd) => $opcode(
+                    types::Fd(fd as i32),
+                    val.buf.as_mut_ptr(),
+                    val.buf.capacity() as u32,
+                )
+                .build(),
+                IoFd::Fixed(idx) => $opcode(
+                    types::Fixed(idx),
+                    val.buf.as_mut_ptr(),
+                    val.buf.capacity() as u32,
+                )
+                .build(),
+            }
+        }
+    };
+    ($fn_name:ident, $field:ident, $opcode:path, send_args) => {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+            let val = unsafe { &mut *op.payload.$field };
+            match val.fd {
+                IoFd::Raw(fd) => $opcode(
+                    types::Fd(fd as i32),
+                    val.buf.as_slice().as_ptr(),
+                    val.buf.len() as u32,
+                )
+                .build(),
+                IoFd::Fixed(idx) => $opcode(
+                    types::Fixed(idx),
+                    val.buf.as_slice().as_ptr(),
+                    val.buf.len() as u32,
+                )
+                .build(),
+            }
+        }
+    };
 }
 
+make_buf_op!(make_sqe_recv, recv, opcode::Recv::new, recv_args);
 impl_default_completion!(on_complete_recv);
 impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 
-// ============================================================================
-// Send
-// ============================================================================
-
-pub(crate) unsafe fn make_sqe_send(op: &mut UringOp) -> squeue::Entry {
-    let send_op = unsafe { &mut *op.payload.send };
-    match send_op.fd {
-        IoFd::Raw(fd) => opcode::Send::new(
-            types::Fd(fd as i32),
-            send_op.buf.as_slice().as_ptr(),
-            send_op.buf.len() as u32,
-        )
-        .build(),
-        IoFd::Fixed(idx) => opcode::Send::new(
-            types::Fixed(idx),
-            send_op.buf.as_slice().as_ptr(),
-            send_op.buf.len() as u32,
-        )
-        .build(),
-    }
-}
-
+make_buf_op!(make_sqe_send, send, opcode::Send::new, send_args);
 impl_default_completion!(on_complete_send);
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
-// ============================================================================
-// Connect
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_connect(op: &mut UringOp) -> squeue::Entry {
-    let connect_op = unsafe { &mut **op.payload.connect };
-    match connect_op.fd {
+    let val = unsafe { &mut *op.payload.connect };
+    match val.fd {
         IoFd::Raw(fd) => opcode::Connect::new(
             types::Fd(fd as i32),
-            &connect_op.addr as *const _ as *const _,
-            connect_op.addr_len,
+            &val.addr as *const _ as *const _,
+            val.addr_len,
         )
         .build(),
         IoFd::Fixed(idx) => opcode::Connect::new(
             types::Fixed(idx),
-            &connect_op.addr as *const _ as *const _,
-            connect_op.addr_len,
+            &val.addr as *const _ as *const _,
+            val.addr_len,
         )
         .build(),
     }
 }
-
 impl_default_completion!(on_complete_connect);
 impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
 
-// ============================================================================
-// Accept
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp) -> squeue::Entry {
-    let accept_op = unsafe { &mut (**op.payload.accept).op };
-    match accept_op.fd {
+    let val = unsafe { &mut (*op.payload.accept).op };
+    match val.fd {
         IoFd::Raw(fd) => opcode::Accept::new(
             types::Fd(fd as i32),
-            &mut accept_op.addr as *mut _ as *mut _,
-            &mut accept_op.addr_len as *mut _,
+            &mut val.addr as *mut _ as *mut _,
+            &mut val.addr_len as *mut _,
         )
         .build(),
         IoFd::Fixed(idx) => opcode::Accept::new(
             types::Fixed(idx),
-            &mut accept_op.addr as *mut _ as *mut _,
-            &mut accept_op.addr_len as *mut _,
+            &mut val.addr as *mut _ as *mut _,
+            &mut val.addr_len as *mut _,
         )
         .build(),
     }
@@ -272,7 +238,7 @@ pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp) -> squeue::Entry {
 
 pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Result<usize> {
     if result >= 0 {
-        let accept_op = unsafe { &mut (**op.payload.accept).op };
+        let accept_op = unsafe { &mut (*op.payload.accept).op };
         // Try fallback parsing to populate remote_addr early
         let addr_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -289,14 +255,14 @@ pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Re
     }
 }
 
-impl_lifecycle!(drop_accept, get_fd_accept, accept, boxed_nested_fd);
+impl_lifecycle!(drop_accept, get_fd_accept, accept, nested_fd);
 
 // ============================================================================
 // SendTo
 // ============================================================================
 
 pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
-    let payload = unsafe { &mut **op.payload.send_to };
+    let payload = unsafe { &mut *op.payload.send_to };
 
     // Initialize internal pointers
     payload.iovec[0].iov_base = payload.op.buf.as_slice().as_ptr() as *mut _;
@@ -319,14 +285,14 @@ pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
 }
 
 impl_default_completion!(on_complete_send_to);
-impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, boxed_nested_fd);
+impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 
 // ============================================================================
 // RecvFrom
 // ============================================================================
 
 pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp) -> squeue::Entry {
-    let payload = unsafe { &mut **op.payload.recv_from };
+    let payload = unsafe { &mut *op.payload.recv_from };
 
     // Initialize internal pointers
     payload.iovec[0].iov_base = payload.op.buf.as_mut_ptr() as *mut _;
@@ -349,7 +315,7 @@ pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp) -> squeue::Entry {
 
 pub(crate) unsafe fn on_complete_recv_from(op: &mut UringOp, result: i32) -> io::Result<usize> {
     if result >= 0 {
-        let payload = unsafe { &mut **op.payload.recv_from };
+        let payload = unsafe { &mut *op.payload.recv_from };
         let len = payload.msghdr.msg_namelen as usize;
         let addr_bytes =
             unsafe { std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len) };
@@ -362,7 +328,7 @@ pub(crate) unsafe fn on_complete_recv_from(op: &mut UringOp, result: i32) -> io:
     }
 }
 
-impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, boxed_nested_fd);
+impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
 
 // ============================================================================
 // Close
