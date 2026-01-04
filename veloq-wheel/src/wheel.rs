@@ -4,10 +4,10 @@ use slotmap::{DefaultKey, SlotMap};
 use std::time::Duration;
 
 /// Internal entry in the slotmap.
-/// Acts as a node in a doubly-linked list.
+/// Acts as a node in a singly-linked list (lazy cancellation).
 ///
 /// Slotmap 中的内部条目。
-/// 作为双向链表中的一个节点。
+/// 作为单向链表中的一个节点（惰性取消）。
 struct WheelEntry<T> {
     /// The actual item/data stored in the wheel.
     /// Wrapped in Option for lazy cancellation (take() leaves None).
@@ -21,8 +21,8 @@ struct WheelEntry<T> {
     /// 该项目过期的绝对 tick 时间戳。
     deadline: u64,
 
-    // Intrusive linked list pointers
-    // 侵入式链表指针
+    // Linked list pointers (Singly linked now)
+    // 链表指针（现在是单向的）
     /// Key of the next entry in the list.
     ///
     /// 链表中后一个条目的 Key。
@@ -46,10 +46,10 @@ struct WheelEntry<T> {
 /// 表示分层时间轮中的单个层级。
 struct Level {
     /// Heads of the linked lists for each slot.
-    /// Each slot contains the head key of a doubly-linked list of tasks.
+    /// Each slot contains the head key of a singly-linked list of tasks.
     ///
     /// 每个槽位的链表头。
-    /// 每个槽位包含一个任务双向链表的头 Key。
+    /// 每个槽位包含一个任务单向链表的头 Key。
     slots: Vec<Option<DefaultKey>>,
 
     /// Bitmask for fast modulo operations (slot_count - 1).
@@ -74,10 +74,10 @@ impl Level {
 }
 
 /// A hierarchical timing wheel implementation.
-/// Uses `SlotMap` for O(1) task addressing and double-linked lists for O(1) insertion/removal per slot.
+/// Uses `SlotMap` for O(1) task addressing and singly-linked lists with lazy cancellation.
 ///
 /// 分层时间轮实现。
-/// 使用 `SlotMap` 进行 O(1) 的任务寻址，并使用双向链表实现每个槽位的 O(1) 插入/移除。
+/// 使用 `SlotMap` 进行 O(1) 的任务寻址，并使用具有惰性取消功能的单向链表。
 pub struct Wheel<T> {
     /// Storage for tasks, providing stable keys (TaskId).
     ///
