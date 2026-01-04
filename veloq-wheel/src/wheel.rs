@@ -10,9 +10,11 @@ use std::time::Duration;
 /// 作为双向链表中的一个节点。
 struct WheelEntry<T> {
     /// The actual item/data stored in the wheel.
+    /// Wrapped in Option for lazy cancellation (take() leaves None).
     ///
     /// 时间轮中存储的实际项目/数据。
-    item: T,
+    /// 包装在 Option 中以支持惰性取消（take() 留下 None）。
+    item: Option<T>,
 
     /// Absolute tick timestamp when this item expires.
     ///
@@ -21,11 +23,6 @@ struct WheelEntry<T> {
 
     // Intrusive linked list pointers
     // 侵入式链表指针
-    /// Key of the previous entry in the list.
-    ///
-    /// 链表中前一个条目的 Key。
-    prev: Option<DefaultKey>,
-
     /// Key of the next entry in the list.
     ///
     /// 链表中后一个条目的 Key。
@@ -36,12 +33,12 @@ struct WheelEntry<T> {
     /// The hierarchy level this entry is currently in (0 or 1).
     ///
     /// 该条目当前所在的层级（0 或 1）。
-    level: usize,
+    level: u8,
 
     /// The slot index within the level.
     ///
     /// 层级内的槽位索引。
-    slot_index: usize,
+    slot_index: u32,
 }
 
 /// Represents a single level in the hierarchical timing wheel.
@@ -160,12 +157,11 @@ impl<T> Wheel<T> {
         // Insert into SlotMap
         // 插入到 SlotMap 中
         let key = self.tasks.insert(WheelEntry {
-            item,
+            item: Some(item),
             deadline,
-            prev: None,
             next: None,
-            level,
-            slot_index,
+            level: level as u8,
+            slot_index: slot_index as u32,
         });
 
         // Link into the determined slot
@@ -183,16 +179,12 @@ impl<T> Wheel<T> {
     pub fn cancel(&mut self, task_id: TaskId) -> Option<T> {
         let key = task_id.key();
 
-        // Remove from map
-        // 从 Map 中移除
-        if let Some(entry) = self.tasks.remove(key) {
-            // Unlink from the list
-            // 从链表中解绑
-            self.unlink_internal(key, &entry);
-            Some(entry.item)
-        } else {
-            None
-        }
+        // Lazy cancellation: just take the item.
+        // The entry remains in the slotmap until the wheel advances to its deadline.
+        //
+        // 惰性取消：只需取出 item。
+        // 条目保留在 SlotMap 中，直到时间轮推进到其截止日期。
+        self.tasks.get_mut(key).and_then(|entry| entry.item.take())
     }
 
     /// Advance the wheel by the specified elapsed time and return all expired items.
@@ -352,66 +344,17 @@ impl<T> Wheel<T> {
         let old_head = self.levels[level].slots[slot_index];
 
         // key.next = old_head
-        // key.prev = None
         if let Some(entry) = self.tasks.get_mut(key) {
             entry.next = old_head;
-            entry.prev = None;
             // Also ensure we update the location fields, as we might be re-linking
             // 还要确保更新位置字段，因为我们可能正在重新链接
-            entry.level = level;
-            entry.slot_index = slot_index;
-        }
-
-        // if old_head exists, old_head.prev = key
-        // 如果 old_head 存在，则 old_head.prev = key
-        if let Some(head_key) = old_head {
-            if let Some(head_entry) = self.tasks.get_mut(head_key) {
-                head_entry.prev = Some(key);
-            }
+            entry.level = level as u8;
+            entry.slot_index = slot_index as u32;
         }
 
         // slot head = key
         // 槽位头 = key
         self.levels[level].slots[slot_index] = Some(key);
-    }
-
-    /// Unlink an entry from its current list.
-    /// Requires the entry data (to read prev/next/level/slot).
-    ///
-    /// 从当前链表中解绑一个条目。
-    /// 需要条目数据（以读取 prev/next/level/slot）。
-    fn unlink_internal(&mut self, _key: DefaultKey, entry: &WheelEntry<T>) {
-        let prev = entry.prev;
-        let next = entry.next;
-        let level = entry.level;
-        let slot = entry.slot_index;
-
-        if let Some(prev_key) = prev {
-            // entry is not head, update prev node
-            // 条目不是头节点，更新前驱节点
-            if let Some(prev_entry) = self.tasks.get_mut(prev_key) {
-                prev_entry.next = next;
-            }
-        } else {
-            // entry is head, update slot head
-            // 条目是头节点，更新槽位头
-
-            // Sanity check: The slot should point to this key.
-            // 健全性检查：槽位应指向此 Key。
-            #[cfg(debug_assertions)]
-            if self.levels[level].slots[slot] != Some(_key) {
-                panic!("Wheel linked list corruption: head mismatch");
-            }
-            self.levels[level].slots[slot] = next;
-        }
-
-        if let Some(next_key) = next {
-            // Update next node's prev pointer
-            // 更新后继节点的 prev 指针
-            if let Some(next_entry) = self.tasks.get_mut(next_key) {
-                next_entry.prev = prev;
-            }
-        }
     }
 
     /// Drain a linked list starting at `head`, moving all items to `expired`.
@@ -426,8 +369,12 @@ impl<T> Wheel<T> {
     ) {
         let mut current_opt = Some(head);
         while let Some(key) = current_opt {
-            if let Some(entry) = tasks.remove(key) {
-                expired.push(entry.item);
+            if let Some(mut entry) = tasks.remove(key) {
+                // Only push if item is Some (not cancelled)
+                // 仅当 item 为 Some（未取消）时才推送
+                if let Some(item) = entry.item.take() {
+                    expired.push(item);
+                }
                 current_opt = entry.next;
             } else {
                 break;
@@ -441,27 +388,35 @@ impl<T> Wheel<T> {
     fn cascade_list(&mut self, head: DefaultKey, expired: &mut Vec<T>) {
         let mut current_opt = Some(head);
         while let Some(curr_key) = current_opt {
-            let (next_key, deadline) = {
+            let (next_key, deadline, is_cancelled) = {
                 let entry = self
                     .tasks
                     .get(curr_key)
                     .expect("L1 Entry must exist during cascade");
-                (entry.next, entry.deadline)
+                (entry.next, entry.deadline, entry.item.is_none())
             };
 
-            // Calculate new location
-            // 计算新位置
-            if deadline <= self.global_tick {
-                // Expired
-                // 已过期
-                if let Some(entry) = self.tasks.remove(curr_key) {
-                    expired.push(entry.item);
-                }
+            if is_cancelled {
+                // Remove ghost task
+                // 移除幽灵任务
+                self.tasks.remove(curr_key);
             } else {
-                let (new_level, new_slot) = self.determine_location(deadline);
-                // We re-link this item.
-                // 重新链接此项目。
-                self.link(curr_key, new_level, new_slot);
+                // Calculate new location
+                // 计算新位置
+                if deadline <= self.global_tick {
+                    // Expired
+                    // 已过期
+                    if let Some(mut entry) = self.tasks.remove(curr_key) {
+                        if let Some(item) = entry.item.take() {
+                            expired.push(item);
+                        }
+                    }
+                } else {
+                    let (new_level, new_slot) = self.determine_location(deadline);
+                    // We re-link this item.
+                    // 重新链接此项目。
+                    self.link(curr_key, new_level, new_slot);
+                }
             }
 
             current_opt = next_key;
