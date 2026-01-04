@@ -17,7 +17,7 @@ impl Drop for UdpSocket {
         #[cfg(unix)]
         let _ = unsafe { Socket::from_raw(self.fd as i32) };
         #[cfg(windows)]
-        let _ = unsafe { Socket::from_raw(self.fd as *mut std::ffi::c_void) };
+        let _ = unsafe { Socket::from_raw(self.fd) };
     }
 }
 
@@ -85,7 +85,7 @@ impl UdpSocket {
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as i32)) };
         #[cfg(windows)]
         let socket =
-            unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as *mut std::ffi::c_void)) };
+            unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
         socket.local_addr()
     }
 

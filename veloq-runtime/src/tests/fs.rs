@@ -13,8 +13,9 @@ fn test_file_integrity() {
             let cx = cx.clone();
             async move {
                 let file_path = Path::new("test_file_integrity.tmp");
+                // Remove file if exists
                 if file_path.exists() {
-                    fs::remove_file(file_path).unwrap();
+                    let _ = fs::remove_file(file_path);
                 }
 
                 // 1. Create and Write
@@ -33,7 +34,7 @@ fn test_file_integrity() {
                     assert_eq!(wrote, size.size()); // Expect full buffer write
 
                     file.sync_all().await.expect("Sync failed");
-                }
+                } // file dropped here, handle closed
 
                 // 2. Open and Read
                 {
@@ -47,10 +48,12 @@ fn test_file_integrity() {
                     // Read should return full size since we wrote full size
                     assert_eq!(n, size.size());
                     assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
-                }
+                } // file dropped here, handle closed
 
                 // Cleanup
-                fs::remove_file(file_path).unwrap();
+                if file_path.exists() {
+                    let _ = fs::remove_file(file_path);
+                }
             }
         });
     }

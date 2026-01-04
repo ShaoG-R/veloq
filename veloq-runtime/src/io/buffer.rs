@@ -81,7 +81,7 @@ pub struct FixedBuf {
 // but in Thread-per-Core it stays on thread.
 
 impl FixedBuf {
-    /// Internal constructor.
+    /// # Safety
     /// `ptr` must point to the payload (after BufferHeader).
     /// The memory at `ptr - size_of::<BufferHeader>()` must be a valid initialized BufferHeader.
     #[inline(always)]
@@ -129,6 +129,11 @@ impl FixedBuf {
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     #[inline(always)]

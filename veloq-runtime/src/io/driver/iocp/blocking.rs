@@ -63,7 +63,7 @@ impl BlockingTask {
                         flags as u32,
                         0,
                         std::ptr::null(),
-                        mode as u32,
+                        mode,
                         FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
                         std::ptr::null_mut(),
                     )
@@ -298,11 +298,10 @@ impl ThreadPool {
                     state.idle_workers.fetch_sub(1, Ordering::SeqCst);
                     queue = guard;
 
-                    if result.timed_out() && queue.is_empty() {
-                        if state.active_workers.load(Ordering::SeqCst) > core_threads {
+                    if result.timed_out() && queue.is_empty()
+                        && state.active_workers.load(Ordering::SeqCst) > core_threads {
                             return;
                         }
-                    }
                 }
                 queue.pop_front()
             };

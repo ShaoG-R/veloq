@@ -171,8 +171,8 @@ impl IocpDriver {
             let op = &mut self.ops[user_data];
             let mut result_is_ready = false;
 
-            if op.result.is_none() {
-                if let Some(iocp_op) = op.resources.as_mut() {
+            if op.result.is_none()
+                && let Some(iocp_op) = op.resources.as_mut() {
                     // Check for blocking result first
                     if let Some(entry) = iocp_op.header.blocking_result.take() {
                         op.result = Some(entry);
@@ -190,7 +190,6 @@ impl IocpDriver {
                         result_is_ready = true;
                     }
                 }
-            }
 
             if result_is_ready {
                 // Clean up resources
@@ -237,9 +236,8 @@ impl Driver for IocpDriver {
                     };
                 }
                 Ok(SubmissionResult::Offload(task)) => {
-                    if let Err(_) = self.pool.execute(task) {
-                        op_entry.result = Some(Err(io::Error::new(
-                            io::ErrorKind::Other,
+                    if self.pool.execute(task).is_err() {
+                        op_entry.result = Some(Err(io::Error::other(
                             "Thread pool overloaded",
                         )));
                         if let Some(waker) = op_entry.waker.take() {
@@ -278,11 +276,10 @@ impl Driver for IocpDriver {
 
             match result {
                 Ok(SubmissionResult::Offload(task)) => {
-                    if let Err(_) = self.pool.execute(task) {
+                    if self.pool.execute(task).is_err() {
                         // Failed to submit background task
                         self.ops.remove(user_data);
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
+                        return Err(io::Error::other(
                             "Thread pool overloaded",
                         ));
                     }
@@ -336,9 +333,9 @@ impl Driver for IocpDriver {
                 }
                 PlatformData::None => {
                     // Try to CancelIoEx if resources exist
-                    if let Some(res) = &mut op.resources {
-                        if let Some(fd) = res.get_fd() {
-                            if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
+                    if let Some(res) = &mut op.resources
+                        && let Some(fd) = res.get_fd()
+                            && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
                                 // Direct access to header
                                 let entry = &mut res.header;
                                 unsafe {
@@ -346,8 +343,6 @@ impl Driver for IocpDriver {
                                     let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
                                 }
                             }
-                        }
-                    }
                 }
             }
         }
@@ -391,12 +386,11 @@ impl Driver for IocpDriver {
         for fd in files {
             if let crate::io::op::IoFd::Fixed(idx) = fd {
                 let idx = idx as usize;
-                if idx < self.registered_files.len() {
-                    if self.registered_files[idx].is_some() {
+                if idx < self.registered_files.len()
+                    && self.registered_files[idx].is_some() {
                         self.registered_files[idx] = None;
                         self.free_slots.push(idx);
                     }
-                }
             }
         }
         Ok(())
@@ -438,10 +432,10 @@ impl Drop for IocpDriver {
         let mut pending_count = 0;
         for (_user_data, op) in self.ops.iter_mut() {
             if op.resources.is_some() && op.result.is_none() {
-                if !op.cancelled {
-                    if let Some(res) = op.resources.as_mut() {
-                        if let Some(fd) = res.get_fd() {
-                            if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
+                if !op.cancelled
+                    && let Some(res) = op.resources.as_mut()
+                        && let Some(fd) = res.get_fd()
+                            && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
                                 // Direct access to header
                                 let entry = &mut res.header;
                                 unsafe {
@@ -449,9 +443,6 @@ impl Drop for IocpDriver {
                                     let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
                                 }
                             }
-                        }
-                    }
-                }
                 pending_count += 1;
             }
         }

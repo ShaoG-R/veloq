@@ -258,7 +258,7 @@ impl<T> Wheel<T> {
 
             // Check if we hit a cascade point
             // 检查是否遇到级联点
-            if self.global_tick % self.l1_tick_ratio == 0 {
+            if self.global_tick.is_multiple_of(self.l1_tick_ratio) {
                 let l1_tick = self.global_tick / self.l1_tick_ratio;
                 let l1_idx = (l1_tick as usize) & self.levels[1].mask;
 
@@ -406,10 +406,10 @@ impl<T> Wheel<T> {
                 if deadline <= self.global_tick {
                     // Expired
                     // 已过期
-                    if let Some(mut entry) = self.tasks.remove(curr_key) {
-                        if let Some(item) = entry.item.take() {
-                            expired.push(item);
-                        }
+                    if let Some(mut entry) = self.tasks.remove(curr_key)
+                        && let Some(item) = entry.item.take()
+                    {
+                        expired.push(item);
                     }
                 } else {
                     let (new_level, new_slot) = self.determine_location(deadline);

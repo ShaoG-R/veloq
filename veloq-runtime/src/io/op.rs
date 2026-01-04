@@ -169,11 +169,10 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for Op<T> {
     fn drop(&mut self) {
-        if let State::Submitted = self.state {
-            if let Some(driver_rc) = self.driver.upgrade() {
+        if let State::Submitted = self.state
+            && let Some(driver_rc) = self.driver.upgrade() {
                 driver_rc.borrow_mut().cancel_op(self.user_data);
             }
-        }
     }
 }
 

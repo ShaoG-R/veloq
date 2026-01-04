@@ -118,8 +118,7 @@ struct BuddyAllocator {
 impl BuddyAllocator {
     fn new() -> Self {
         // 分配 Arena 内存
-        let mut memory = Vec::with_capacity(ARENA_SIZE);
-        memory.resize(ARENA_SIZE, 0);
+        let mut memory = vec![0; ARENA_SIZE];
         let base_ptr = memory.as_mut_ptr();
 
         let mut free_heads = [None; NUM_ORDERS];

@@ -300,7 +300,7 @@ impl_into_iocp_op!(
             op,
             wsabuf,
             addr,
-            addr_len: addr_len as i32,
+            addr_len,
         }
     }
 );

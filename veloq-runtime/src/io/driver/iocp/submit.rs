@@ -281,12 +281,12 @@ pub(crate) unsafe fn submit_connect(
 
     if ret == 0 {
         let family = name.ss_family;
-        if family == AF_INET as u16 {
+        if family == AF_INET {
             let addr_in = unsafe { &*(&name as *const _ as *const SOCKADDR_IN) };
             if addr_in.sin_port != 0 {
                 need_bind = false;
             }
-        } else if family == AF_INET6 as u16 {
+        } else if family == AF_INET6 {
             let addr_in6 = unsafe { &*(&name as *const _ as *const SOCKADDR_IN6) };
             if addr_in6.sin6_port != 0 {
                 need_bind = false;
@@ -301,7 +301,7 @@ pub(crate) unsafe fn submit_connect(
         let mut bind_addr6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
         bind_addr6.sin6_family = AF_INET6;
 
-        let (ptr, len) = if family == AF_INET as u16 {
+        let (ptr, len) = if family == AF_INET {
             (
                 &bind_addr as *const _ as *const SOCKADDR,
                 std::mem::size_of::<SOCKADDR_IN>() as i32,
@@ -454,12 +454,12 @@ pub(crate) unsafe fn on_complete_accept(
 
     if !remote_sockaddr.is_null() && remote_len > 0 {
         let family = unsafe { (*remote_sockaddr).sa_family };
-        if family == AF_INET as u16 {
+        if family == AF_INET {
             let addr_in = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN) };
             let ip = Ipv4Addr::from(unsafe { addr_in.sin_addr.S_un.S_addr.to_ne_bytes() });
             let port = u16::from_be(addr_in.sin_port);
             payload.op.remote_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
-        } else if family == AF_INET6 as u16 {
+        } else if family == AF_INET6 {
             let addr_in6 = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN6) };
             let ip = Ipv6Addr::from(unsafe { addr_in6.sin6_addr.u.Byte });
             let port = u16::from_be(addr_in6.sin6_port);

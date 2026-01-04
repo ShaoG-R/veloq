@@ -104,6 +104,12 @@ pub struct HybridAllocator {
     slabs: Vec<Slab>,
 }
 
+impl Default for HybridAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HybridAllocator {
     pub fn new() -> Self {
         let mut slabs = Vec::with_capacity(SLABS.len());
@@ -111,8 +117,7 @@ impl HybridAllocator {
 
         for config in SLABS.iter() {
             let total_size = config.block_size * config.count;
-            let mut memory = Vec::with_capacity(total_size);
-            memory.resize(total_size, 0); // zero init
+            let memory = vec![0; total_size]; // zero init
 
             // Free indices stack: initially all indices 0..count
             let free_indices: Vec<usize> = (0..config.count).collect();
@@ -188,6 +193,8 @@ impl HybridAllocator {
     /// `block_ptr`: pointer to the start of the block (header position).
     /// `cap`: total capacity of the block (needed for global dealloc).
     /// `context`: context from allocation.
+    /// # Safety
+    /// Caller must ensure block_ptr is valid and matches context
     pub unsafe fn dealloc(&mut self, block_ptr: NonNull<u8>, cap: usize, context: usize) {
         if context == GLOBAL_ALLOC_CONTEXT {
             // Reconstruct Vec to drop it

@@ -68,9 +68,12 @@ impl Extensions {
             closesocket(socket);
 
             Ok(Self {
-                accept_ex: std::mem::transmute(accept_ex),
-                connect_ex: std::mem::transmute(connect_ex),
-                get_accept_ex_sockaddrs: std::mem::transmute(get_accept_ex_sockaddrs),
+                accept_ex: std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex),
+                connect_ex: std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex),
+                get_accept_ex_sockaddrs: std::mem::transmute::<
+                    *const std::ffi::c_void,
+                    LpfnGetAcceptExSockaddrs,
+                >(get_accept_ex_sockaddrs),
             })
         }
     }

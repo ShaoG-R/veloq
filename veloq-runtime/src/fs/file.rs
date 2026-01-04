@@ -124,34 +124,30 @@ impl File {
 }
 
 impl crate::io::AsyncBufRead for File {
-    fn read(
+    async fn read(
         &self,
         buf: FixedBuf,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
-        async move {
-            let offset = *self.pos.borrow();
-            let (res, buf) = self.read_at(buf, offset).await;
-            if let Ok(n) = res {
-                *self.pos.borrow_mut() += n as u64;
-            }
-            (res, buf)
+    ) -> (io::Result<usize>, FixedBuf) {
+        let offset = *self.pos.borrow();
+        let (res, buf) = self.read_at(buf, offset).await;
+        if let Ok(n) = res {
+            *self.pos.borrow_mut() += n as u64;
         }
+        (res, buf)
     }
 }
 
 impl crate::io::AsyncBufWrite for File {
-    fn write(
+    async fn write(
         &self,
         buf: FixedBuf,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
-        async move {
-            let offset = *self.pos.borrow();
-            let (res, buf) = self.write_at(buf, offset).await;
-            if let Ok(n) = res {
-                *self.pos.borrow_mut() += n as u64;
-            }
-            (res, buf)
+    ) -> (io::Result<usize>, FixedBuf) {
+        let offset = *self.pos.borrow();
+        let (res, buf) = self.write_at(buf, offset).await;
+        if let Ok(n) = res {
+            *self.pos.borrow_mut() += n as u64;
         }
+        (res, buf)
     }
 
     fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {

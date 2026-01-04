@@ -125,7 +125,7 @@ impl<T> StableSlab<T> {
         let available = (self.pages.len() * PAGE_SIZE) - self.len;
         if additional > available {
             let needed = additional - available;
-            let pages_needed = (needed + PAGE_SIZE - 1) / PAGE_SIZE;
+            let pages_needed = needed.div_ceil(PAGE_SIZE);
             for _ in 0..pages_needed {
                 self.add_page();
             }

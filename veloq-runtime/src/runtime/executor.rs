@@ -42,6 +42,12 @@ pub struct ExecutorRegistry {
     next: AtomicUsize,  // Source of randomness for P2C
 }
 
+impl Default for ExecutorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExecutorRegistry {
     pub fn new() -> Self {
         Self {

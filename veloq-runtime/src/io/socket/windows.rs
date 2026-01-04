@@ -140,7 +140,7 @@ impl Socket {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let mut buf = [0u8; 128];
-        let mut len = 128 as i32;
+        let mut len = 128_i32;
         let ret = unsafe {
             getsockname(
                 self.handle as usize,
@@ -178,7 +178,7 @@ pub fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, i32) {
             let mut sin6: SOCKADDR_IN6 = unsafe { mem::zeroed() };
             sin6.sin6_family = AF_INET6;
             sin6.sin6_port = a.port().to_be();
-            sin6.sin6_addr = unsafe { mem::transmute(a.ip().octets()) };
+            sin6.sin6_addr = unsafe { mem::transmute::<[u8; 16], windows_sys::Win32::Networking::WinSock::IN6_ADDR>(a.ip().octets()) };
             sin6.sin6_flowinfo = a.flowinfo();
             sin6.Anonymous.sin6_scope_id = a.scope_id();
 
@@ -209,7 +209,7 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SOCKADDR_STORAGE, i32) {
             unsafe {
                 (*sin6_ptr).sin6_family = AF_INET6;
                 (*sin6_ptr).sin6_port = a.port().to_be();
-                (*sin6_ptr).sin6_addr = mem::transmute(a.ip().octets());
+                (*sin6_ptr).sin6_addr = mem::transmute::<[u8; 16], windows_sys::Win32::Networking::WinSock::IN6_ADDR>(a.ip().octets());
                 (*sin6_ptr).sin6_flowinfo = a.flowinfo();
                 (*sin6_ptr).Anonymous.sin6_scope_id = a.scope_id();
                 mem::size_of::<SOCKADDR_IN6>() as i32

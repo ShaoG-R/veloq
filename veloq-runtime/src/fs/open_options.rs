@@ -16,6 +16,12 @@ pub struct OpenOptions {
     custom_flags: i32,
 }
 
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenOptions {
     pub fn new() -> Self {
         Self {
