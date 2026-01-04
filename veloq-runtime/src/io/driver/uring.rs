@@ -105,7 +105,9 @@ impl UringDriver {
         }
 
         let fd = self.waker_fd;
-        let op = crate::io::op::Wakeup { fd: crate::io::op::IoFd::Raw(fd) };
+        let op = crate::io::op::Wakeup {
+            fd: crate::io::op::IoFd::Raw(fd),
+        };
         // Use into_platform_op to convert to UringOp
         let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
 
@@ -115,7 +117,8 @@ impl UringDriver {
         // Generate and push SQE
         if let Some(entry) = self.ops.get_mut(user_data) {
             if let Some(ref mut resources) = entry.resources {
-                let sqe = unsafe { (resources.vtable.make_sqe)(resources).user_data(user_data as u64) };
+                let sqe =
+                    unsafe { (resources.vtable.make_sqe)(resources).user_data(user_data as u64) };
                 self.push_entry(sqe);
             }
         }
@@ -218,21 +221,21 @@ impl UringDriver {
     /// Get a submission queue entry to fill.
     fn push_entry(&mut self, entry: squeue::Entry) {
         let mut sq = self.ring.submission();
-        
+
         // Attempt to push the entry
         if unsafe { sq.push(&entry) }.is_err() {
             // SQ is full. We must submit current entries to clear space.
             drop(sq); // Drop mutable borrow to call submit
             if let Err(e) = self.ring.submit() {
-                // If submit fails, we have a serious problem. 
+                // If submit fails, we have a serious problem.
                 // Panic is appropriate here as we can't recover easily and maintaining consistency is hard.
                 panic!("io_uring submit failed during push recovery: {}", e);
             }
-            
+
             // Retry push
             let mut sq = self.ring.submission();
             if unsafe { sq.push(&entry) }.is_err() {
-                // If it still fails, it essentially means the kernel isn't consuming SQEs fast enough 
+                // If it still fails, it essentially means the kernel isn't consuming SQEs fast enough
                 // or we are trying to push more than the ring size at once without processing completions.
                 // For a robust runtime, we might want to wait/park, but for now panicking prevents hidden deadlocks.
                 panic!("io_uring submission queue is full and cannot be cleared");
@@ -299,7 +302,7 @@ impl Driver for UringDriver {
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
         // Verify it is a Close op by checking the vtable function pointer
         if op.vtable.make_sqe as usize == submit::make_sqe_close as usize {
-             let sqe = unsafe { (op.vtable.make_sqe)(&mut op).user_data(BACKGROUND_USER_DATA) };
+            let sqe = unsafe { (op.vtable.make_sqe)(&mut op).user_data(BACKGROUND_USER_DATA) };
 
             // Try to push
             // Optimization: direct access to ring submission to handle full queue
@@ -316,7 +319,7 @@ impl Driver for UringDriver {
             }
             Ok(())
         } else {
-             Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "background op only supports Close",
             ))
@@ -347,7 +350,6 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    #[cfg(target_os = "linux")]
     fn register_buffer_pool(&mut self, vec: &Vec<libc::iovec>) -> io::Result<()> {
         self.register_buffers(vec)
     }

@@ -12,7 +12,12 @@ if [ -f "/tmp/id_ed25519.pub" ]; then
     fi
 fi
 
+# If arguments are provided, execute them
+if [ $# -gt 0 ]; then
+    exec "$@"
+fi
+
 # Start SSH daemon
 # -D: Do not detach and does not become a daemon
 echo "Starting SSH server..."
-/usr/sbin/sshd -D
+exec /usr/sbin/sshd -D

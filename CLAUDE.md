@@ -23,6 +23,8 @@
 ### Docker
 - **构建镜像**: `docker build -t veloq .`
 - **运行容器**: `docker run -it veloq`
+- **直接运行检查**: `docker-compose run --rm dev cargo check`
+- **直接运行测试**: `docker-compose run --rm dev cargo test`
 
 ## 架构 (Architecture)
 

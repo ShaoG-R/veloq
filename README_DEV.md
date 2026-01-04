@@ -38,7 +38,22 @@ Host veloq-dev
 
 Then you can simply run: `ssh veloq-dev`
 
-## 4. Connecting via VSCode (Remote - SSH)
+## 4. Running Commands Directly
+
+You can execute cargo commands directly inside the container without SSH:
+
+```bash
+# Run cargo check
+docker-compose run --rm dev cargo check
+
+# Run tests
+docker-compose run --rm dev cargo test
+
+# Open a shell
+docker-compose run --rm dev bash
+```
+
+## 5. Connecting via VSCode (Remote - SSH)
 
 1. Open VSCode.
 2. Press `F1` (or `Ctrl+Shift+P`) and run **Remote-SSH: Connect to Host...**.
