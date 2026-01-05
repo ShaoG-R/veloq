@@ -311,10 +311,10 @@ unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
 
     let mut inner = pool_rc.borrow_mut();
     unsafe {
-        if let Err(e) = inner.dealloc(NonNull::new_unchecked(block_ptr), total_cap, params.context)
+        if let Err(_e) = inner.dealloc(NonNull::new_unchecked(block_ptr), total_cap, params.context)
         {
             #[cfg(debug_assertions)]
-            eprintln!("HybridPool dealloc error: {}", e);
+            eprintln!("HybridPool dealloc error: {}", _e);
         }
     }
 }
