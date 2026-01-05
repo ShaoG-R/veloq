@@ -15,7 +15,7 @@ pub struct UdpSocket {
 impl Drop for UdpSocket {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = unsafe { Socket::from_raw(self.fd as i32) };
+        let _ = unsafe { Socket::from_raw(self.fd) };
         #[cfg(windows)]
         let _ = unsafe { Socket::from_raw(self.fd) };
     }
@@ -82,15 +82,15 @@ impl UdpSocket {
         use std::mem::ManuallyDrop;
 
         #[cfg(unix)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as i32)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
         #[cfg(windows)]
-        let socket =
-            unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
         socket.local_addr()
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
         let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_to_storage(addr);
+        #[allow(clippy::unnecessary_cast)]
         let op = Connect {
             fd: IoFd::Raw(self.fd),
             addr: raw_addr,

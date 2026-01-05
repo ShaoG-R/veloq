@@ -98,8 +98,7 @@ impl OpenOptions {
     /// 对外的公共 API：清晰、线性、无平台噪音
     pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
         let pool = crate::runtime::context::current_pool().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 "No buffer pool bound to current thread",
             )
         })?;

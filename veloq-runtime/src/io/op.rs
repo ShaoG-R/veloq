@@ -323,17 +323,16 @@ impl OpLifecycle for Accept {
 
     type Output = (RawHandle, std::net::SocketAddr);
 
+    #[cfg(windows)]
     fn pre_alloc(_fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
-        #[cfg(unix)]
-        {
-            Ok(())
-        }
-        #[cfg(windows)]
-        {
-            // On Windows, we need to pre-create a socket for AcceptEx
-            use crate::io::socket::Socket;
-            Ok(Socket::new_tcp_v4()?.into_raw() as RawHandle)
-        }
+        // On Windows, we need to pre-create a socket for AcceptEx
+        use crate::io::socket::Socket;
+        Ok(Socket::new_tcp_v4()?.into_raw() as RawHandle)
+    }
+
+    #[cfg(unix)]
+    fn pre_alloc(_fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
+        Ok(())
     }
 
     #[allow(unused_variables)]

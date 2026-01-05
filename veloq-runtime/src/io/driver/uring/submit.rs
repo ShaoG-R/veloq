@@ -202,7 +202,7 @@ pub(crate) unsafe fn make_sqe_connect(op: &mut UringOp) -> squeue::Entry {
     let val = unsafe { &mut *op.payload.connect };
     match val.fd {
         IoFd::Raw(fd) => opcode::Connect::new(
-            types::Fd(fd as i32),
+            types::Fd(fd),
             &val.addr as *const _ as *const _,
             val.addr_len,
         )
@@ -222,7 +222,7 @@ pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp) -> squeue::Entry {
     let val = unsafe { &mut (*op.payload.accept).op };
     match val.fd {
         IoFd::Raw(fd) => opcode::Accept::new(
-            types::Fd(fd as i32),
+            types::Fd(fd),
             &mut val.addr as *mut _ as *mut _,
             &mut val.addr_len as *mut _,
         )
@@ -276,7 +276,7 @@ pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
 
     match payload.op.fd {
         IoFd::Raw(fd) => {
-            opcode::SendMsg::new(types::Fd(fd as i32), &payload.msghdr as *const _).build()
+            opcode::SendMsg::new(types::Fd(fd), &payload.msghdr as *const _).build()
         }
         IoFd::Fixed(idx) => {
             opcode::SendMsg::new(types::Fixed(idx), &payload.msghdr as *const _).build()
@@ -305,7 +305,7 @@ pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp) -> squeue::Entry {
 
     match payload.op.fd {
         IoFd::Raw(fd) => {
-            opcode::RecvMsg::new(types::Fd(fd as i32), &mut payload.msghdr as *mut _).build()
+            opcode::RecvMsg::new(types::Fd(fd), &mut payload.msghdr as *mut _).build()
         }
         IoFd::Fixed(idx) => {
             opcode::RecvMsg::new(types::Fixed(idx), &mut payload.msghdr as *mut _).build()
@@ -337,7 +337,7 @@ impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
 pub(crate) unsafe fn make_sqe_close(op: &mut UringOp) -> squeue::Entry {
     let close_op = unsafe { &mut *op.payload.close };
     match close_op.fd {
-        IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd as i32)).build(),
+        IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd)).build(),
         IoFd::Fixed(idx) => opcode::Close::new(types::Fixed(idx)).build(),
     }
 }
@@ -358,7 +358,7 @@ pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp) -> squeue::Entry {
     };
 
     match fsync_op.fd {
-        IoFd::Raw(fd) => opcode::Fsync::new(types::Fd(fd as i32))
+        IoFd::Raw(fd) => opcode::Fsync::new(types::Fd(fd))
             .flags(flags)
             .build(),
         IoFd::Fixed(idx) => opcode::Fsync::new(types::Fixed(idx)).flags(flags).build(),
@@ -375,7 +375,7 @@ impl_lifecycle!(drop_fsync, get_fd_fsync, fsync, direct_fd);
 pub(crate) unsafe fn make_sqe_sync_range(op: &mut UringOp) -> squeue::Entry {
     let sync_op = unsafe { &mut *op.payload.sync_range };
     match sync_op.fd {
-        IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd as i32), sync_op.nbytes as u32)
+        IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd), sync_op.nbytes as u32)
             .offset(sync_op.offset)
             .flags(sync_op.flags)
             .build(),
@@ -396,11 +396,11 @@ impl_lifecycle!(drop_sync_range, get_fd_sync_range, sync_range, direct_fd);
 pub(crate) unsafe fn make_sqe_fallocate(op: &mut UringOp) -> squeue::Entry {
     let fallocate_op = unsafe { &mut *op.payload.fallocate };
     match fallocate_op.fd {
-        IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd as i32), fallocate_op.len as u64)
+        IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
             .offset(fallocate_op.offset)
             .mode(fallocate_op.mode)
             .build(),
-        IoFd::Fixed(idx) => opcode::Fallocate::new(types::Fixed(idx), fallocate_op.len as u64)
+        IoFd::Fixed(idx) => opcode::Fallocate::new(types::Fixed(idx), fallocate_op.len)
             .offset(fallocate_op.offset)
             .mode(fallocate_op.mode)
             .build(),
@@ -451,7 +451,7 @@ pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.wakeup };
     match payload.op.fd {
         IoFd::Raw(fd) => {
-            opcode::Read::new(types::Fd(fd as i32), payload.buf.as_mut_ptr(), 8).build()
+            opcode::Read::new(types::Fd(fd), payload.buf.as_mut_ptr(), 8).build()
         }
         _ => panic!("Wakeup only supports raw fd"),
     }

@@ -228,12 +228,10 @@ impl UringDriver {
 
                     let res = if let Some(ref mut resources) = op.resources {
                         unsafe { (resources.vtable.on_complete)(resources, cqe.result()) }
+                    } else if cqe.result() >= 0 {
+                        Ok(cqe.result() as usize)
                     } else {
-                        if cqe.result() >= 0 {
-                            Ok(cqe.result() as usize)
-                        } else {
-                            Err(io::Error::from_raw_os_error(-cqe.result()))
-                        }
+                        Err(io::Error::from_raw_os_error(-cqe.result()))
                     };
 
                     if op.cancelled {
@@ -308,12 +306,7 @@ impl UringDriver {
 
     /// Attempt to submit operations from the backlog.
     fn flush_backlog(&mut self) {
-        loop {
-            let user_data = match self.backlog_head {
-                Some(ud) => ud,
-                None => break,
-            };
-
+        while let Some(user_data) = self.backlog_head {
             // 1. Check state
             let (is_cancelled, is_submitted, has_resources) =
                 if let Some(entry) = self.ops.get_mut(user_data) {
@@ -413,7 +406,7 @@ impl UringDriver {
         Some(head)
     }
 
-    pub fn register_buffers(&mut self, iovecs: &Vec<libc::iovec>) -> io::Result<()> {
+    pub fn register_buffers(&mut self, iovecs: &[libc::iovec]) -> io::Result<()> {
         if self.buffers_registered {
             return Ok(());
         }
@@ -501,7 +494,7 @@ impl Driver for UringDriver {
             let sqe = unsafe { (op.vtable.make_sqe)(&mut op).user_data(BACKGROUND_USER_DATA) };
 
             if !self.push_entry(sqe) {
-                return Err(io::Error::new(io::ErrorKind::Other, "sq full"));
+                return Err(io::Error::other("sq full"));
             }
             Ok(())
         } else {
@@ -518,8 +511,8 @@ impl Driver for UringDriver {
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<usize>, Self::Op)> {
         // First check if stored in backlog (not submitted)
-        if let Some(entry) = self.ops.get_mut(user_data) {
-            if !entry.platform_data.submitted {
+        if let Some(entry) = self.ops.get_mut(user_data)
+            && !entry.platform_data.submitted {
                 // Not in ring yet. Try to flush backlog.
                 self.flush_backlog();
                 self.flush_cancellations();
@@ -532,7 +525,6 @@ impl Driver for UringDriver {
                     return Poll::Pending;
                 }
             }
-        }
 
         // Delegate to ops registry for result check
         self.ops.poll_op(user_data, cx)
@@ -558,7 +550,7 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffers(&mut self, vec: &Vec<libc::iovec>) -> io::Result<()> {
+    fn register_buffers(&mut self, vec: &[libc::iovec]) -> io::Result<()> {
         self.register_buffers(vec)
     }
 
@@ -566,7 +558,7 @@ impl Driver for UringDriver {
         &mut self,
         files: &[crate::io::op::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
-        let fds: Vec<i32> = files.iter().map(|&f| f as i32).collect();
+        let fds: Vec<i32> = files.to_vec();
         self.ring.submitter().register_files(&fds)?;
 
         let mut fixed_fds = Vec::with_capacity(files.len());

@@ -45,16 +45,16 @@ impl<'a> SyncRangeBuilder<'a> {
             file,
             offset,
             nbytes,
-            flags: flags as u32,
+            flags,
         }
     }
 
     pub fn wait_before(mut self, wait: bool) -> Self {
         #[cfg(unix)]
         if wait {
-            self.flags |= libc::SYNC_FILE_RANGE_WAIT_BEFORE as u32;
+            self.flags |= libc::SYNC_FILE_RANGE_WAIT_BEFORE;
         } else {
-            self.flags &= !(libc::SYNC_FILE_RANGE_WAIT_BEFORE as u32);
+            self.flags &= !libc::SYNC_FILE_RANGE_WAIT_BEFORE;
         }
         #[cfg(not(unix))]
         ignore!(wait, &mut self);
@@ -64,9 +64,9 @@ impl<'a> SyncRangeBuilder<'a> {
     pub fn write(mut self, write: bool) -> Self {
         #[cfg(unix)]
         if write {
-            self.flags |= libc::SYNC_FILE_RANGE_WRITE as u32;
+            self.flags |= libc::SYNC_FILE_RANGE_WRITE;
         } else {
-            self.flags &= !(libc::SYNC_FILE_RANGE_WRITE as u32);
+            self.flags &= !libc::SYNC_FILE_RANGE_WRITE;
         }
         #[cfg(not(unix))]
         ignore!(write, &mut self);
@@ -76,9 +76,9 @@ impl<'a> SyncRangeBuilder<'a> {
     pub fn wait_after(mut self, wait: bool) -> Self {
         #[cfg(unix)]
         if wait {
-            self.flags |= libc::SYNC_FILE_RANGE_WAIT_AFTER as u32;
+            self.flags |= libc::SYNC_FILE_RANGE_WAIT_AFTER;
         } else {
-            self.flags &= !(libc::SYNC_FILE_RANGE_WAIT_AFTER as u32);
+            self.flags &= !libc::SYNC_FILE_RANGE_WAIT_AFTER;
         }
         #[cfg(not(unix))]
         ignore!(wait, &mut self);
@@ -254,7 +254,7 @@ impl Drop for File {
             if let Some(fd) = self.fd.raw() {
                 #[cfg(unix)]
                 unsafe {
-                    libc::close(fd as i32);
+                    libc::close(fd);
                 }
                 #[cfg(windows)]
                 unsafe {

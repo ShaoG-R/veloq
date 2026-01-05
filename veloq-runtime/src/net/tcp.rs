@@ -20,7 +20,7 @@ pub struct TcpStream {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = unsafe { Socket::from_raw(self.fd as i32) };
+        let _ = unsafe { Socket::from_raw(self.fd) };
         #[cfg(windows)]
         let _ = unsafe { Socket::from_raw(self.fd) };
     }
@@ -29,7 +29,7 @@ impl Drop for TcpListener {
 impl Drop for TcpStream {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = unsafe { Socket::from_raw(self.fd as i32) };
+        let _ = unsafe { Socket::from_raw(self.fd) };
         #[cfg(windows)]
         let _ = unsafe { Socket::from_raw(self.fd) };
     }
@@ -63,10 +63,15 @@ impl TcpListener {
 
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         // Pre-allocate resources (platform specific)
+        #[cfg(target_os = "windows")]
         let pre_alloc = Accept::pre_alloc(self.fd)?;
 
         // Create the Op
+        #[cfg(target_os = "windows")]
         let op = Accept::into_op(self.fd, pre_alloc);
+
+        #[cfg(target_os = "linux")]
+        let op = Accept::into_op(self.fd, ());
 
         // Submit and Await
         let future = Op::new(op, self.driver.clone());
@@ -87,10 +92,9 @@ impl TcpListener {
         use std::mem::ManuallyDrop;
 
         #[cfg(unix)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as i32)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
         #[cfg(windows)]
-        let socket =
-            unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
         socket.local_addr()
     }
 }
@@ -108,6 +112,7 @@ impl TcpStream {
         let fd = socket.into_raw() as RawHandle;
 
         let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_to_storage(addr);
+        #[allow(clippy::unnecessary_cast)]
         let op = Connect {
             fd: IoFd::Raw(fd),
             addr: raw_addr,

@@ -17,8 +17,8 @@ use crate::runtime::task::Task;
 use std::cell::OnceCell;
 
 thread_local! {
-    static CONTEXT: RefCell<Option<RuntimeContext>> = RefCell::new(None);
-    static CURRENT_POOL: OnceCell<AnyBufPool> = OnceCell::new();
+    static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
+    static CURRENT_POOL: OnceCell<AnyBufPool> = const { OnceCell::new() };
 }
 
 /// Sets the thread-local runtime context.
@@ -177,24 +177,34 @@ impl Future for YieldNow {
 /// # Panics
 /// Panics if a pool is already bound to this thread.
 pub fn bind_pool<P: BufPool + Clone + 'static>(pool: P) {
-    try_bind_pool(pool)
-        .ok()
-        .expect("Buffer pool already bound for this thread");
+    try_bind_pool(pool).expect("Buffer pool already bound for this thread");
 }
+
+/// Error returned when trying to bind a pool to a thread that already has one.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolAlreadyBound;
+
+impl std::fmt::Display for PoolAlreadyBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Buffer pool already bound for this thread")
+    }
+}
+
+impl std::error::Error for PoolAlreadyBound {}
 
 /// Try to bind a buffer pool to the current thread.
 /// Returns error if already bound.
-pub fn try_bind_pool<P: BufPool + Clone + 'static>(pool: P) -> Result<(), ()> {
+pub fn try_bind_pool<P: BufPool + Clone + 'static>(pool: P) -> Result<(), PoolAlreadyBound> {
     let any_pool = AnyBufPool::new(pool);
     // 1. Set TLS
-    CURRENT_POOL.with(|cell| cell.set(any_pool).map_err(|_| ()))?;
+    CURRENT_POOL.with(|cell| cell.set(any_pool).map_err(|_| PoolAlreadyBound))?;
 
     // 2. Try Auto-Register (Active Hook)
     // If we are already running inside a RuntimeContext, register immediately.
-    if let Some(ctx) = try_current() {
-        if let Some(pool) = current_pool() {
-            ctx.register_buffers(&pool);
-        }
+    if let Some(ctx) = try_current()
+        && let Some(pool) = current_pool()
+    {
+        ctx.register_buffers(&pool);
     }
 
     Ok(())

@@ -32,6 +32,7 @@ RUN echo "export PATH=\"/usr/local/cargo/bin:\$PATH\"" >> /etc/profile
 
 # Install useful cargo subcommands (optional, can be commented out to speed up build)
 # RUN cargo install cargo-expand cargo-edit
+RUN rustup component add clippy
 
 WORKDIR /root/workspace
 

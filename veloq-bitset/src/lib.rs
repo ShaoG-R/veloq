@@ -30,7 +30,7 @@ impl BitSet {
     /// Creates a new BitSet with enough capacity to hold `size` bits.
     /// All bits are initially 0 (false).
     pub fn new(capacity: usize) -> Self {
-        let num_u64 = (capacity + 63) / 64;
+        let num_u64 = capacity.div_ceil(64);
         Self {
             bits: alloc::vec![0; num_u64],
             size: capacity,
