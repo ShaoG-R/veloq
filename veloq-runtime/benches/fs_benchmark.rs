@@ -100,7 +100,13 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 }
 
                 // 使用 verify range 替代 sync_all
-                file.sync_range(0, TOTAL_SIZE).await.expect("Sync failed");
+                // Optimize: Skip wait_before because we are the only writer after the loop finishes.
+                file.sync_range(0, TOTAL_SIZE)
+                    .wait_before(false)
+                    .write(true)
+                    .wait_after(true)
+                    .await
+                    .expect("Sync failed");
 
                 // 清理
                 drop(file);
@@ -225,7 +231,13 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 }
 
                 for file in &files {
-                    file.sync_range(0, FILE_SIZE).await.expect("Sync failed");
+                    // Optimize: Skip wait_before
+                    file.sync_range(0, FILE_SIZE)
+                        .wait_before(false)
+                        .write(true)
+                        .wait_after(true)
+                        .await
+                        .expect("Sync failed");
                 }
 
                 drop(files);

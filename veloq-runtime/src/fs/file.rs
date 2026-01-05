@@ -4,14 +4,93 @@ use crate::io::driver::PlatformDriver;
 use crate::io::op::{Fallocate, Fsync, IoFd, Op, ReadFixed, SyncFileRange, WriteFixed};
 
 use std::cell::RefCell;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::path::Path;
+use std::pin::Pin;
 use std::rc::Weak;
 
 pub struct File {
     pub(crate) fd: IoFd,
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
     pub(crate) pos: RefCell<u64>,
+}
+
+pub struct SyncRangeBuilder<'a> {
+    file: &'a File,
+    offset: u64,
+    nbytes: u64,
+    flags: u32,
+}
+
+impl<'a> SyncRangeBuilder<'a> {
+    fn new(file: &'a File, offset: u64, nbytes: u64) -> Self {
+        #[cfg(unix)]
+        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+            | libc::SYNC_FILE_RANGE_WRITE
+            | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+        #[cfg(not(unix))]
+        let flags = 0;
+
+        Self {
+            file,
+            offset,
+            nbytes,
+            flags: flags as u32,
+        }
+    }
+
+    #[allow(unused_mut, unused_variables)]
+    pub fn wait_before(mut self, wait: bool) -> Self {
+        #[cfg(unix)]
+        if wait {
+            self.flags |= libc::SYNC_FILE_RANGE_WAIT_BEFORE as u32;
+        } else {
+            self.flags &= !(libc::SYNC_FILE_RANGE_WAIT_BEFORE as u32);
+        }
+        self
+    }
+
+    #[allow(unused_mut, unused_variables)]
+    pub fn write(mut self, write: bool) -> Self {
+        #[cfg(unix)]
+        if write {
+            self.flags |= libc::SYNC_FILE_RANGE_WRITE as u32;
+        } else {
+            self.flags &= !(libc::SYNC_FILE_RANGE_WRITE as u32);
+        }
+        self
+    }
+
+    #[allow(unused_mut, unused_variables)]
+    pub fn wait_after(mut self, wait: bool) -> Self {
+        #[cfg(unix)]
+        if wait {
+            self.flags |= libc::SYNC_FILE_RANGE_WAIT_AFTER as u32;
+        } else {
+            self.flags &= !(libc::SYNC_FILE_RANGE_WAIT_AFTER as u32);
+        }
+        self
+    }
+}
+
+impl<'a> IntoFuture for SyncRangeBuilder<'a> {
+    type Output = io::Result<()>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let op = SyncFileRange {
+            fd: self.file.fd,
+            offset: self.offset,
+            nbytes: self.nbytes,
+            flags: self.flags,
+        };
+        let driver = self.file.driver.clone();
+        Box::pin(async move {
+            let (res, _) = Op::new(op, driver).await;
+            res.map(|_| ())
+        })
+    }
 }
 
 impl File {
@@ -85,23 +164,11 @@ impl File {
     /// Sync a file range.
     ///
     /// On Windows, this falls back to `FlushFileBuffers` which syncs the entire file, ignoring the range.
-    pub async fn sync_range(&self, offset: u64, nbytes: u64) -> io::Result<()> {
-        #[cfg(unix)]
-        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
-            | libc::SYNC_FILE_RANGE_WRITE
-            | libc::SYNC_FILE_RANGE_WAIT_AFTER;
-        #[cfg(not(unix))]
-        let flags = 0;
-
-        let op = SyncFileRange {
-            fd: self.fd,
-            offset,
-            nbytes,
-            flags: flags as u32,
-        };
-        let driver = self.driver.clone();
-        let (res, _) = Op::new(op, driver).await;
-        res.map(|_| ())
+    ///
+    /// Returns a specific Future (Builder) that allows configuring flags.
+    /// Usage: `file.sync_range(0, 100).wait_before(false).write(true).await`
+    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_> {
+        SyncRangeBuilder::new(self, offset, nbytes)
     }
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> io::Result<()> {
