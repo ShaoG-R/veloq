@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [ "main", "master" ]
+    paths-ignore:
+      - '.github/**'
+      - '.zed/**'
+      - 'docs/**'
+      - '**.md'
   pull_request:
     branches: [ "main", "master" ]
+    paths-ignore:
+      - '.github/**'
+      - '.zed/**'
+      - 'docs/**'
+      - '**.md'
   workflow_dispatch:
 
 env:
