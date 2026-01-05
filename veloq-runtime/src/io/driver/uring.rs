@@ -73,6 +73,7 @@ pub struct UringDriver {
 
     waker_fd: RawFd,
     waker_token: Option<usize>,
+    buffers_registered: bool,
 }
 
 impl UringDriver {
@@ -114,6 +115,7 @@ impl UringDriver {
             pending_cancellations: VecDeque::new(),
             waker_fd,
             waker_token: None,
+            buffers_registered: false,
         };
 
         driver.submit_waker();
@@ -412,7 +414,25 @@ impl UringDriver {
     }
 
     pub fn register_buffers(&mut self, iovecs: &Vec<libc::iovec>) -> io::Result<()> {
-        unsafe { self.ring.submitter().register_buffers(iovecs) }
+        if self.buffers_registered {
+            return Ok(());
+        }
+        match unsafe { self.ring.submitter().register_buffers(iovecs) } {
+            Ok(_) => {
+                self.buffers_registered = true;
+                Ok(())
+            }
+            Err(e) => {
+                // If the kernel says it's busy, it usually means buffers are already registered.
+                // We treat this as success to support driver reuse.
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    self.buffers_registered = true;
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     fn cancel_op_internal(&mut self, user_data: usize) {
