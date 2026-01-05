@@ -187,7 +187,7 @@ fn test_iocp_timeout() {
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
     let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
-    let pool = HybridPool::new();
+    let pool = HybridPool::new().unwrap();
 
     // Setup connection
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

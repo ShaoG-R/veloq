@@ -32,27 +32,23 @@
 //!   should be **Page Aligned (4096 bytes)**. This prevents splitting pages across
 //!   DRAM boundaries in ways that might degrade DMA performance.
 //!
-//! ### 3. Intrusive Header Layout
-//! `FixedBuf` relies on an intrusive [`BufferHeader`] stored *before* the payload pointer
-//! to manage lifecycle and context.
-//!
-//! ```text
-//! [ ... Padding / Alignment ... | BufferHeader | Payload (Aligned 512) ... ]
-//!                                              ^
-//!                                              |
-//!                                        FixedBuf.ptr
-//! ```
+//! ### 3. Metadata Management
+//! Unlike traditional implementations that might store metadata in an intrusive header
+//! *before* the payload, `FixedBuf` stores necessary context (like pool references and VTable)
+//! within the handle itself to avoid alignment complexities.
 //!
 //! **Implementors MUST ensure:**
-//! - The memory at `ptr - size_of::<BufferHeader>()` is valid and writeable.
-//! - The `BufferHeader` placement does **not** violate the 512-byte alignment of the Payload.
-//!   - *Incorrect*: `[ Header (24 bytes) | Payload ]` -> If Header is at 0, Payload is at 24 (Bad).
-//!   - *Correct*:   `[ ... | Header | Padding | Payload ]` -> Payload is at 512.
+//! - The `dealloc` function in the VTable can correctly free the memory using only:
+//!   - The payload pointer (`ptr`)
+//!   - The capacity (`cap`)
+//!   - An opaque `context` value (usize) provided during allocation
 //!
-//! See [`buddy::BuddyPool`] and [`hybrid::HybridPool`] for reference implementations
-//! that use `std::alloc` with specific layouts to satisfy these constraints.
+//! See [`buddy::BuddyPool`] and [`hybrid::HybridPool`] for reference implementations.
 
-use std::{alloc::Layout, ptr::NonNull};
+use std::{
+    alloc::{Layout, LayoutError},
+    ptr::NonNull,
+};
 
 pub mod buddy;
 pub mod hybrid;
@@ -62,13 +58,7 @@ pub use hybrid::HybridPool;
 
 pub const NO_REGISTRATION_INDEX: u16 = u16::MAX;
 
-#[repr(C)]
-pub struct BufferHeader {
-    pub vtable: &'static PoolVTable,
-    pub pool_data: NonNull<()>,
-    pub context: usize,
-}
-
+#[derive(Debug)]
 pub struct PoolVTable {
     pub dealloc: unsafe fn(pool_data: NonNull<()>, params: DeallocParams),
 }
@@ -100,9 +90,16 @@ pub trait BufPool: std::fmt::Debug + 'static {
                 ptr,
                 cap,
                 global_index,
-                context: _,
+                context,
             } => unsafe {
-                let mut buf = FixedBuf::new(ptr, cap, global_index);
+                let mut buf = FixedBuf::new(
+                    ptr,
+                    cap,
+                    global_index,
+                    self.pool_data(),
+                    self.vtable(),
+                    context,
+                );
                 buf.set_len(len);
                 Some(buf)
             },
@@ -116,6 +113,12 @@ pub trait BufPool: std::fmt::Debug + 'static {
     /// Get all buffers for io_uring registration.
     #[cfg(target_os = "linux")]
     fn get_registration_buffers(&self) -> Vec<libc::iovec>;
+
+    /// Get the VTable for this pool.
+    fn vtable(&self) -> &'static PoolVTable;
+
+    /// Get the raw pool data pointer (e.g. Rc<RefCell<Allocator>> as void ptr).
+    fn pool_data(&self) -> NonNull<()>;
 }
 
 pub trait BufPoolExt: BufPool + Clone {
@@ -131,6 +134,10 @@ pub struct FixedBuf {
     len: usize,
     cap: usize,
     global_index: u16,
+    // Metadata moved from Heap Header to Handle
+    pool_data: NonNull<()>,
+    vtable: &'static PoolVTable,
+    context: usize,
 }
 
 // Safety: This buffer is generally not Send because it refers to thread-local pool logic
@@ -138,15 +145,24 @@ pub struct FixedBuf {
 
 impl FixedBuf {
     /// # Safety
-    /// `ptr` must point to the payload (after BufferHeader).
-    /// The memory at `ptr - size_of::<BufferHeader>()` must be a valid initialized BufferHeader.
+    /// `ptr` must be valid and allocated by the pool associated with `vtable`.
     #[inline(always)]
-    pub unsafe fn new(ptr: NonNull<u8>, cap: usize, global_index: u16) -> Self {
+    pub unsafe fn new(
+        ptr: NonNull<u8>,
+        cap: usize,
+        global_index: u16,
+        pool_data: NonNull<()>,
+        vtable: &'static PoolVTable,
+        context: usize,
+    ) -> Self {
         Self {
             ptr,
             len: cap,
             cap,
             global_index,
+            pool_data,
+            vtable,
+            context,
         }
     }
 
@@ -202,32 +218,40 @@ impl FixedBuf {
         assert!(len <= self.cap);
         self.len = len;
     }
-
-    #[inline(always)]
-    pub(crate) unsafe fn header_ptr(&self) -> *mut BufferHeader {
-        unsafe { (self.ptr.as_ptr() as *mut BufferHeader).offset(-1) }
-    }
 }
 
 impl Drop for FixedBuf {
     #[inline(always)]
     fn drop(&mut self) {
         unsafe {
-            // Retrieve header
-            let header_ptr = self.header_ptr();
-            let header = &*header_ptr;
-
             let params = DeallocParams {
                 ptr: self.ptr,
                 cap: self.cap,
-                context: header.context,
+                context: self.context,
             };
 
-            // Call dealloc via vtable
-            (header.vtable.dealloc)(header.pool_data, params);
+            // Call dealloc via vtable stored in handle
+            (self.vtable.dealloc)(self.pool_data, params);
         }
     }
 }
+
+#[derive(Debug)]
+pub enum AllocError {
+    Layout(LayoutError),
+    Oom,
+}
+
+impl std::fmt::Display for AllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AllocError::Layout(e) => write!(f, "Layout error: {}", e),
+            AllocError::Oom => write!(f, "Out of memory"),
+        }
+    }
+}
+
+impl std::error::Error for AllocError {}
 
 pub(crate) struct AlignedMemory {
     ptr: NonNull<u8>,
@@ -235,21 +259,19 @@ pub(crate) struct AlignedMemory {
 }
 
 impl AlignedMemory {
-    fn new(size: usize, align: usize) -> Self {
-        use std::alloc::{alloc, handle_alloc_error};
-
-        let layout = Layout::from_size_align(size, align).unwrap();
+    fn new(size: usize, align: usize) -> Result<Self, AllocError> {
+        let layout = Layout::from_size_align(size, align).map_err(AllocError::Layout)?;
         // SAFETY: Only creating a sized allocation with valid layout
-        let ptr = unsafe { alloc(layout) };
+        let ptr = unsafe { std::alloc::alloc(layout) };
         if ptr.is_null() {
-            handle_alloc_error(layout);
+            return Err(AllocError::Oom);
         }
         // Zero initialize for safety
         unsafe { std::ptr::write_bytes(ptr, 0, size) };
-        Self {
+        Ok(Self {
             ptr: NonNull::new(ptr).unwrap(),
             layout,
-        }
+        })
     }
 
     fn as_ptr(&self) -> *mut u8 {
@@ -259,7 +281,6 @@ impl AlignedMemory {
 
 impl Drop for AlignedMemory {
     fn drop(&mut self) {
-        use std::alloc::dealloc;
-        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }

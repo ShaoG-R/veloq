@@ -11,7 +11,7 @@ fn test_file_integrity() {
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let pool = HybridPool::new();
+        let pool = HybridPool::new().unwrap();
         exec.register_buffers(&pool);
 
         let pool_clone = pool.clone();

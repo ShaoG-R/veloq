@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = ["veloq-bitset",
     "veloq-runtime",
     "veloq-wheel",
 ]

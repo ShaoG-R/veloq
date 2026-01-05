@@ -62,7 +62,7 @@ fn test_tcp_send_recv() {
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let pool = HybridPool::new();
+        let pool = HybridPool::new().unwrap();
         exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
@@ -200,7 +200,7 @@ fn test_tcp_multiple_connections() {
 fn test_tcp_large_data_transfer() {
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let pool = HybridPool::new();
+        let pool = HybridPool::new().unwrap();
         exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
@@ -315,7 +315,7 @@ fn test_tcp_connect_refused() {
 fn test_tcp_recv_zero_bytes() {
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let pool = HybridPool::new();
+        let pool = HybridPool::new().unwrap();
         exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
@@ -415,7 +415,7 @@ fn test_multithread_tcp_connections() {
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
-            let pool = HybridPool::new();
+            let pool = HybridPool::new().unwrap();
             exec.register_buffers(&pool);
 
             let listener =
@@ -468,7 +468,7 @@ fn test_multithread_tcp_echo() {
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
-            let pool = HybridPool::new();
+            let pool = HybridPool::new().unwrap();
             exec.register_buffers(&pool);
 
             let fut = async move {
@@ -504,7 +504,7 @@ fn test_multithread_tcp_echo() {
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
-            let pool = HybridPool::new();
+            let pool = HybridPool::new().unwrap();
             exec.register_buffers(&pool);
 
             let fut = async move {

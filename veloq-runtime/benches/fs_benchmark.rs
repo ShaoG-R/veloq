@@ -22,7 +22,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
 
     group.bench_function("write_1gb_concurrent", |b| {
         let mut exec = LocalExecutor::default();
-        let pool = BuddyPool::new();
+        let pool = BuddyPool::new().unwrap();
         exec.register_buffers(&pool);
 
         let pool_for_bench = pool.clone();
@@ -131,7 +131,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
     group.bench_function("write_32_files_concurrent", |b| {
         let mut exec = LocalExecutor::default();
-        let pool = BuddyPool::new();
+        let pool = BuddyPool::new().unwrap();
         exec.register_buffers(&pool);
 
         let pool_for_bench = pool.clone();
