@@ -103,24 +103,80 @@ impl Drop for IocpOp {
     }
 }
 
-// Ensure proper alignment
-#[repr(C)]
-pub union IocpOpPayload {
-    pub read: ManuallyDrop<ReadFixed>,
-    pub write: ManuallyDrop<WriteFixed>,
-    pub recv: ManuallyDrop<Recv>,
-    pub send: ManuallyDrop<OpSend>,
-    pub connect: ManuallyDrop<Connect>,
-    pub accept: ManuallyDrop<AcceptPayload>,
-    pub send_to: ManuallyDrop<SendToPayload>,
-    pub recv_from: ManuallyDrop<RecvFromPayload>,
-    pub open: ManuallyDrop<OpenPayload>,
-    pub close: ManuallyDrop<Close>,
-    pub fsync: ManuallyDrop<Fsync>,
-    pub sync_range: ManuallyDrop<SyncFileRange>,
-    pub fallocate: ManuallyDrop<Fallocate>,
-    pub wakeup: ManuallyDrop<WakeupPayload>,
-    pub timeout: ManuallyDrop<Timeout>,
+// ============================================================================
+// Macro Definition
+// ============================================================================
+
+macro_rules! define_iocp_ops {
+    (
+        $(
+            $OpType:ident {
+                field: $field:ident,
+                $(payload: $Payload:ty,)?
+                submit: $submit:path,
+                $(on_complete: $complete:path,)?
+                drop: $drop:path,
+                get_fd: $get_fd:path,
+                $(construct: $construct:expr,)?
+                $(destruct: $destruct:expr,)?
+            }
+        ),+ $(,)?
+    ) => {
+        // Ensure proper alignment
+        #[repr(C)]
+        pub union IocpOpPayload {
+            $(
+                pub $field: ManuallyDrop< define_iocp_ops!(@payload_type $OpType $(, $Payload)?) >,
+            )+
+        }
+
+        $(
+            impl IntoPlatformOp<IocpDriver> for $OpType {
+                fn into_platform_op(self) -> IocpOp {
+                    const TABLE: OpVTable = OpVTable {
+                        submit: $submit,
+                        on_complete: define_iocp_ops!(@optional_complete $($complete)?),
+                        drop: $drop,
+                        get_fd: $get_fd,
+                    };
+
+                    let payload = define_iocp_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
+
+                    IocpOp {
+                        header: OverlappedEntry::new(0),
+                        vtable: &TABLE,
+                        payload: IocpOpPayload {
+                            $field: ManuallyDrop::new(payload),
+                        },
+                    }
+                }
+
+                fn from_platform_op(op: IocpOp) -> Self {
+                    let op = ManuallyDrop::new(op);
+                    let payload = unsafe {
+                        ManuallyDrop::into_inner(std::ptr::read(&op.payload.$field))
+                    };
+                    define_iocp_ops!(@destruct payload, $($destruct)?)
+                }
+            }
+        )+
+    };
+
+    (@payload_type $OpType:ty) => { $OpType };
+    (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
+
+    (@optional_complete) => { None };
+    (@optional_complete $fn:path) => { Some($fn) };
+
+    // Default construct: return self
+    (@construct $self:expr, , $OpType:ty) => { $self };
+    // Custom construct
+    (@construct $self:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($self) };
+
+    // Default destruct: return payload (assumes payload is OpType)
+    (@destruct $payload:expr, ) => { $payload };
+    // Custom destruct
+    (@destruct $payload:expr, $destruct:expr) => { ($destruct)($payload) };
 }
 
 // ============================================================================
@@ -156,217 +212,151 @@ pub struct WakeupPayload {
 }
 
 // ============================================================================
-// IntoPlatformOp Implementations
+// Op Definitions
 // ============================================================================
 
-macro_rules! impl_into_iocp_op {
-    ($Type:ident, $Field:ident, $Submit:ident, $Complete:expr, $Drop:ident, $GetFd:ident) => {
-        impl IntoPlatformOp<IocpDriver> for $Type {
-            fn into_platform_op(self) -> IocpOp {
-                const TABLE: OpVTable = OpVTable {
-                    submit: submit::$Submit,
-                    on_complete: $Complete,
-                    drop: submit::$Drop,
-                    get_fd: submit::$GetFd,
-                };
-
-                IocpOp {
-                    header: OverlappedEntry::new(0),
-                    vtable: &TABLE,
-                    payload: IocpOpPayload {
-                        $Field: ManuallyDrop::new(self),
-                    },
-                }
-            }
-            fn from_platform_op(op: IocpOp) -> Self {
-                let op = ManuallyDrop::new(op);
-                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)) }
-            }
-        }
-    };
-    ($Type:ident, $Field:ident, $Submit:ident, $Complete:expr, $Drop:ident, $GetFd:ident, $Payload:ident, $Constructor:expr) => {
-        impl IntoPlatformOp<IocpDriver> for $Type {
-            fn into_platform_op(self) -> IocpOp {
-                const TABLE: OpVTable = OpVTable {
-                    submit: submit::$Submit,
-                    on_complete: $Complete,
-                    drop: submit::$Drop,
-                    get_fd: submit::$GetFd,
-                };
-
-                let construct: fn($Type) -> $Payload = $Constructor;
-                let payload = construct(self);
-
-                IocpOp {
-                    header: OverlappedEntry::new(0),
-                    vtable: &TABLE,
-                    payload: IocpOpPayload {
-                        $Field: ManuallyDrop::new(payload),
-                    },
-                }
-            }
-            fn from_platform_op(op: IocpOp) -> Self {
-                let op = ManuallyDrop::new(op);
-                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)).op }
-            }
-        }
-    };
-}
-
-impl_into_iocp_op!(
-    ReadFixed,
-    read,
-    submit_read_fixed,
-    None,
-    drop_read_fixed,
-    get_fd_read_fixed
-);
-impl_into_iocp_op!(
-    WriteFixed,
-    write,
-    submit_write_fixed,
-    None,
-    drop_write_fixed,
-    get_fd_write_fixed
-);
-impl_into_iocp_op!(Recv, recv, submit_recv, None, drop_recv, get_fd_recv);
-impl_into_iocp_op!(OpSend, send, submit_send, None, drop_send, get_fd_send);
-
-impl_into_iocp_op!(Close, close, submit_close, None, drop_close, get_fd_close);
-
-impl_into_iocp_op!(Fsync, fsync, submit_fsync, None, drop_fsync, get_fd_fsync);
-impl_into_iocp_op!(
-    SyncFileRange,
-    sync_range,
-    submit_sync_range,
-    None,
-    drop_sync_range,
-    get_fd_sync_range
-);
-impl_into_iocp_op!(
-    Fallocate,
-    fallocate,
-    submit_fallocate,
-    None,
-    drop_fallocate,
-    get_fd_fallocate
-);
-impl_into_iocp_op!(
-    Timeout,
-    timeout,
-    submit_timeout,
-    None,
-    drop_timeout,
-    get_fd_timeout
-);
-impl_into_iocp_op!(
-    Connect,
-    connect,
-    submit_connect,
-    Some(submit::on_complete_connect),
-    drop_connect,
-    get_fd_connect
-);
-
-impl_into_iocp_op!(
-    Accept,
-    accept,
-    submit_accept,
-    Some(submit::on_complete_accept),
-    drop_accept,
-    get_fd_accept,
-    AcceptPayload,
-    |op| AcceptPayload {
-        op,
-        accept_buffer: [0; 288],
-    }
-);
-
-impl_into_iocp_op!(
-    SendTo,
-    send_to,
-    submit_send_to,
-    None,
-    drop_send_to,
-    get_fd_send_to,
-    SendToPayload,
-    |op| {
-        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(op.addr);
-        let wsabuf = WSABUF {
-            len: op.buf.len() as u32,
-            buf: op.buf.as_slice().as_ptr() as *mut u8,
-        };
-        SendToPayload {
+define_iocp_ops! {
+    ReadFixed {
+        field: read,
+        submit: submit::submit_read_fixed,
+        drop: submit::drop_read_fixed,
+        get_fd: submit::get_fd_read_fixed,
+    },
+    WriteFixed {
+        field: write,
+        submit: submit::submit_write_fixed,
+        drop: submit::drop_write_fixed,
+        get_fd: submit::get_fd_write_fixed,
+    },
+    Recv {
+        field: recv,
+        submit: submit::submit_recv,
+        drop: submit::drop_recv,
+        get_fd: submit::get_fd_recv,
+    },
+    OpSend {
+        field: send,
+        submit: submit::submit_send,
+        drop: submit::drop_send,
+        get_fd: submit::get_fd_send,
+    },
+    Close {
+        field: close,
+        submit: submit::submit_close,
+        drop: submit::drop_close,
+        get_fd: submit::get_fd_close,
+    },
+    Fsync {
+        field: fsync,
+        submit: submit::submit_fsync,
+        drop: submit::drop_fsync,
+        get_fd: submit::get_fd_fsync,
+    },
+    SyncFileRange {
+        field: sync_range,
+        submit: submit::submit_sync_range,
+        drop: submit::drop_sync_range,
+        get_fd: submit::get_fd_sync_range,
+    },
+    Fallocate {
+        field: fallocate,
+        submit: submit::submit_fallocate,
+        drop: submit::drop_fallocate,
+        get_fd: submit::get_fd_fallocate,
+    },
+    Timeout {
+        field: timeout,
+        submit: submit::submit_timeout,
+        drop: submit::drop_timeout,
+        get_fd: submit::get_fd_timeout,
+    },
+    Connect {
+        field: connect,
+        submit: submit::submit_connect,
+        on_complete: submit::on_complete_connect,
+        drop: submit::drop_connect,
+        get_fd: submit::get_fd_connect,
+    },
+    Accept {
+        field: accept,
+        payload: AcceptPayload,
+        submit: submit::submit_accept,
+        on_complete: submit::on_complete_accept,
+        drop: submit::drop_accept,
+        get_fd: submit::get_fd_accept,
+        construct: |op| AcceptPayload {
             op,
-            wsabuf,
-            addr,
-            addr_len,
-        }
-    }
-);
-
-impl_into_iocp_op!(
-    Open,
-    open,
-    submit_open,
-    None,
-    drop_open,
-    get_fd_open,
-    OpenPayload,
-    |op| OpenPayload { op }
-);
-
-impl_into_iocp_op!(
-    Wakeup,
-    wakeup,
-    submit_wakeup,
-    None,
-    drop_wakeup,
-    get_fd_wakeup,
-    WakeupPayload,
-    |op| WakeupPayload { op }
-);
-
-// RecvFrom requires complex reconstruction so we keep it logic here,
-// OR we implement it manually. Kept manual to match logic.
-impl IntoPlatformOp<IocpDriver> for RecvFrom {
-    fn into_platform_op(mut self) -> IocpOp {
-        const TABLE: OpVTable = OpVTable {
-            submit: submit::submit_recv_from,
-            on_complete: None,
-            drop: submit::drop_recv_from,
-            get_fd: submit::get_fd_recv_from,
-        };
-
-        let wsabuf = WSABUF {
-            len: self.buf.capacity() as u32,
-            buf: self.buf.as_mut_ptr(),
-        };
-        let payload = RecvFromPayload {
-            op: self,
-            wsabuf,
-            flags: 0,
-            addr: SockAddrStorage::default(),
-            addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
-        };
-        IocpOp {
-            header: OverlappedEntry::new(0),
-            vtable: &TABLE,
-            payload: IocpOpPayload {
-                recv_from: ManuallyDrop::new(payload),
-            },
-        }
-    }
-    fn from_platform_op(op: IocpOp) -> Self {
-        let op = ManuallyDrop::new(op);
-        let payload = unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.recv_from)) };
-        let mut val = payload.op;
-        let len = payload.addr_len as usize;
-        let addr = unsafe {
-            let s = std::slice::from_raw_parts(&payload.addr as *const _ as *const u8, len);
-            crate::io::socket::to_socket_addr(s).ok()
-        };
-        val.addr = addr;
-        val
-    }
+            accept_buffer: [0; 288],
+        },
+        destruct: |p: AcceptPayload| p.op,
+    },
+    SendTo {
+        field: send_to,
+        payload: SendToPayload,
+        submit: submit::submit_send_to,
+        drop: submit::drop_send_to,
+        get_fd: submit::get_fd_send_to,
+        construct: |op: SendTo| {
+            let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(op.addr);
+            let wsabuf = WSABUF {
+                len: op.buf.len() as u32,
+                buf: op.buf.as_slice().as_ptr() as *mut u8,
+            };
+            SendToPayload {
+                op,
+                wsabuf,
+                addr,
+                addr_len,
+            }
+        },
+        destruct: |p: SendToPayload| p.op,
+    },
+    RecvFrom {
+        field: recv_from,
+        payload: RecvFromPayload,
+        submit: submit::submit_recv_from,
+        drop: submit::drop_recv_from,
+        get_fd: submit::get_fd_recv_from,
+        construct: |mut op: RecvFrom| {
+            let wsabuf = WSABUF {
+                len: op.buf.capacity() as u32,
+                buf: op.buf.as_mut_ptr(),
+            };
+            RecvFromPayload {
+                op,
+                wsabuf,
+                flags: 0,
+                addr: SockAddrStorage::default(),
+                addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
+            }
+        },
+        destruct: |p: RecvFromPayload| {
+            let mut val = p.op;
+            let len = p.addr_len as usize;
+            let addr = unsafe {
+                let s = std::slice::from_raw_parts(&p.addr as *const _ as *const u8, len);
+                crate::io::socket::to_socket_addr(s).ok()
+            };
+            val.addr = addr;
+            val
+        },
+    },
+    Open {
+        field: open,
+        payload: OpenPayload,
+        submit: submit::submit_open,
+        drop: submit::drop_open,
+        get_fd: submit::get_fd_open,
+        construct: |op| OpenPayload { op },
+        destruct: |p: OpenPayload| p.op,
+    },
+    Wakeup {
+        field: wakeup,
+        payload: WakeupPayload,
+        submit: submit::submit_wakeup,
+        drop: submit::drop_wakeup,
+        get_fd: submit::get_fd_wakeup,
+        construct: |op| WakeupPayload { op },
+        destruct: |p: WakeupPayload| p.op,
+    },
 }

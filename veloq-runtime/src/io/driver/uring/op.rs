@@ -59,24 +59,76 @@ impl Drop for UringOp {
     }
 }
 
-// Ensure proper alignment
-#[repr(C)]
-pub union UringOpPayload {
-    pub read: ManuallyDrop<ReadFixed>,
-    pub write: ManuallyDrop<WriteFixed>,
-    pub recv: ManuallyDrop<Recv>,
-    pub send: ManuallyDrop<OpSend>,
-    pub connect: ManuallyDrop<Connect>,
-    pub accept: ManuallyDrop<AcceptPayload>,
-    pub send_to: ManuallyDrop<SendToPayload>,
-    pub recv_from: ManuallyDrop<RecvFromPayload>,
-    pub open: ManuallyDrop<OpenPayload>,
-    pub close: ManuallyDrop<Close>,
-    pub fsync: ManuallyDrop<Fsync>,
-    pub sync_range: ManuallyDrop<SyncFileRange>,
-    pub fallocate: ManuallyDrop<Fallocate>,
-    pub wakeup: ManuallyDrop<WakeupPayload>,
-    pub timeout: ManuallyDrop<TimeoutPayload>,
+// ============================================================================
+// Macro Definition
+// ============================================================================
+
+macro_rules! define_uring_ops {
+    (
+        $(
+            $OpType:ident {
+                field: $field:ident,
+                $(payload: $Payload:ty,)?
+                make_sqe: $make_sqe:path,
+                on_complete: $complete:path,
+                drop: $drop:path,
+                get_fd: $get_fd:path,
+                $(construct: $construct:expr,)?
+                $(destruct: $destruct:expr,)?
+            }
+        ),+ $(,)?
+    ) => {
+        // Ensure proper alignment
+        #[repr(C)]
+        pub union UringOpPayload {
+            $(
+                pub $field: ManuallyDrop< define_uring_ops!(@payload_type $OpType $(, $Payload)?) >,
+            )+
+        }
+
+        $(
+            impl IntoPlatformOp<UringDriver> for $OpType {
+                fn into_platform_op(self) -> UringOp {
+                    const TABLE: OpVTable = OpVTable {
+                        make_sqe: $make_sqe,
+                        on_complete: $complete,
+                        drop: $drop,
+                        get_fd: $get_fd,
+                    };
+
+                    let payload = define_uring_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
+
+                    UringOp {
+                        vtable: &TABLE,
+                        payload: UringOpPayload {
+                            $field: ManuallyDrop::new(payload),
+                        },
+                    }
+                }
+
+                fn from_platform_op(op: UringOp) -> Self {
+                    let op = ManuallyDrop::new(op);
+                    let payload = unsafe {
+                        ManuallyDrop::into_inner(std::ptr::read(&op.payload.$field))
+                    };
+                    define_uring_ops!(@destruct payload, $($destruct)?)
+                }
+            }
+        )+
+    };
+
+    (@payload_type $OpType:ty) => { $OpType };
+    (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
+
+    // Default construct: return self
+    (@construct $self:expr, , $OpType:ty) => { $self };
+    // Custom construct
+    (@construct $self:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($self) };
+
+    // Default destruct: return payload (assumes payload is OpType)
+    (@destruct $payload:expr, ) => { $payload };
+    // Custom destruct
+    (@destruct $payload:expr, $destruct:expr) => { ($destruct)($payload) };
 }
 
 // ============================================================================
@@ -118,213 +170,146 @@ pub struct TimeoutPayload {
 }
 
 // ============================================================================
-// IntoPlatformOp Implementations
+// Op Definitions
 // ============================================================================
 
-macro_rules! impl_into_uring_op {
-    ($Type:ident, $Field:ident, $MakeSqe:ident, $OnComplete:ident, $Drop:ident, $GetFd:ident) => {
-        impl IntoPlatformOp<UringDriver> for $Type {
-            fn into_platform_op(self) -> UringOp {
-                const TABLE: OpVTable = OpVTable {
-                    make_sqe: submit::$MakeSqe,
-                    on_complete: submit::$OnComplete,
-                    drop: submit::$Drop,
-                    get_fd: submit::$GetFd,
-                };
-
-                UringOp {
-                    vtable: &TABLE,
-                    payload: UringOpPayload {
-                        $Field: ManuallyDrop::new(self),
-                    },
-                }
+define_uring_ops! {
+    ReadFixed {
+        field: read,
+        make_sqe: submit::make_sqe_read_fixed,
+        on_complete: submit::on_complete_read_fixed,
+        drop: submit::drop_read_fixed,
+        get_fd: submit::get_fd_read_fixed,
+    },
+    WriteFixed {
+        field: write,
+        make_sqe: submit::make_sqe_write_fixed,
+        on_complete: submit::on_complete_write_fixed,
+        drop: submit::drop_write_fixed,
+        get_fd: submit::get_fd_write_fixed,
+    },
+    Recv {
+        field: recv,
+        make_sqe: submit::make_sqe_recv,
+        on_complete: submit::on_complete_recv,
+        drop: submit::drop_recv,
+        get_fd: submit::get_fd_recv,
+    },
+    OpSend {
+        field: send,
+        make_sqe: submit::make_sqe_send,
+        on_complete: submit::on_complete_send,
+        drop: submit::drop_send,
+        get_fd: submit::get_fd_send,
+    },
+    Connect {
+        field: connect,
+        make_sqe: submit::make_sqe_connect,
+        on_complete: submit::on_complete_connect,
+        drop: submit::drop_connect,
+        get_fd: submit::get_fd_connect,
+    },
+    Close {
+        field: close,
+        make_sqe: submit::make_sqe_close,
+        on_complete: submit::on_complete_close,
+        drop: submit::drop_close,
+        get_fd: submit::get_fd_close,
+    },
+    Fsync {
+        field: fsync,
+        make_sqe: submit::make_sqe_fsync,
+        on_complete: submit::on_complete_fsync,
+        drop: submit::drop_fsync,
+        get_fd: submit::get_fd_fsync,
+    },
+    SyncFileRange {
+        field: sync_range,
+        make_sqe: submit::make_sqe_sync_range,
+        on_complete: submit::on_complete_sync_range,
+        drop: submit::drop_sync_range,
+        get_fd: submit::get_fd_sync_range,
+    },
+    Fallocate {
+        field: fallocate,
+        make_sqe: submit::make_sqe_fallocate,
+        on_complete: submit::on_complete_fallocate,
+        drop: submit::drop_fallocate,
+        get_fd: submit::get_fd_fallocate,
+    },
+    Accept {
+        field: accept,
+        payload: AcceptPayload,
+        make_sqe: submit::make_sqe_accept,
+        on_complete: submit::on_complete_accept,
+        drop: submit::drop_accept,
+        get_fd: submit::get_fd_accept,
+        construct: |op| AcceptPayload { op },
+        destruct: |p: AcceptPayload| p.op,
+    },
+    SendTo {
+        field: send_to,
+        payload: SendToPayload,
+        make_sqe: submit::make_sqe_send_to,
+        on_complete: submit::on_complete_send_to,
+        drop: submit::drop_send_to,
+        get_fd: submit::get_fd_send_to,
+        construct: |op: SendTo| {
+            let (msg_name, msg_namelen) = crate::io::socket::socket_addr_to_storage(op.addr);
+            SendToPayload {
+                op,
+                msg_name,
+                msg_namelen: msg_namelen as libc::socklen_t,
+                iovec: [unsafe { std::mem::zeroed() }],
+                msghdr: unsafe { std::mem::zeroed() },
             }
-            fn from_platform_op(op: UringOp) -> Self {
-                let op = ManuallyDrop::new(op);
-                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)) }
-            }
-        }
-    };
-    ($Type:ident, $Field:ident, $MakeSqe:ident, $OnComplete:ident, $Drop:ident, $GetFd:ident, $Payload:ident, $Constructor:expr) => {
-        impl IntoPlatformOp<UringDriver> for $Type {
-            fn into_platform_op(self) -> UringOp {
-                const TABLE: OpVTable = OpVTable {
-                    make_sqe: submit::$MakeSqe,
-                    on_complete: submit::$OnComplete,
-                    drop: submit::$Drop,
-                    get_fd: submit::$GetFd,
-                };
-
-                let construct: fn($Type) -> $Payload = $Constructor;
-                let payload = construct(self);
-
-                UringOp {
-                    vtable: &TABLE,
-                    payload: UringOpPayload {
-                        $Field: ManuallyDrop::new(payload),
-                    },
-                }
-            }
-            fn from_platform_op(op: UringOp) -> Self {
-                let op = ManuallyDrop::new(op);
-                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)).op }
-            }
-        }
-    };
-}
-
-impl_into_uring_op!(
-    ReadFixed,
-    read,
-    make_sqe_read_fixed,
-    on_complete_read_fixed,
-    drop_read_fixed,
-    get_fd_read_fixed
-);
-impl_into_uring_op!(
-    WriteFixed,
-    write,
-    make_sqe_write_fixed,
-    on_complete_write_fixed,
-    drop_write_fixed,
-    get_fd_write_fixed
-);
-impl_into_uring_op!(
-    Recv,
-    recv,
-    make_sqe_recv,
-    on_complete_recv,
-    drop_recv,
-    get_fd_recv
-);
-impl_into_uring_op!(
-    OpSend,
-    send,
-    make_sqe_send,
-    on_complete_send,
-    drop_send,
-    get_fd_send
-);
-impl_into_uring_op!(
-    Connect,
-    connect,
-    make_sqe_connect,
-    on_complete_connect,
-    drop_connect,
-    get_fd_connect
-);
-
-impl_into_uring_op!(
-    Close,
-    close,
-    make_sqe_close,
-    on_complete_close,
-    drop_close,
-    get_fd_close
-);
-impl_into_uring_op!(
-    Fsync,
-    fsync,
-    make_sqe_fsync,
-    on_complete_fsync,
-    drop_fsync,
-    get_fd_fsync
-);
-impl_into_uring_op!(
-    SyncFileRange,
-    sync_range,
-    make_sqe_sync_range,
-    on_complete_sync_range,
-    drop_sync_range,
-    get_fd_sync_range
-);
-impl_into_uring_op!(
-    Fallocate,
-    fallocate,
-    make_sqe_fallocate,
-    on_complete_fallocate,
-    drop_fallocate,
-    get_fd_fallocate
-);
-
-// Manual implementations for ops with extras
-impl_into_uring_op!(
-    Accept,
-    accept,
-    make_sqe_accept,
-    on_complete_accept,
-    drop_accept,
-    get_fd_accept,
-    AcceptPayload,
-    |op| AcceptPayload { op }
-);
-
-impl_into_uring_op!(
-    SendTo,
-    send_to,
-    make_sqe_send_to,
-    on_complete_send_to,
-    drop_send_to,
-    get_fd_send_to,
-    SendToPayload,
-    |op| {
-        let (msg_name, msg_namelen) = crate::io::socket::socket_addr_to_storage(op.addr);
-        SendToPayload {
+        },
+        destruct: |p: SendToPayload| p.op,
+    },
+    RecvFrom {
+        field: recv_from,
+        payload: RecvFromPayload,
+        make_sqe: submit::make_sqe_recv_from,
+        on_complete: submit::on_complete_recv_from,
+        drop: submit::drop_recv_from,
+        get_fd: submit::get_fd_recv_from,
+        construct: |op| RecvFromPayload {
             op,
-            msg_name,
-            msg_namelen: msg_namelen as libc::socklen_t,
+            msg_name: unsafe { std::mem::zeroed() },
+            msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
-        }
-    }
-);
-
-impl_into_uring_op!(
-    RecvFrom,
-    recv_from,
-    make_sqe_recv_from,
-    on_complete_recv_from,
-    drop_recv_from,
-    get_fd_recv_from,
-    RecvFromPayload,
-    |op| RecvFromPayload {
-        op,
-        msg_name: unsafe { std::mem::zeroed() },
-        msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-        iovec: [unsafe { std::mem::zeroed() }],
-        msghdr: unsafe { std::mem::zeroed() },
-    }
-);
-
-impl_into_uring_op!(
-    Open,
-    open,
-    make_sqe_open,
-    on_complete_open,
-    drop_open,
-    get_fd_open,
-    OpenPayload,
-    |op| OpenPayload { op }
-);
-
-impl_into_uring_op!(
-    Wakeup,
-    wakeup,
-    make_sqe_wakeup,
-    on_complete_wakeup,
-    drop_wakeup,
-    get_fd_wakeup,
-    WakeupPayload,
-    |op| WakeupPayload { op, buf: [0; 8] }
-);
-
-impl_into_uring_op!(
-    Timeout,
-    timeout,
-    make_sqe_timeout,
-    on_complete_timeout,
-    drop_timeout,
-    get_fd_timeout,
-    TimeoutPayload,
-    |op| TimeoutPayload { op, ts: [0; 2] }
-);
+        },
+        destruct: |p: RecvFromPayload| p.op,
+    },
+    Open {
+        field: open,
+        payload: OpenPayload,
+        make_sqe: submit::make_sqe_open,
+        on_complete: submit::on_complete_open,
+        drop: submit::drop_open,
+        get_fd: submit::get_fd_open,
+        construct: |op| OpenPayload { op },
+        destruct: |p: OpenPayload| p.op,
+    },
+    Wakeup {
+        field: wakeup,
+        payload: WakeupPayload,
+        make_sqe: submit::make_sqe_wakeup,
+        on_complete: submit::on_complete_wakeup,
+        drop: submit::drop_wakeup,
+        get_fd: submit::get_fd_wakeup,
+        construct: |op| WakeupPayload { op, buf: [0; 8] },
+        destruct: |p: WakeupPayload| p.op,
+    },
+    Timeout {
+        field: timeout,
+        payload: TimeoutPayload,
+        make_sqe: submit::make_sqe_timeout,
+        on_complete: submit::on_complete_timeout,
+        drop: submit::drop_timeout,
+        get_fd: submit::get_fd_timeout,
+        construct: |op| TimeoutPayload { op, ts: [0; 2] },
+        destruct: |p: TimeoutPayload| p.op,
+    },
+}
