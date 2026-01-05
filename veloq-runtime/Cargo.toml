@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 crossbeam-queue = "0.3.12"
-veloq-wheel = { path = "../veloq-wheel" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"
@@ -21,6 +20,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_Security"
 ] }
+veloq-wheel = { path = "../veloq-wheel" }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["html_reports"] }
