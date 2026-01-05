@@ -13,6 +13,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
 
     // 1GB Total Size
     const TOTAL_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+    let pool = BuddyPool::new().unwrap();
+    veloq_runtime::runtime::context::bind_pool(pool.clone());
 
     // 设置吞吐量统计单位
     group.throughput(Throughput::Bytes(TOTAL_SIZE));
@@ -22,8 +24,6 @@ fn benchmark_1gb_write(c: &mut Criterion) {
 
     group.bench_function("write_1gb_concurrent", |b| {
         let mut exec = LocalExecutor::default();
-        let pool = BuddyPool::new().unwrap();
-        let _ = veloq_runtime::runtime::context::try_bind_pool(pool.clone());
 
         b.iter(|| {
             let pool = pool.clone();
