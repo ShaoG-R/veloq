@@ -1,4 +1,7 @@
-use std::fmt;
+#![no_std]
+use core::fmt;
+
+extern crate alloc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BitSetError {
@@ -15,11 +18,11 @@ impl fmt::Display for BitSetError {
     }
 }
 
-impl std::error::Error for BitSetError {}
+impl core::error::Error for BitSetError {}
 
 #[derive(Debug, Clone)]
 pub struct BitSet {
-    bits: Vec<u64>,
+    bits: alloc::vec::Vec<u64>,
     size: usize,
 }
 
@@ -29,7 +32,7 @@ impl BitSet {
     pub fn new(capacity: usize) -> Self {
         let num_u64 = (capacity + 63) / 64;
         Self {
-            bits: vec![0; num_u64],
+            bits: alloc::vec![0; num_u64],
             size: capacity,
         }
     }
