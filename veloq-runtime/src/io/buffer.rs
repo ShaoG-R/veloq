@@ -1,4 +1,58 @@
-use std::ptr::NonNull;
+//! # Buffer Management for High-Performance I/O
+//!
+//! This module provides abstractions for managing memory buffers compatible with modern
+//! asynchronous I/O interfaces (like `io_uring` on Linux and IOCP on Windows).
+//!
+//! ## Core Components
+//!
+//! - [`FixedBuf`]: An owned handle to a buffer allocated from a pool. It ensures the underlying
+//!   memory remains valid as long as the handle exists. It uses type erasure (VTables) to
+//!   delegate deallocation back to the source pool.
+//! - [`BufPool`]: The base trait for memory pool implementations.
+//!
+//! ## Implementation Requirements
+//!
+//! Implementing a `BufPool` requires strict adherence to memory layout rules to support
+//! Zero-Copy and Direct I/O (O_DIRECT / FILE_FLAG_NO_BUFFERING) operations.
+//!
+//! ### 1. Memory Stability
+//! The pool must guarantee that the memory pointer in `FixedBuf` remains valid until
+//! `dealloc` is called. For `io_uring`, this often means the memory must be registered
+//! with the kernel and not moved.
+//!
+//! ### 2. Direct I/O Alignment (Critical)
+//! To support `DirectSync` operations, the buffers returned by the pool must satisfy
+//! strict alignment requirements imposed by the OS and hardware drivers:
+//!
+//! - **Payload Alignment**: The `ptr` points to the start of the user data payload.
+//!   This address MUST be aligned to at least **512 bytes** (Sector Size). Ideally, align
+//!   to **4096 bytes** (Page Size) for best performance.
+//!   
+//! - **Backing Memory Alignment**: The underlying allocation (Slab, Arena, or Block)
+//!   should be **Page Aligned (4096 bytes)**. This prevents splitting pages across
+//!   DRAM boundaries in ways that might degrade DMA performance.
+//!
+//! ### 3. Intrusive Header Layout
+//! `FixedBuf` relies on an intrusive [`BufferHeader`] stored *before* the payload pointer
+//! to manage lifecycle and context.
+//!
+//! ```text
+//! [ ... Padding / Alignment ... | BufferHeader | Payload (Aligned 512) ... ]
+//!                                              ^
+//!                                              |
+//!                                        FixedBuf.ptr
+//! ```
+//!
+//! **Implementors MUST ensure:**
+//! - The memory at `ptr - size_of::<BufferHeader>()` is valid and writeable.
+//! - The `BufferHeader` placement does **not** violate the 512-byte alignment of the Payload.
+//!   - *Incorrect*: `[ Header (24 bytes) | Payload ]` -> If Header is at 0, Payload is at 24 (Bad).
+//!   - *Correct*:   `[ ... | Header | Padding | Payload ]` -> Payload is at 512.
+//!
+//! See [`buddy::BuddyPool`] and [`hybrid::HybridPool`] for reference implementations
+//! that use `std::alloc` with specific layouts to satisfy these constraints.
+
+use std::{alloc::Layout, ptr::NonNull};
 
 pub mod buddy;
 pub mod hybrid;
@@ -167,5 +221,40 @@ impl Drop for FixedBuf {
             // Call dealloc via vtable
             (header.vtable.dealloc)(header.pool_data, params);
         }
+    }
+}
+
+pub(crate) struct AlignedMemory {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedMemory {
+    fn new(size: usize, align: usize) -> Self {
+        use std::alloc::{alloc, handle_alloc_error};
+
+        let layout = Layout::from_size_align(size, align).unwrap();
+        // SAFETY: Only creating a sized allocation with valid layout
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        // Zero initialize for safety
+        unsafe { std::ptr::write_bytes(ptr, 0, size) };
+        Self {
+            ptr: NonNull::new(ptr).unwrap(),
+            layout,
+        }
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for AlignedMemory {
+    fn drop(&mut self) {
+        use std::alloc::dealloc;
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }

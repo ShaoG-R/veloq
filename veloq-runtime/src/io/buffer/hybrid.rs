@@ -1,11 +1,17 @@
 use crate::io::buffer::BufPoolExt;
 
 use super::{
-    AllocResult, BufPool, BufferHeader, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX, PoolVTable,
+    AlignedMemory, AllocResult, BufPool, BufferHeader, DeallocParams, FixedBuf,
+    NO_REGISTRATION_INDEX, PoolVTable,
 };
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
+
+// Alignment requirement for Direct I/O
+const ALIGNMENT: usize = 512;
+const PAGE_SIZE: usize = 4096;
 
 const SIZE_4K: usize = 4096;
 const SIZE_16K: usize = 16384;
@@ -87,7 +93,7 @@ const GLOBAL_ALLOC_CONTEXT: usize = usize::MAX;
 
 struct Slab {
     config: SlabConfig,
-    memory: Vec<u8>,
+    memory: AlignedMemory,
     free_indices: Vec<usize>,
     global_index_offset: u16,
 }
@@ -119,7 +125,7 @@ impl HybridAllocator {
 
         for config in SLABS.iter() {
             let total_size = config.block_size * config.count;
-            let memory = vec![0; total_size]; // zero init
+            let memory = AlignedMemory::new(total_size, PAGE_SIZE);
 
             // Free indices stack: initially all indices 0..count
             let free_indices: Vec<usize> = (0..config.count).collect();
@@ -156,7 +162,7 @@ impl HybridAllocator {
             if slab.config.block_size >= needed_total {
                 if let Some(index) = slab.free_indices.pop() {
                     let block_ptr =
-                        unsafe { slab.memory.as_mut_ptr().add(index * slab.config.block_size) };
+                        unsafe { slab.memory.as_ptr().add(index * slab.config.block_size) };
 
                     // Encode slab_idx (0-2) and index (0-1024) into usize context
                     let context = (slab_idx << 16) | index;
@@ -175,10 +181,15 @@ impl HybridAllocator {
 
         // Fallback: Global Allocator
         if needed_total > SIZE_64K {
-            let mut vec: Vec<u8> = Vec::with_capacity(needed_total);
-            let block_ptr = vec.as_mut_ptr();
-            let cap = vec.capacity();
-            std::mem::forget(vec);
+            let layout = Layout::from_size_align(needed_total, PAGE_SIZE).unwrap();
+            let block_ptr = unsafe { alloc(layout) };
+            if block_ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            // Zero init
+            unsafe { std::ptr::write_bytes(block_ptr, 0, needed_total) };
+
+            let cap = needed_total;
 
             return Some(RawAlloc {
                 ptr: unsafe { NonNull::new_unchecked(block_ptr) },
@@ -199,8 +210,8 @@ impl HybridAllocator {
     /// Caller must ensure block_ptr is valid and matches context
     pub unsafe fn dealloc(&mut self, block_ptr: NonNull<u8>, cap: usize, context: usize) {
         if context == GLOBAL_ALLOC_CONTEXT {
-            // Reconstruct Vec to drop it
-            let _vec = unsafe { Vec::from_raw_parts(block_ptr.as_ptr(), 0, cap) };
+            let layout = Layout::from_size_align(cap, PAGE_SIZE).unwrap();
+            unsafe { dealloc(block_ptr.as_ptr(), layout) };
             return;
         }
 
@@ -238,9 +249,9 @@ unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     let pool_rc = unsafe { Rc::from_raw(pool_data.as_ptr() as *const RefCell<HybridAllocator>) };
 
     // Calculate block start and total capacity
-    let header_size = std::mem::size_of::<BufferHeader>();
-    let block_ptr = unsafe { params.ptr.as_ptr().sub(header_size) };
-    let total_cap = params.cap + header_size;
+    let offset = ALIGNMENT;
+    let block_ptr = unsafe { params.ptr.as_ptr().sub(offset) };
+    let total_cap = params.cap + offset;
 
     let mut inner = pool_rc.borrow_mut();
     unsafe {
@@ -277,23 +288,24 @@ impl HybridPool {
     // Helper to return proper types for FixedBuf or AllocResult
     fn alloc_mem_inner(&self, size: usize) -> Option<(NonNull<u8>, usize, u16)> {
         let mut inner = self.inner.borrow_mut();
-        let header_size = std::mem::size_of::<BufferHeader>();
-        let needed_total = size + header_size;
+        let offset = ALIGNMENT;
+        let needed_total = size + offset;
 
         if let Some(raw) = inner.alloc(needed_total) {
             let block_ptr = raw.ptr.as_ptr();
-            let header_ptr = block_ptr as *mut BufferHeader;
             let pool_raw = Rc::into_raw(self.inner.clone());
 
             unsafe {
+                let payload_ptr = block_ptr.add(offset);
+                let header_ptr = (payload_ptr as *mut BufferHeader).offset(-1);
+
                 (*header_ptr) = BufferHeader {
                     vtable: &HYBRID_POOL_VTABLE,
                     pool_data: NonNull::new_unchecked(pool_raw as *mut ()),
                     context: raw.context,
                 };
 
-                let payload_ptr = block_ptr.add(header_size);
-                let payload_cap = raw.cap - header_size;
+                let payload_cap = raw.cap - offset;
 
                 Some((
                     NonNull::new_unchecked(payload_ptr),
@@ -370,10 +382,10 @@ mod tests {
         assert_eq!(allocator.count_free(2), 32); // 64K slab
 
         // Alloc 4K (fits in 4K slab?)
-        // needed_total = 4096 (payload) + 24 (header) = 4120
-        // best_fit(4120) -> Size16K.
+        // needed_total = 4096 (payload) + 512 (offset) = 4608
+        // best_fit(4608) -> Size16K.
         // So it takes from slab 1 (16K).
-        let raw = allocator.alloc(4120).unwrap();
+        let raw = allocator.alloc(4608).unwrap();
         assert_eq!(raw.cap, SIZE_16K);
         assert_eq!(raw.context >> 16, 1); // Slab index 1
         assert_eq!(allocator.count_free(0), 1024);
@@ -386,9 +398,9 @@ mod tests {
     #[test]
     fn test_allocator_small() {
         let mut allocator = HybridAllocator::new();
-        // Request very small size. 100 bytes + 24
-        let raw = allocator.alloc(124).unwrap();
-        // best_fit(124) -> Size4K
+        // Request very small size. 100 bytes + 512
+        let raw = allocator.alloc(612).unwrap();
+        // best_fit(612) -> Size4K
         assert_eq!(raw.cap, SIZE_4K);
         assert_eq!(raw.context >> 16, 0); // Slab 0
         assert_eq!(allocator.count_free(0), 1023);

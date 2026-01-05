@@ -1,6 +1,8 @@
 use crate::io::buffer::BufPoolExt;
 
-use super::{AllocResult, BufPool, BufferHeader, DeallocParams, FixedBuf, PoolVTable};
+use super::{
+    AlignedMemory, AllocResult, BufPool, BufferHeader, DeallocParams, FixedBuf, PoolVTable,
+};
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -8,6 +10,9 @@ use std::rc::Rc;
 // Buddy System Constants
 const ARENA_SIZE: usize = 16 * 1024 * 1024; // 16MB Total
 const MIN_BLOCK_SIZE: usize = 4096; // 4KB
+
+// Alignment requirement for Direct I/O (512 is standard sector size, safe for most O_DIRECT)
+const ALIGNMENT: usize = 512;
 
 // Number of orders: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB
 const NUM_ORDERS: usize = 13;
@@ -105,7 +110,7 @@ struct FreeNode {
 /// 独立于 BufPool trait，便于单独测试
 struct BuddyAllocator {
     // 保持对内存的所有权
-    _memory_owner: Vec<u8>,
+    _memory_owner: AlignedMemory,
     // 内存基地址，用于指针计算
     base_ptr: *mut u8,
 
@@ -120,8 +125,8 @@ struct BuddyAllocator {
 impl BuddyAllocator {
     fn new() -> Self {
         // 分配 Arena 内存
-        let mut memory = vec![0; ARENA_SIZE];
-        let base_ptr = memory.as_mut_ptr();
+        let memory = AlignedMemory::new(ARENA_SIZE, 4096);
+        let base_ptr = memory.as_ptr();
 
         let mut free_heads = [None; NUM_ORDERS];
 
@@ -355,11 +360,10 @@ unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     // Rc is now alive again (and will drop at end of scope, decrementing validity)
 
     // 2. Adjust params to find original block start
-    // In alloc: ptr = block_start + header_size
-    // So block_start = ptr - header_size
-    // Header size matches BufferHeader size
-    let header_size = std::mem::size_of::<BufferHeader>();
-    let block_start_ptr = unsafe { params.ptr.as_ptr().sub(header_size) };
+    // In alloc: ptr = block_start + ALIGNMENT
+    // So block_start = ptr - ALIGNMENT
+    let offset = ALIGNMENT;
+    let block_start_ptr = unsafe { params.ptr.as_ptr().sub(offset) };
     let block_start_non_null = unsafe { NonNull::new_unchecked(block_start_ptr) };
 
     // 3. Recover size from context (Buddy uses Order in context)
@@ -390,20 +394,20 @@ impl BuddyPool {
         let mut inner = self.inner.borrow_mut();
 
         if let Some((block_ptr, actual_size)) = inner.alloc(size) {
-            // Reserve space for header
-            let header_size = std::mem::size_of::<BufferHeader>();
+            let offset = ALIGNMENT;
             let capacity = actual_size.size();
 
-            // Check if capacity is enough (should be for reasonable sizes, min 4K)
-            if capacity <= header_size {
-                // Return block immediately if too small (should not happen with 4K min)
+            // Check if capacity is enough for alignment overhead
+            if capacity <= offset {
                 unsafe { inner.dealloc(block_ptr, actual_size) };
                 return None;
             }
 
             // Write header
             unsafe {
-                let header_ptr = block_ptr.as_ptr() as *mut BufferHeader;
+                let payload_ptr = block_ptr.as_ptr().add(offset);
+                // FixedBuf expects header at payload_ptr - sizeof(BufferHeader)
+                let header_ptr = (payload_ptr as *mut BufferHeader).offset(-1);
 
                 // Increment Rc strong count for the FixedBuf lifecycle
                 let pool_raw = Rc::into_raw(self.inner.clone());
@@ -415,9 +419,11 @@ impl BuddyPool {
                 };
 
                 // Setup FixedBuf
-                // Payload starts after header
-                let payload_ptr = block_ptr.as_ptr().add(header_size);
-                let payload_len = capacity - header_size;
+                // Payload starts at offset, length is capacity - offset
+                // This guarantees:
+                // 1. Payload address is (base + offset) -> aligned if base is aligned
+                // 2. Payload length is (BlockSize - offset) -> aligned if BlockSize and offset are aligned
+                let payload_len = capacity - offset;
 
                 return Some(FixedBuf::new(
                     NonNull::new_unchecked(payload_ptr),
@@ -430,8 +436,8 @@ impl BuddyPool {
     }
 
     pub fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
-        let header_size = std::mem::size_of::<BufferHeader>();
-        let needed = len.checked_add(header_size)?;
+        let offset = ALIGNMENT;
+        let needed = len.checked_add(offset)?;
         let size = BufferSize::best_fit(needed)?;
 
         self.alloc(size).map(|mut buf| {
@@ -462,17 +468,20 @@ impl BufPool for BuddyPool {
 
         match inner.alloc(buf_size) {
             Some((block_ptr, actual_size)) => {
-                let header_size = std::mem::size_of::<BufferHeader>();
+                let offset = ALIGNMENT;
                 let capacity = actual_size.size();
 
-                if capacity <= header_size {
+                if capacity <= offset {
                     unsafe { inner.dealloc(block_ptr, actual_size) };
                     return AllocResult::Failed;
                 }
 
                 unsafe {
-                    // Write Header
-                    let header_ptr = block_ptr.as_ptr() as *mut BufferHeader;
+                    // Start payload at aligned offset
+                    let payload_ptr = block_ptr.as_ptr().add(offset);
+                    // Header is just before payload
+                    let header_ptr = (payload_ptr as *mut BufferHeader).offset(-1);
+
                     let pool_raw = Rc::into_raw(self.inner.clone());
 
                     (*header_ptr) = BufferHeader {
@@ -481,14 +490,13 @@ impl BufPool for BuddyPool {
                         context: actual_size.order(),
                     };
 
-                    let payload_ptr = block_ptr.as_ptr().add(header_size);
-                    let payload_len = capacity - header_size;
+                    let payload_len = capacity - offset;
 
                     AllocResult::Allocated {
                         ptr: NonNull::new_unchecked(payload_ptr),
                         cap: payload_len,
                         global_index: 0,
-                        context: actual_size.order(), // this context is somewhat redundant if header has it, but alloc_mem returns it
+                        context: actual_size.order(),
                     }
                 }
             }
@@ -547,9 +555,8 @@ mod tests {
     fn test_pool_integration() {
         let pool = BuddyPool::new();
         let buf = pool.alloc(BufferSize::Size4K).unwrap();
-        // Capacity should be 4096 - 24 = 4072
-        let header_size = std::mem::size_of::<BufferHeader>();
-        assert_eq!(buf.capacity(), 4096 - header_size);
+        // Capacity should be 4096 - 512 = 3584
+        assert_eq!(buf.capacity(), 4096 - ALIGNMENT);
         drop(buf);
         // Ensure no panic on drop and proper rc cleanup
     }
