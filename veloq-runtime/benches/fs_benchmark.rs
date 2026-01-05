@@ -22,8 +22,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
 
     group.bench_function("write_1gb_concurrent", |b| {
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(BuddyPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = BuddyPool::new();
+        exec.register_buffers(&pool);
 
         let pool_for_bench = pool.clone();
 
@@ -48,7 +48,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                     .create(true)
                     .truncate(true)
                     .buffering(BufferingMode::DirectSync)
-                    .open(&file_path, pool.as_ref())
+                    .open(&file_path, &pool)
                     .await
                     .expect("Failed to create");
 
@@ -131,8 +131,8 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
     group.bench_function("write_32_files_concurrent", |b| {
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(BuddyPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = BuddyPool::new();
+        exec.register_buffers(&pool);
 
         let pool_for_bench = pool.clone();
 
@@ -162,7 +162,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         .create(true)
                         .truncate(true)
                         .buffering(BufferingMode::DirectSync)
-                        .open(&path, pool.as_ref())
+                        .open(&path, &pool)
                         .await
                         .expect("Failed to create");
                     let file = Rc::new(file);

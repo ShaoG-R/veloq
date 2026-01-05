@@ -9,8 +9,10 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-// Alignment requirement for Direct I/O
-const ALIGNMENT: usize = 512;
+// Alignment requirement for Direct I/O.
+// We use 4096 (Page Size) to ensure compatibility with strict Direct I/O requirements.
+// This also ensures that the payload length (Capacity) remains a multiple of 4096.
+const ALIGNMENT: usize = 4096;
 const PAGE_SIZE: usize = 4096;
 
 const SIZE_4K: usize = 4096;

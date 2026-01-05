@@ -3,7 +3,6 @@ use crate::io::buffer::HybridPool;
 use crate::runtime::executor::LocalExecutor;
 use std::fs;
 use std::path::Path;
-use std::rc::Rc;
 
 #[test]
 fn test_file_integrity() {
@@ -12,8 +11,8 @@ fn test_file_integrity() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
 
         let pool_clone = pool.clone();
 
@@ -28,7 +27,7 @@ fn test_file_integrity() {
 
             // 1. Create and Write
             {
-                let file = File::create(&file_path, pool.as_ref())
+                let file = File::create(&file_path, &pool)
                     .await
                     .expect("Failed to create");
 
@@ -46,9 +45,7 @@ fn test_file_integrity() {
 
             // 2. Open and Read
             {
-                let file = File::open(&file_path, pool.as_ref())
-                    .await
-                    .expect("Failed to open");
+                let file = File::open(&file_path, &pool).await.expect("Failed to open");
 
                 let read_buf = pool.alloc(size).unwrap();
                 // read_buf.set_len(read_buf.capacity()); // Default is full capacity

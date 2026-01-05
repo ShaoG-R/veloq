@@ -11,8 +11,10 @@ use std::rc::Rc;
 const ARENA_SIZE: usize = 16 * 1024 * 1024; // 16MB Total
 const MIN_BLOCK_SIZE: usize = 4096; // 4KB
 
-// Alignment requirement for Direct I/O (512 is standard sector size, safe for most O_DIRECT)
-const ALIGNMENT: usize = 512;
+// Alignment requirement for Direct I/O.
+// We use 4096 (Page Size) to ensure compatibility with strict Direct I/O requirements.
+// This also ensures that the payload length (Capacity) remains a multiple of 4096.
+const ALIGNMENT: usize = 4096;
 
 // Number of orders: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB
 const NUM_ORDERS: usize = 13;
@@ -554,9 +556,11 @@ mod tests {
     #[test]
     fn test_pool_integration() {
         let pool = BuddyPool::new();
-        let buf = pool.alloc(BufferSize::Size4K).unwrap();
-        // Capacity should be 4096 - 512 = 3584
-        assert_eq!(buf.capacity(), 4096 - ALIGNMENT);
+        // With 4096 alignment, a 4K block has 0 capacity (4096 - 4096).
+        // Minimal usable block is 8K.
+        let buf = pool.alloc(BufferSize::Size8K).unwrap();
+        // Capacity should be 8192 - 4096 = 4096
+        assert_eq!(buf.capacity(), 8192 - ALIGNMENT);
         drop(buf);
         // Ensure no panic on drop and proper rc cleanup
     }

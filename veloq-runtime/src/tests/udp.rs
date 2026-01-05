@@ -46,8 +46,8 @@ fn test_udp_send_recv() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
 
         let pool_clone = pool.clone();
 
@@ -102,8 +102,8 @@ fn test_udp_echo() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
 
         let pool_clone = pool.clone();
 
@@ -180,8 +180,8 @@ fn test_udp_echo() {
 fn test_udp_multiple_messages() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
@@ -238,8 +238,8 @@ fn test_udp_multiple_messages() {
 fn test_udp_large_data() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
@@ -333,8 +333,8 @@ fn test_multithread_udp() {
 
             runtime.spawn_worker(move || {
                 let exec = LocalExecutor::new();
-                let pool = Rc::new(HybridPool::new());
-                exec.register_buffers(pool.as_ref());
+                let pool = HybridPool::new();
+                exec.register_buffers(&pool);
                 let driver = exec.driver_handle();
 
                 // Each worker creates its own UDP sockets and tests send/recv
@@ -399,8 +399,8 @@ fn test_multithread_udp_echo() {
         // Worker 1: Echo server
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
-            let pool = Rc::new(HybridPool::new());
-            exec.register_buffers(pool.as_ref());
+            let pool = HybridPool::new();
+            exec.register_buffers(&pool);
             let driver = exec.driver_handle();
 
             let fut = async move {
@@ -434,8 +434,8 @@ fn test_multithread_udp_echo() {
         // Worker 2: Client
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
-            let pool = Rc::new(HybridPool::new());
-            exec.register_buffers(pool.as_ref());
+            let pool = HybridPool::new();
+            exec.register_buffers(&pool);
             let driver = exec.driver_handle();
 
             let fut = async move {
@@ -491,8 +491,8 @@ fn test_multithread_concurrent_udp_clients() {
         // Server worker
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
-            let pool = Rc::new(HybridPool::new());
-            exec.register_buffers(pool.as_ref());
+            let pool = HybridPool::new();
+            exec.register_buffers(&pool);
             let driver = exec.driver_handle();
 
             let fut = async move {
@@ -527,8 +527,8 @@ fn test_multithread_concurrent_udp_clients() {
             let counter = message_count.clone();
             runtime.spawn_worker(move || {
                 let exec = LocalExecutor::new();
-                let pool = Rc::new(HybridPool::new());
-                exec.register_buffers(pool.as_ref());
+                let pool = HybridPool::new();
+                exec.register_buffers(&pool);
                 let driver = exec.driver_handle();
 
                 let fut = async move {

@@ -62,8 +62,8 @@ fn test_tcp_send_recv() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
         let listener =
@@ -200,8 +200,8 @@ fn test_tcp_multiple_connections() {
 fn test_tcp_large_data_transfer() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
         let listener =
@@ -315,8 +315,8 @@ fn test_tcp_connect_refused() {
 fn test_tcp_recv_zero_bytes() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let pool = Rc::new(HybridPool::new());
-        exec.register_buffers(pool.as_ref());
+        let pool = HybridPool::new();
+        exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
         let listener =
@@ -415,8 +415,8 @@ fn test_multithread_tcp_connections() {
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
-            let pool = Rc::new(HybridPool::new());
-            exec.register_buffers(pool.as_ref());
+            let pool = HybridPool::new();
+            exec.register_buffers(&pool);
 
             let listener =
                 TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
@@ -468,8 +468,8 @@ fn test_multithread_tcp_echo() {
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
-            let pool = Rc::new(HybridPool::new());
-            exec.register_buffers(pool.as_ref());
+            let pool = HybridPool::new();
+            exec.register_buffers(&pool);
 
             let fut = async move {
                 let listener = TcpListener::bind("127.0.0.1:0", driver.clone())
@@ -504,8 +504,8 @@ fn test_multithread_tcp_echo() {
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
-            let pool = Rc::new(HybridPool::new());
-            exec.register_buffers(pool.as_ref());
+            let pool = HybridPool::new();
+            exec.register_buffers(&pool);
 
             let fut = async move {
                 // Wait for server address
