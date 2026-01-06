@@ -596,6 +596,7 @@ impl LocalExecutor {
                 if *main_woken.borrow() {
                     *main_woken.borrow_mut() = false;
                     did_work = true;
+                    executed += 1;
                     if let Poll::Ready(val) = pinned_future.as_mut().poll(&mut cx) {
                         return val;
                     }
