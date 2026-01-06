@@ -533,6 +533,24 @@ impl LocalExecutor {
     }
 }
 
+impl Drop for LocalExecutor {
+    fn drop(&mut self) {
+        // Clear the task queue to drop all futures.
+        // This explicitly drops tasks (and their buffers/sockets) before the driver is dropped.
+        if let Ok(mut queue) = self.queue.try_borrow_mut() {
+            queue.clear();
+        }
+
+        // Pump the driver to process cancellations and completions.
+        // This is critical for IOCP safety to avoid Heap Corruption from pending cancellations,
+        // as the kernel might try to write to buffers that are being freed.
+        if let Ok(mut driver) = self.driver.try_borrow_mut() {
+            let _ = driver.submit_queue();
+            let _ = driver.process_completions();
+        }
+    }
+}
+
 impl Default for LocalExecutor {
     fn default() -> Self {
         Self::new()

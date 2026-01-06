@@ -7,6 +7,7 @@ use veloq_runtime::LocalExecutor;
 use veloq_runtime::fs::{BufferingMode, File};
 use veloq_runtime::io::buffer::BuddyPool;
 use veloq_runtime::io::buffer::buddy::BufferSize;
+use veloq_runtime::spawn_local;
 
 fn benchmark_1gb_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("fs_throughput");
@@ -29,7 +30,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
             let pool = pool.clone();
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(async move {
-                let cx = veloq_runtime::runtime::context::current();
+                // let cx = veloq_runtime::runtime::context::current();
 
                 const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
                 let chunk_size = CHUNK_SIZE_ENUM.size();
@@ -75,7 +76,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                             let fut = async move { file_clone.write_at(buf, current_offset).await };
 
                             // Use cx.spawn_local
-                            tasks.push_back(cx.spawn_local(fut));
+                            tasks.push_back(spawn_local(fut));
                             offset += write_len as u64;
                             continue;
                         }
@@ -136,7 +137,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
             let pool_inner = pool_for_bench.clone();
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(async move {
-                let cx = veloq_runtime::runtime::context::current();
+                // let cx = veloq_runtime::runtime::context::current();
                 let pool = pool_inner;
                 let _ = veloq_runtime::runtime::context::try_bind_pool(pool.clone());
 
@@ -209,7 +210,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                 let fut =
                                     async move { file_clone.write_at(buf, current_offset).await };
 
-                                tasks.push_back(cx.spawn_local(fut));
+                                tasks.push_back(spawn_local(fut));
                                 offsets[idx] += write_len as u64;
                                 continue;
                             }

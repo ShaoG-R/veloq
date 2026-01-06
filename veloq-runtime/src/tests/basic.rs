@@ -1,7 +1,7 @@
 //! Basic runtime tests for spawn and spawn_local functionality.
 
 use crate::runtime::executor::{LocalExecutor, Runtime};
-// use crate::{spawn, spawn_local}; // globals removed
+use crate::spawn_local;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,8 +17,8 @@ fn test_spawn_local_basic() {
     let result_clone = result.clone();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
-        let handle = cx.spawn_local(async move {
+        // let cx = crate::runtime::context::current();
+        let handle = spawn_local(async move {
             *result_clone.borrow_mut() = 42;
             "done"
         });
@@ -38,9 +38,9 @@ fn test_spawn_local_not_send() {
     let data_clone = data.clone();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
+        // let cx = crate::runtime::context::current();
         // This would fail to compile with spawn()
-        let handle = cx.spawn_local(async move {
+        let handle = spawn_local(async move {
             assert_eq!(data_clone.len(), 3);
             data_clone[0] + data_clone[1] + data_clone[2]
         });
@@ -57,14 +57,11 @@ fn test_nested_spawn_local() {
     let c1 = counter.clone();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
-        let cx2 = cx.clone();
-        let h1 = cx.spawn_local(async move {
+        let h1 = spawn_local(async move {
             *c1.borrow_mut() += 1;
             let c2 = c1.clone();
-            let cx3 = cx2.clone(); // Capture cx for inner task
 
-            let h2 = cx3.spawn_local(async move {
+            let h2 = spawn_local(async move {
                 *c2.borrow_mut() += 10;
             });
             h2.await;

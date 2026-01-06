@@ -3,6 +3,7 @@
 use crate::io::buffer::{FixedBuf, HybridPool};
 use crate::net::udp::UdpSocket;
 use crate::runtime::executor::{LocalExecutor, Runtime};
+use crate::spawn_local;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,10 +27,7 @@ fn test_udp_bind() {
     let mut exec = LocalExecutor::default();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
-        let driver = cx.driver();
-        let socket =
-            UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind UDP socket");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
 
         let addr = socket.local_addr().expect("Failed to get local address");
 
@@ -52,15 +50,10 @@ fn test_udp_send_recv() {
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
-            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
 
-            let driver = cx.driver();
-
-            let socket1 =
-                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 1");
-            let socket2 =
-                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 2");
+            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+            let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
             let addr2 = socket2.local_addr().expect("Failed to get addr2");
@@ -73,7 +66,7 @@ fn test_udp_send_recv() {
             let pool_clone = pool.clone();
 
             // Receiver task: socket1 waits for data
-            let handler = cx.spawn_local(async move {
+            let handler = spawn_local(async move {
                 let buf = alloc_buf(&pool_clone, size);
                 // buf.set_len(buf.capacity());
                 let (result, _buf) = socket1_clone.recv_from(buf).await;
@@ -108,15 +101,10 @@ fn test_udp_echo() {
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
-            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
-
-            let driver = cx.driver();
             // Create server and client sockets
-            let server = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                .expect("Failed to bind server socket");
-            let client = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                .expect("Failed to bind client socket");
+            let server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
+            let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
 
             let server_addr = server.local_addr().expect("Failed to get server address");
             let client_addr = client.local_addr().expect("Failed to get client address");
@@ -129,7 +117,7 @@ fn test_udp_echo() {
             let pool_server = pool.clone();
 
             // Server task: receive and echo back
-            let server_h = cx.spawn_local(async move {
+            let server_h = spawn_local(async move {
                 // Receive data
                 let buf = pool_server.alloc(size).unwrap();
                 let (result, buf) = server_clone.recv_from(buf).await;
@@ -185,15 +173,10 @@ fn test_udp_multiple_messages() {
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
-            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
 
-            let driver = cx.driver();
-
-            let socket1 =
-                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 1");
-            let socket2 =
-                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 2");
+            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+            let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
             let _addr2 = socket2.local_addr().expect("Failed to get addr2");
@@ -206,7 +189,7 @@ fn test_udp_multiple_messages() {
             let pool_clone = pool.clone();
 
             // Receiver task
-            let h_recv = cx.spawn_local(async move {
+            let h_recv = spawn_local(async move {
                 for i in 0..NUM_MESSAGES {
                     let buf = alloc_buf(&pool_clone, size);
                     let (result, _buf) = socket1_clone.recv_from(buf).await;
@@ -243,15 +226,10 @@ fn test_udp_large_data() {
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
-            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
 
-            let driver = cx.driver();
-
-            let socket1 =
-                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 1");
-            let socket2 =
-                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 2");
+            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+            let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
 
@@ -264,7 +242,7 @@ fn test_udp_large_data() {
             let pool_clone = pool.clone();
 
             // Receiver task
-            let h_recv = cx.spawn_local(async move {
+            let h_recv = spawn_local(async move {
                 let buf = alloc_buf(&pool_clone, size);
                 let (result, buf) = socket1_clone.recv_from(buf).await;
                 let (bytes, _from) = result.expect("recv_from failed");
@@ -298,9 +276,7 @@ fn test_udp_ipv6() {
     let mut exec = LocalExecutor::default();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
-        let driver = cx.driver();
-        let socket_result = UdpSocket::bind("::1:0", driver.clone());
+        let socket_result = UdpSocket::bind("::1:0");
 
         if socket_result.is_err() {
             println!("IPv6 not available, skipping test");
@@ -335,31 +311,28 @@ fn test_multithread_udp() {
                 let exec = LocalExecutor::new();
                 let pool = HybridPool::new().unwrap();
                 crate::runtime::context::bind_pool(pool.clone());
-                let driver = exec.driver_handle();
-
-                // Each worker creates its own UDP sockets and tests send/recv
-                let socket1 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 1");
-                let socket2 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 2");
-
-                let addr1 = socket1.local_addr().expect("Failed to get addr1");
-                println!("Worker {} socket 1 bound to: {}", worker_id, addr1);
-
-                let socket1_rc = Rc::new(socket1);
-                let socket2_rc = Rc::new(socket2);
-                let socket1_clone = socket1_rc.clone();
-                let pool_clone = pool.clone();
-
-                // Receiver task via exec.spawn_local
-                let h_recv = exec.spawn_local(async move {
-                    let buf = pool_clone.alloc(size).unwrap();
-                    let (result, _buf) = socket1_clone.recv_from(buf).await;
-                    result.expect("recv_from failed");
-                    println!("Worker {} received message", worker_id);
-                });
 
                 let fut = async move {
+                    // Each worker creates its own UDP sockets and tests send/recv
+                    let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+                    let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
+
+                    let addr1 = socket1.local_addr().expect("Failed to get addr1");
+                    println!("Worker {} socket 1 bound to: {}", worker_id, addr1);
+
+                    let socket1_rc = Rc::new(socket1);
+                    let socket2_rc = Rc::new(socket2);
+                    let socket1_clone = socket1_rc.clone();
+                    let pool_clone = pool.clone();
+
+                    // Receiver task via crate::spawn_local (uses current context)
+                    let h_recv = crate::spawn_local(async move {
+                        let buf = pool_clone.alloc(size).unwrap();
+                        let (result, _buf) = socket1_clone.recv_from(buf).await;
+                        result.expect("recv_from failed");
+                        println!("Worker {} received message", worker_id);
+                    });
+
                     // Sender
                     let mut buf = pool.alloc(size).unwrap();
                     let msg = format!("Hello from worker {}", worker_id);
@@ -401,11 +374,9 @@ fn test_multithread_udp_echo() {
             let exec = LocalExecutor::new();
             let pool = HybridPool::new().unwrap();
             crate::runtime::context::bind_pool(pool.clone());
-            let driver = exec.driver_handle();
 
             let fut = async move {
-                let socket = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind server socket");
+                let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
                 let server_addr = socket.local_addr().expect("Failed to get server address");
                 println!("UDP echo server listening on {}", server_addr);
 
@@ -436,7 +407,6 @@ fn test_multithread_udp_echo() {
             let exec = LocalExecutor::new();
             let pool = HybridPool::new().unwrap();
             crate::runtime::context::bind_pool(pool.clone());
-            let driver = exec.driver_handle();
 
             let fut = async move {
                 // Wait for server address
@@ -445,8 +415,7 @@ fn test_multithread_udp_echo() {
                     .expect("Timeout waiting for server address");
                 println!("Client connecting to {}", server_addr);
 
-                let client = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind client socket");
+                let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
 
                 // Send data
                 let mut send_buf = pool.alloc(size).unwrap();
@@ -493,11 +462,9 @@ fn test_multithread_concurrent_udp_clients() {
             let exec = LocalExecutor::new();
             let pool = HybridPool::new().unwrap();
             crate::runtime::context::bind_pool(pool.clone());
-            let driver = exec.driver_handle();
 
             let fut = async move {
-                let socket = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind server socket");
+                let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
                 let server_addr = socket.local_addr().expect("Failed to get server address");
                 println!("Server listening on {}", server_addr);
 
@@ -529,7 +496,6 @@ fn test_multithread_concurrent_udp_clients() {
                 let exec = LocalExecutor::new();
                 let pool = HybridPool::new().unwrap();
                 crate::runtime::context::bind_pool(pool.clone());
-                let driver = exec.driver_handle();
 
                 let fut = async move {
                     // Get address from shared receiver
@@ -540,8 +506,8 @@ fn test_multithread_concurrent_udp_clients() {
                             .expect("Timeout waiting for server address")
                     };
 
-                    let client = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                        .expect("Failed to bind client socket");
+                    let client =
+                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
 
                     let mut buf = pool.alloc(size).unwrap();
                     let msg = format!("Hello from client {}", client_id);

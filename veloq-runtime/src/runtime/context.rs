@@ -266,3 +266,40 @@ pub fn try_bind_pool<P: BufPool + Clone + 'static>(pool: P) -> Result<(), PoolAl
 pub fn current_pool() -> Option<AnyBufPool> {
     CURRENT_POOL.with(|cell| cell.get().cloned())
 }
+
+/// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
+///
+/// Spawning a task enables the task to execute concurrently to other tasks. There is no
+/// guarantee that the spawned task will execute to completion. When a task is spawned,
+/// it triggers the provided future. The returned `JoinHandle` receives the result of
+/// the future when the task completes.
+///
+/// This function requires the future to be `Send` as it may be executed on a different thread.
+///
+/// # Panics
+///
+/// Panics if called outside of a runtime context, or if the current runtime does not support
+/// global spawning (missing executor registry).
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    current().spawn(future)
+}
+
+/// Spawns a `!Send` future on the current thread.
+///
+/// The task is guaranteed to run on the exact same thread that called `spawn_local`.
+/// Unlike `spawn`, `spawn_local` allows spawning futures that do not implement `Send`.
+///
+/// # Panics
+///
+/// Panics if called outside of a runtime context.
+pub fn spawn_local<F>(future: F) -> LocalJoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    current().spawn_local(future)
+}

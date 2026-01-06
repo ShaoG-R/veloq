@@ -3,6 +3,7 @@
 use crate::io::buffer::{FixedBuf, HybridPool};
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::executor::{LocalExecutor, Runtime};
+use crate::spawn_local;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,29 +25,26 @@ fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf {
 #[test]
 fn test_tcp_connect_with_global_api() {
     let mut exec = LocalExecutor::default();
-    let driver = exec.driver_handle();
-
-    // Create listener before block_on
-    let listener =
-        TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-    let listen_addr = listener.local_addr().expect("Failed to get local address");
-    println!("Listener bound to: {}", listen_addr);
-
-    let listener_rc = Rc::new(listener);
-    let listener_clone = listener_rc.clone();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
+        // Create listener inside block_on to access context
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+        println!("Listener bound to: {}", listen_addr);
+
+        let listener_rc = Rc::new(listener);
+        let listener_clone = listener_rc.clone();
+
         // Server task using cx.spawn_local
-        let server_h = cx.spawn_local(async move {
+        let server_h = spawn_local(async move {
             let (stream, peer_addr) = listener_clone.accept().await.expect("Accept failed");
             println!("Accepted connection from: {}", peer_addr);
             drop(stream);
         });
 
         // Client uses cx.driver()
-        let driver = cx.driver();
-        let stream = TcpStream::connect(listen_addr, driver)
+        // Client uses cx implicitly
+        let stream = TcpStream::connect(listen_addr)
             .await
             .expect("Failed to connect");
         println!("Connected successfully");
@@ -64,26 +62,21 @@ fn test_tcp_send_recv() {
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let driver = exec.driver_handle();
 
-        let listener =
-            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
-
-        let listener_rc = Rc::new(listener);
-        let listener_clone = listener_rc.clone();
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
-            let cx = crate::runtime::context::current();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+            let listener_rc = Rc::new(listener);
+            let listener_clone = listener_rc.clone();
             let pool = pool_clone.clone();
 
-            // Get driver and allocate buffers inside async context
-            let driver_weak = cx.driver();
             let pool_server = pool.clone();
 
             // Server task: Robust Echo Loop
-            let server_h = cx.spawn_local(async move {
+            let server_h = spawn_local(async move {
                 let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
                 loop {
@@ -104,7 +97,7 @@ fn test_tcp_send_recv() {
             });
 
             // Client
-            let stream = TcpStream::connect(listen_addr, driver_weak)
+            let stream = TcpStream::connect(listen_addr)
                 .await
                 .expect("Failed to connect");
 
@@ -157,21 +150,18 @@ fn test_tcp_send_recv() {
 #[test]
 fn test_tcp_multiple_connections() {
     let mut exec = LocalExecutor::default();
-    let driver = exec.driver_handle();
-
-    let listener =
-        TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-    let listen_addr = listener.local_addr().expect("Failed to get local address");
-
-    const NUM_CONNECTIONS: usize = 5;
-
-    let listener_rc = Rc::new(listener);
-    let listener_clone = listener_rc.clone();
 
     exec.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        const NUM_CONNECTIONS: usize = 5;
+
+        let listener_rc = Rc::new(listener);
+        let listener_clone = listener_rc.clone();
+
         // Server task: accept all connections
-        let cx = crate::runtime::context::current();
-        let server_h = cx.spawn_local(async move {
+        let server_h = spawn_local(async move {
             for i in 0..NUM_CONNECTIONS {
                 let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
                 println!("Accepted connection {} from {}", i, peer);
@@ -181,9 +171,8 @@ fn test_tcp_multiple_connections() {
         });
 
         // Client: make connections sequentially
-        let driver = cx.driver();
         for i in 0..NUM_CONNECTIONS {
-            let stream = TcpStream::connect(listen_addr, driver.clone())
+            let stream = TcpStream::connect(listen_addr)
                 .await
                 .expect("Failed to connect");
             println!("Client {} connected", i);
@@ -202,26 +191,22 @@ fn test_tcp_large_data_transfer() {
     crate::runtime::context::bind_pool(pool.clone());
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let driver = exec.driver_handle();
-
-        let listener =
-            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
-
-        const DATA_SIZE: usize = 8192; // 8KB
-        const CHUNK_SIZE: usize = 4096;
-
-        let listener_rc = Rc::new(listener);
-        let listener_clone = listener_rc.clone();
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
-            let cx = crate::runtime::context::current();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+            const DATA_SIZE: usize = 8192; // 8KB
+            const CHUNK_SIZE: usize = 4096;
+
+            let listener_rc = Rc::new(listener);
+            let listener_clone = listener_rc.clone();
             let pool = pool_clone.clone();
             let pool_server = pool.clone();
 
             // Server task
-            let server_h = cx.spawn_local(async move {
+            let server_h = spawn_local(async move {
                 let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
                 let mut total_received = 0;
@@ -245,8 +230,7 @@ fn test_tcp_large_data_transfer() {
             });
 
             // Client
-            let driver = cx.driver();
-            let stream = TcpStream::connect(listen_addr, driver)
+            let stream = TcpStream::connect(listen_addr)
                 .await
                 .expect("Failed to connect");
 
@@ -278,11 +262,9 @@ fn test_tcp_large_data_transfer() {
 #[test]
 fn test_listener_local_addr() {
     let mut exec = LocalExecutor::default();
-    let driver = exec.driver_handle();
 
     exec.block_on(async move {
-        let listener =
-            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
 
         let addr = listener.local_addr().expect("Failed to get local address");
 
@@ -299,11 +281,9 @@ fn test_tcp_connect_refused() {
     let mut exec = LocalExecutor::default();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
         let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
-        let driver = cx.driver();
 
-        let result = TcpStream::connect(addr, driver).await;
+        let result = TcpStream::connect(addr).await;
 
         assert!(result.is_err());
         println!("Connection refused as expected: {:?}", result.err());
@@ -317,28 +297,24 @@ fn test_tcp_recv_zero_bytes() {
     crate::runtime::context::bind_pool(pool.clone());
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let driver = exec.driver_handle();
 
-        let listener =
-            TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
-
-        let listener_rc = Rc::new(listener);
-        let listener_clone = listener_rc.clone();
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
-            let cx = crate::runtime::context::current();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+            let listener_rc = Rc::new(listener);
+            let listener_clone = listener_rc.clone();
             // Server: accept and immediately close
-            let server_h = cx.spawn_local(async move {
+            let server_h = spawn_local(async move {
                 let (stream, _) = listener_clone.accept().await.expect("Accept failed");
                 println!("Server accepted and closing connection");
                 drop(stream);
             });
 
             // Client
-            let driver = cx.driver();
-            let stream = TcpStream::connect(listen_addr, driver)
+            let stream = TcpStream::connect(listen_addr)
                 .await
                 .expect("Failed to connect");
 
@@ -361,34 +337,31 @@ fn test_tcp_recv_zero_bytes() {
 #[test]
 fn test_tcp_ipv6() {
     let mut exec = LocalExecutor::default();
-    let driver = exec.driver_handle();
-
-    let listener_result = TcpListener::bind("::1:0", driver.clone());
-
-    if listener_result.is_err() {
-        println!("IPv6 not available, skipping test");
-        return;
-    }
-
-    let listener = listener_result.unwrap();
-    let listen_addr = listener.local_addr().expect("Failed to get local address");
-
-    assert!(listen_addr.is_ipv6());
-    println!("IPv6 listener bound to: {}", listen_addr);
-
-    let listener_rc = Rc::new(listener);
-    let listener_clone = listener_rc.clone();
 
     exec.block_on(async move {
-        let cx = crate::runtime::context::current();
-        let server_h = cx.spawn_local(async move {
+        let listener_result = TcpListener::bind("::1:0");
+
+        if listener_result.is_err() {
+            println!("IPv6 not available, skipping test");
+            return;
+        }
+
+        let listener = listener_result.unwrap();
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        assert!(listen_addr.is_ipv6());
+        println!("IPv6 listener bound to: {}", listen_addr);
+
+        let listener_rc = Rc::new(listener);
+        let listener_clone = listener_rc.clone();
+
+        let server_h = spawn_local(async move {
             let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
             println!("Accepted IPv6 connection from: {}", peer);
             drop(stream);
         });
 
-        let driver = cx.driver();
-        let stream = TcpStream::connect(listen_addr, driver)
+        let stream = TcpStream::connect(listen_addr)
             .await
             .expect("Failed to connect via IPv6");
 
@@ -414,34 +387,29 @@ fn test_multithread_tcp_connections() {
 
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
-            let driver = exec.driver_handle();
-            let pool = HybridPool::new().unwrap();
-            crate::runtime::context::bind_pool(pool.clone());
-
-            let listener =
-                TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
-            let listen_addr = listener.local_addr().expect("Failed to get local address");
-            println!("Worker {} listening on {}", worker_id, listen_addr);
-
-            let listener_rc = Rc::new(listener);
-            let listener_clone = listener_rc.clone();
-
-            // Spawn server task
-            let server_h = exec.spawn_local(async move {
-                let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
-                println!("Worker {} accepted from {}", worker_id, peer);
-                drop(stream);
-            });
 
             let fut = async move {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listen_addr = listener.local_addr().expect("Failed to get local address");
+                println!("Worker {} listening on {}", worker_id, listen_addr);
+
+                let listener_rc = Rc::new(listener);
+                let listener_clone = listener_rc.clone();
+
+                // Spawn server task inside fut using crate::spawn_local
+                crate::spawn_local(async move {
+                    let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
+                    println!("Worker {} accepted from {}", worker_id, peer);
+                    drop(stream);
+                });
+
                 // Client connects to self
-                let stream = TcpStream::connect(listen_addr, driver)
+                let stream = TcpStream::connect(listen_addr)
                     .await
                     .expect("Failed to connect");
                 println!("Worker {} connected to self", worker_id);
                 drop(stream);
 
-                server_h.await;
                 counter.fetch_add(1, Ordering::SeqCst);
             };
             (exec, fut)
@@ -467,13 +435,11 @@ fn test_multithread_tcp_echo() {
         // Worker 1: Echo server
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
-            let driver = exec.driver_handle();
             let pool = HybridPool::new().unwrap();
             crate::runtime::context::bind_pool(pool.clone());
 
             let fut = async move {
-                let listener = TcpListener::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind listener");
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
                 let listen_addr = listener.local_addr().expect("Failed to get local address");
                 println!("Echo server listening on {}", listen_addr);
 
@@ -503,7 +469,6 @@ fn test_multithread_tcp_echo() {
         // Worker 2: Client
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
-            let driver = exec.driver_handle();
             let pool = HybridPool::new().unwrap();
             crate::runtime::context::bind_pool(pool.clone());
 
@@ -514,7 +479,7 @@ fn test_multithread_tcp_echo() {
                     .expect("Timeout waiting for server address");
                 println!("Client connecting to {}", listen_addr);
 
-                let stream = TcpStream::connect(listen_addr, driver)
+                let stream = TcpStream::connect(listen_addr)
                     .await
                     .expect("Failed to connect");
 
@@ -560,11 +525,9 @@ fn test_multithread_concurrent_clients() {
     // Server worker
     runtime.spawn_worker(move || {
         let exec = LocalExecutor::new();
-        let driver = exec.driver_handle();
 
         let fut = async move {
-            let listener =
-                TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
             let listen_addr = listener.local_addr().expect("Failed to get local address");
             println!("Server listening on {}", listen_addr);
 
@@ -592,7 +555,6 @@ fn test_multithread_concurrent_clients() {
         let counter = connection_count.clone();
         runtime.spawn_worker(move || {
             let exec = LocalExecutor::new();
-            let driver = exec.driver_handle();
             let fut = async move {
                 // Get address from shared receiver
                 let listen_addr = {
@@ -602,7 +564,7 @@ fn test_multithread_concurrent_clients() {
                         .expect("Timeout waiting for server address")
                 };
 
-                let stream = TcpStream::connect(listen_addr, driver)
+                let stream = TcpStream::connect(listen_addr)
                     .await
                     .expect("Failed to connect");
 

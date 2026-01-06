@@ -36,10 +36,7 @@ impl Drop for TcpStream {
 }
 
 impl TcpListener {
-    pub fn bind<A: ToSocketAddrs>(
-        addr: A,
-        driver: Weak<RefCell<PlatformDriver>>,
-    ) -> io::Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         // Resolve address (take first one)
         let addr = addr
             .to_socket_addrs()?
@@ -54,6 +51,8 @@ impl TcpListener {
 
         socket.bind(addr)?;
         socket.listen(1024)?; // backlog
+
+        let driver = crate::runtime::context::current().driver();
 
         Ok(Self {
             fd: socket.into_raw() as RawHandle,
@@ -100,10 +99,7 @@ impl TcpListener {
 }
 
 impl TcpStream {
-    pub async fn connect(
-        addr: SocketAddr,
-        driver: Weak<RefCell<PlatformDriver>>,
-    ) -> io::Result<Self> {
+    pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
         let socket = if addr.is_ipv4() {
             Socket::new_tcp_v4()?
         } else {
@@ -119,6 +115,7 @@ impl TcpStream {
             addr_len: raw_addr_len as u32,
         };
 
+        let driver = crate::runtime::context::current().driver();
         let future = Op::new(op, driver.clone());
         let (res, _op_back) = future.await;
         res?;

@@ -22,10 +22,7 @@ impl Drop for UdpSocket {
 }
 
 impl UdpSocket {
-    pub fn bind<A: ToSocketAddrs>(
-        addr: A,
-        driver: Weak<RefCell<PlatformDriver>>,
-    ) -> io::Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let addr = addr
             .to_socket_addrs()?
             .next()
@@ -38,6 +35,8 @@ impl UdpSocket {
         };
 
         socket.bind(addr)?;
+
+        let driver = crate::runtime::context::current().driver();
 
         Ok(Self {
             fd: socket.into_raw() as RawHandle,

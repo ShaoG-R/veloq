@@ -8,7 +8,7 @@ pub mod runtime;
 // Re-export key functions for convenient access
 pub use runtime::{JoinHandle, LocalJoinHandle};
 pub use runtime::{LocalExecutor, Runtime}; // Export Runtime for config usage
-pub use runtime::{RuntimeContext, yield_now};
+pub use runtime::{RuntimeContext, spawn, spawn_local, yield_now};
 
 #[cfg(test)]
 mod tests {
