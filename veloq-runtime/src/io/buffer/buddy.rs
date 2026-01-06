@@ -1,5 +1,3 @@
-use crate::io::buffer::BufPoolExt;
-
 use super::{AlignedMemory, AllocError, AllocResult, BufPool, DeallocParams, FixedBuf, PoolVTable};
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -14,84 +12,6 @@ const NUM_ORDERS: usize = 14;
 
 const TAG_ALLOCATED: u8 = 0x80;
 const TAG_ORDER_MASK: u8 = 0x7F;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BufferSize {
-    /// 4KB (Order 0)
-    Size4K = 0,
-    /// 8KB (Order 1)
-    Size8K = 1,
-    /// 16KB (Order 2)
-    Size16K = 2,
-    /// 32KB (Order 3)
-    Size32K = 3,
-    /// 64KB (Order 4)
-    Size64K = 4,
-    /// 128KB (Order 5)
-    Size128K = 5,
-    /// 256KB (Order 6)
-    Size256K = 6,
-    /// 512KB (Order 7)
-    Size512K = 7,
-    /// 1MB (Order 8)
-    Size1M = 8,
-    /// 2MB (Order 9)
-    Size2M = 9,
-    /// 4MB (Order 10)
-    Size4M = 10,
-    /// 8MB (Order 11)
-    Size8M = 11,
-    /// 16MB (Order 12)
-    Size16M = 12,
-    /// 32MB (Order 13)
-    Size32M = 13,
-}
-
-impl BufferSize {
-    #[inline(always)]
-    pub fn size(&self) -> usize {
-        MIN_BLOCK_SIZE << (*self as usize)
-    }
-
-    #[inline(always)]
-    pub fn order(&self) -> usize {
-        *self as usize
-    }
-
-    pub fn from_order(order: usize) -> Option<Self> {
-        match order {
-            0 => Some(BufferSize::Size4K),
-            1 => Some(BufferSize::Size8K),
-            2 => Some(BufferSize::Size16K),
-            3 => Some(BufferSize::Size32K),
-            4 => Some(BufferSize::Size64K),
-            5 => Some(BufferSize::Size128K),
-            6 => Some(BufferSize::Size256K),
-            7 => Some(BufferSize::Size512K),
-            8 => Some(BufferSize::Size1M),
-            9 => Some(BufferSize::Size2M),
-            10 => Some(BufferSize::Size4M),
-            11 => Some(BufferSize::Size8M),
-            12 => Some(BufferSize::Size16M),
-            13 => Some(BufferSize::Size32M),
-            _ => None,
-        }
-    }
-
-    pub fn best_fit(size: usize) -> Option<Self> {
-        if size > ARENA_SIZE {
-            return None;
-        }
-        if size <= MIN_BLOCK_SIZE {
-            return Some(BufferSize::Size4K);
-        }
-
-        // Optimized O(1) calculation using bit manipulation
-        // MIN_BLOCK_SIZE is 4096 (2^12)
-        let order = size.next_power_of_two().ilog2() as usize - 12;
-        Self::from_order(order)
-    }
-}
 
 /// 侵入式双向链表节点，存储在空闲块的头部
 #[repr(C)]
@@ -151,9 +71,26 @@ impl BuddyAllocator {
         })
     }
 
+    fn calculate_order(size: usize) -> Option<usize> {
+        if size > ARENA_SIZE {
+            return None;
+        }
+        if size <= MIN_BLOCK_SIZE {
+            return Some(0);
+        }
+        // MIN_BLOCK_SIZE is 4096 (2^12)
+        let order = size.next_power_of_two().ilog2() as usize - 12;
+        if order >= NUM_ORDERS {
+            None
+        } else {
+            Some(order)
+        }
+    }
+
     /// 分配指定大小的内存块
-    fn alloc(&mut self, size: BufferSize) -> Option<(NonNull<u8>, BufferSize)> {
-        let needed_order = size.order();
+    /// 返回 (pointer, order)
+    fn alloc(&mut self, size: usize) -> Option<(NonNull<u8>, usize)> {
+        let needed_order = Self::calculate_order(size)?;
 
         // 寻找合适的空闲块
         for order in needed_order..NUM_ORDERS {
@@ -200,7 +137,7 @@ impl BuddyAllocator {
                 return Some((
                     // SAFETY: curr_ptr 是有效的非空指针
                     unsafe { NonNull::new_unchecked(curr_ptr) },
-                    size,
+                    needed_order,
                 ));
             }
         }
@@ -208,14 +145,14 @@ impl BuddyAllocator {
     }
 
     /// 释放内存块
-    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, size: BufferSize) {
+    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, order: usize) {
         let base_ptr = self.base_ptr;
         let ptr_raw = ptr.as_ptr();
         // SAFETY: 假定 ptr 是由 alloc 返回的，在 Arena 范围内
         let offset = unsafe { ptr_raw.offset_from(base_ptr) } as usize;
 
         let mut curr_offset = offset;
-        let mut curr_order = size.order();
+        let mut curr_order = order;
 
         // 立即标记为空闲
         let idx = curr_offset / MIN_BLOCK_SIZE;
@@ -359,19 +296,10 @@ unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
 
     // 3. Recover size from context (Buddy uses Order in context)
     let order = params.context;
-    let size = match BufferSize::from_order(order) {
-        Some(s) => s,
-        None => {
-            #[cfg(debug_assertions)]
-            panic!("Invalid order in dealloc: {}", order);
-            #[cfg(not(debug_assertions))]
-            return;
-        }
-    };
 
     // 4. Perform dealloc
     let mut inner = pool_rc.borrow_mut();
-    unsafe { inner.dealloc(block_start_non_null, size) };
+    unsafe { inner.dealloc(block_start_non_null, order) };
 }
 
 impl BuddyPool {
@@ -381,34 +309,27 @@ impl BuddyPool {
         })
     }
 
-    pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf> {
+    pub fn alloc(&self, len: usize) -> Option<FixedBuf> {
         let mut inner = self.inner.borrow_mut();
 
-        if let Some((block_ptr, actual_size)) = inner.alloc(size) {
-            let capacity = actual_size.size();
+        if let Some((block_ptr, order)) = inner.alloc(len) {
+            let capacity = MIN_BLOCK_SIZE << order;
 
             unsafe {
-                return Some(FixedBuf::new(
+                let mut buf = FixedBuf::new(
                     block_ptr,
                     capacity,
                     0, // Global index is 0
                     self.pool_data(),
                     self.vtable(),
-                    actual_size.order(),
-                ));
+                    order, // Use order as context
+                );
+                buf.set_len(len);
+                Some(buf)
             }
+        } else {
+            None
         }
-        None
-    }
-
-    pub fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
-        let needed = len;
-        let size = BufferSize::best_fit(needed)?;
-
-        self.alloc(size).map(|mut buf| {
-            buf.set_len(len);
-            buf
-        })
     }
 }
 
@@ -416,21 +337,16 @@ impl BufPool for BuddyPool {
     fn alloc_mem(&self, size: usize) -> AllocResult {
         let mut inner = self.inner.borrow_mut();
 
-        let buf_size = match BufferSize::best_fit(size) {
-            Some(s) => s,
-            None => return AllocResult::Failed,
-        };
-
-        match inner.alloc(buf_size) {
-            Some((block_ptr, actual_size)) => {
-                let capacity = actual_size.size();
+        match inner.alloc(size) {
+            Some((block_ptr, order)) => {
+                let capacity = MIN_BLOCK_SIZE << order;
                 // No header writing needed
 
                 AllocResult::Allocated {
                     ptr: block_ptr,
                     cap: capacity,
                     global_index: 0,
-                    context: actual_size.order(),
+                    context: order,
                 }
             }
             None => AllocResult::Failed,
@@ -458,15 +374,6 @@ impl BufPool for BuddyPool {
     }
 }
 
-impl BufPoolExt for BuddyPool {
-    type BufferSize = BufferSize;
-
-    #[inline(always)]
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf> {
-        self.alloc(size)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,8 +385,8 @@ mod tests {
         assert_eq!(allocator.count_free(NUM_ORDERS - 1), 1);
 
         // 分配 4KB (Order 0)
-        let (ptr1, size1) = allocator.alloc(BufferSize::Size4K).unwrap();
-        assert_eq!(size1, BufferSize::Size4K);
+        let (ptr1, order1) = allocator.alloc(4096).unwrap();
+        assert_eq!(order1, 0);
 
         // 分裂路径验证
         // MaxOrder -> ... -> 8K -> 4K(Allocated) + 4K(Free)
@@ -488,7 +395,7 @@ mod tests {
         assert_eq!(allocator.count_free(1), 1); // 剩下一个 8K
         assert_eq!(allocator.count_free(NUM_ORDERS - 1), 0); // MaxOrder 没了
 
-        unsafe { allocator.dealloc(ptr1, size1) };
+        unsafe { allocator.dealloc(ptr1, order1) };
 
         // 释放后应完全合并
         assert_eq!(allocator.count_free(NUM_ORDERS - 1), 1);
@@ -500,7 +407,7 @@ mod tests {
         let pool = BuddyPool::new().unwrap();
         // With 4KB alignment, a 4K block has 4096 capacity.
         // Minimal usable block is 4K.
-        let buf = pool.alloc(BufferSize::Size4K).unwrap();
+        let buf = pool.alloc(4096).unwrap();
         // Capacity should be 4096
         assert_eq!(buf.capacity(), 4096);
         drop(buf);

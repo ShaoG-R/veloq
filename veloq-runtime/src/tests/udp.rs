@@ -11,10 +11,8 @@ use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
 
-use crate::io::buffer::hybrid::BufferSize;
-
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf {
+fn alloc_buf(pool: &HybridPool, size: usize) -> FixedBuf {
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
@@ -43,7 +41,7 @@ fn test_udp_bind() {
 fn test_udp_send_recv() {
     let pool = HybridPool::new().unwrap();
     crate::runtime::context::bind_pool(pool.clone());
-    for size in [BufferSize::Size8K, BufferSize::Size16K] {
+    for size in [8192, 16384] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
 
@@ -94,7 +92,7 @@ fn test_udp_send_recv() {
 fn test_udp_echo() {
     let pool = HybridPool::new().unwrap();
     crate::runtime::context::bind_pool(pool.clone());
-    for size in [BufferSize::Size8K, BufferSize::Size16K] {
+    for size in [8192, 16384] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
 
@@ -168,7 +166,7 @@ fn test_udp_echo() {
 fn test_udp_multiple_messages() {
     let pool = HybridPool::new().unwrap();
     crate::runtime::context::bind_pool(pool.clone());
-    for size in [BufferSize::Size8K, BufferSize::Size16K] {
+    for size in [8192, 16384] {
         let mut exec = LocalExecutor::default();
         let pool_clone = pool.clone();
 
@@ -221,7 +219,7 @@ fn test_udp_multiple_messages() {
 fn test_udp_large_data() {
     let pool = HybridPool::new().unwrap();
     crate::runtime::context::bind_pool(pool.clone());
-    for size in [BufferSize::Size8K, BufferSize::Size16K] {
+    for size in [8192, 16384] {
         let mut exec = LocalExecutor::default();
         let pool_clone = pool.clone();
 
@@ -298,7 +296,7 @@ fn test_udp_ipv6() {
 /// Test UDP across multiple worker threads
 #[test]
 fn test_multithread_udp() {
-    for size in [BufferSize::Size8K, BufferSize::Size16K] {
+    for size in [8192, 16384] {
         let message_count = Arc::new(AtomicUsize::new(0));
         let mut runtime = Runtime::new(crate::config::Config::default());
 
@@ -365,7 +363,7 @@ fn test_multithread_udp_echo() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    for size in [BufferSize::Size8K, BufferSize::Size16K] {
+    for size in [8192, 16384] {
         let (addr_tx, addr_rx) = mpsc::channel();
         let mut runtime = Runtime::new(crate::config::Config::default());
 
@@ -449,7 +447,7 @@ fn test_multithread_concurrent_udp_clients() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    for size in [BufferSize::Size8K, BufferSize::Size16K] {
+    for size in [8192, 16384] {
         let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
         let addr_rx = Arc::new(Mutex::new(addr_rx));
         let message_count = Arc::new(AtomicUsize::new(0));

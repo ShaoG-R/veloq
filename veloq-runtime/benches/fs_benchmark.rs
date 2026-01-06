@@ -6,7 +6,7 @@ use std::time::Duration;
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::fs::{BufferingMode, File};
 use veloq_runtime::io::buffer::BuddyPool;
-use veloq_runtime::io::buffer::buddy::BufferSize;
+
 use veloq_runtime::spawn_local;
 
 fn benchmark_1gb_write(c: &mut Criterion) {
@@ -32,8 +32,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
             exec.block_on(async move {
                 // let cx = veloq_runtime::runtime::context::current();
 
-                const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
-                let chunk_size = CHUNK_SIZE_ENUM.size();
+                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                let chunk_size = CHUNK_SIZE;
                 let file_path = Path::new("bench_1gb_test.tmp");
 
                 if file_path.exists() {
@@ -66,7 +66,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                     // 1. 尝试分配并在此窗口内提交任务
                     if tasks.len() < concurrency_limit {
                         // Use pool directly
-                        if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
+                        if let Some(buf) = pool.alloc(CHUNK_SIZE) {
                             let remaining = TOTAL_SIZE - offset;
                             let write_len = std::cmp::min(remaining, chunk_size as u64) as usize;
 
@@ -141,8 +141,8 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 let pool = pool_inner;
                 let _ = veloq_runtime::runtime::context::try_bind_pool(pool.clone());
 
-                const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
-                let chunk_size = CHUNK_SIZE_ENUM.size();
+                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                let chunk_size = CHUNK_SIZE;
 
                 let mut files = Vec::with_capacity(FILE_COUNT);
                 let mut file_paths = Vec::with_capacity(FILE_COUNT);
@@ -199,7 +199,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         }
 
                         if let Some(idx) = found {
-                            if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
+                            if let Some(buf) = pool.alloc(CHUNK_SIZE) {
                                 let remaining = FILE_SIZE - offsets[idx];
                                 let write_len =
                                     std::cmp::min(remaining, chunk_size as u64) as usize;

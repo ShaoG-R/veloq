@@ -1,6 +1,6 @@
 use super::*;
 use crate::io::buffer::HybridPool;
-use crate::io::buffer::hybrid::BufferSize;
+
 use crate::io::driver::Driver;
 use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, RawHandle, Recv, Timeout};
 use crate::io::socket::Socket;
@@ -203,9 +203,7 @@ fn test_iocp_recv_with_buffer_pool() {
     let stream_handle = stream.into_raw_socket() as RawHandle;
 
     // Alloc buffer
-    let buf = pool
-        .alloc(BufferSize::Size8K)
-        .expect("Failed to alloc buffer");
+    let buf = pool.alloc(8192).expect("Failed to alloc buffer");
 
     // Create Recv Op
     let recv_op = Recv {

@@ -84,7 +84,7 @@ pub enum AllocResult {
 /// Trait for memory pool implementation allows custom memory management
 pub trait BufPool: std::fmt::Debug + 'static {
     /// Allocate memory with specific length.
-    fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
+    fn alloc(&self, len: usize) -> Option<FixedBuf> {
         match self.alloc_mem(len) {
             AllocResult::Allocated {
                 ptr,
@@ -119,13 +119,6 @@ pub trait BufPool: std::fmt::Debug + 'static {
 
     /// Get the raw pool data pointer (e.g. Rc<RefCell<Allocator>> as void ptr).
     fn pool_data(&self) -> NonNull<()>;
-}
-
-pub trait BufPoolExt: BufPool + Clone {
-    type BufferSize: Copy + std::fmt::Debug;
-
-    /// Allocate memory.
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf>;
 }
 
 #[derive(Debug)]

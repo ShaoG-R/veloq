@@ -6,9 +6,7 @@ use std::path::Path;
 
 #[test]
 fn test_file_integrity() {
-    use crate::io::buffer::hybrid::BufferSize;
-
-    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [8192, 16384, 65536] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
             let mut exec = LocalExecutor::default();
@@ -37,7 +35,7 @@ fn test_file_integrity() {
 
                     let (res, _) = file.write_at(write_buf, 0).await;
                     let wrote = res.expect("Write failed");
-                    assert_eq!(wrote, size.size());
+                    assert_eq!(wrote, size);
 
                     file.sync_all().await.expect("Sync failed");
                 }
@@ -50,7 +48,7 @@ fn test_file_integrity() {
 
                     let (res, read_buf) = file.read_at(read_buf, 0).await;
                     let n = res.expect("Read failed");
-                    assert_eq!(n, size.size());
+                    assert_eq!(n, size);
                     assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
                 }
 

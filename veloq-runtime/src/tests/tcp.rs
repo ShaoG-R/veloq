@@ -11,10 +11,8 @@ use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
 
-use crate::io::buffer::hybrid::BufferSize;
-
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf {
+fn alloc_buf(pool: &HybridPool, size: usize) -> FixedBuf {
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
@@ -59,7 +57,7 @@ fn test_tcp_connect_with_global_api() {
 fn test_tcp_send_recv() {
     let pool = HybridPool::new().unwrap();
     crate::runtime::context::bind_pool(pool.clone());
-    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [8192, 16384, 65536] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
 
@@ -189,7 +187,7 @@ fn test_tcp_multiple_connections() {
 fn test_tcp_large_data_transfer() {
     let pool = HybridPool::new().unwrap();
     crate::runtime::context::bind_pool(pool.clone());
-    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [8192, 16384, 65536] {
         let mut exec = LocalExecutor::default();
         let pool_clone = pool.clone();
 
@@ -295,7 +293,7 @@ fn test_tcp_connect_refused() {
 fn test_tcp_recv_zero_bytes() {
     let pool = HybridPool::new().unwrap();
     crate::runtime::context::bind_pool(pool.clone());
-    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [8192, 16384, 65536] {
         let mut exec = LocalExecutor::default();
 
         let pool_clone = pool.clone();
@@ -428,7 +426,7 @@ fn test_multithread_tcp_echo() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [8192, 16384, 65536] {
         let (addr_tx, addr_rx) = mpsc::channel();
         let mut runtime = Runtime::new(crate::config::Config::default());
 

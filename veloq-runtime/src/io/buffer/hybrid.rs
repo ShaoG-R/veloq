@@ -1,4 +1,3 @@
-use crate::io::buffer::BufPoolExt;
 use veloq_bitset::BitSet;
 
 use super::{
@@ -20,64 +19,6 @@ const SIZE_8K: usize = 8192;
 const SIZE_16K: usize = 16384;
 const SIZE_32K: usize = 32768;
 const SIZE_64K: usize = 65536;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BufferSize {
-    /// 4KB
-    Size4K,
-    /// 8KB
-    Size8K,
-    /// 16KB
-    Size16K,
-    /// 32KB
-    Size32K,
-    /// 64KB
-    Size64K,
-    /// Custom size
-    Custom(usize),
-}
-
-impl BufferSize {
-    #[inline(always)]
-    pub fn size(&self) -> usize {
-        match self {
-            BufferSize::Size4K => SIZE_4K,
-            BufferSize::Size8K => SIZE_8K,
-            BufferSize::Size16K => SIZE_16K,
-            BufferSize::Size32K => SIZE_32K,
-            BufferSize::Size64K => SIZE_64K,
-            BufferSize::Custom(size) => *size,
-        }
-    }
-
-    #[inline(always)]
-    pub fn slab_index(&self) -> Option<usize> {
-        match self {
-            BufferSize::Size4K => Some(0),
-            BufferSize::Size8K => Some(1),
-            BufferSize::Size16K => Some(2),
-            BufferSize::Size32K => Some(3),
-            BufferSize::Size64K => Some(4),
-            BufferSize::Custom(_) => None,
-        }
-    }
-
-    pub fn best_fit(size: usize) -> Self {
-        if size <= SIZE_4K {
-            BufferSize::Size4K
-        } else if size <= SIZE_8K {
-            BufferSize::Size8K
-        } else if size <= SIZE_16K {
-            BufferSize::Size16K
-        } else if size <= SIZE_32K {
-            BufferSize::Size32K
-        } else if size <= SIZE_64K {
-            BufferSize::Size64K
-        } else {
-            BufferSize::Custom(size)
-        }
-    }
-}
 
 // Slab configuration definition
 struct SlabConfig {
@@ -171,25 +112,31 @@ impl HybridAllocator {
 
     /// Allocate memory. `size` is the total size requirement including header.
     pub fn alloc(&mut self, needed_total: usize) -> Option<RawAlloc> {
-        // Try to find best slab request size
-        let best = BufferSize::best_fit(needed_total);
+        // Find best slab request size
+        let slab_idx = if needed_total <= SIZE_4K {
+            Some(0)
+        } else if needed_total <= SIZE_8K {
+            Some(1)
+        } else if needed_total <= SIZE_16K {
+            Some(2)
+        } else if needed_total <= SIZE_32K {
+            Some(3)
+        } else if needed_total <= SIZE_64K {
+            Some(4)
+        } else {
+            None
+        };
 
-        if let Some(slab_idx) = best.slab_index() {
-            let slab = &mut self.slabs[slab_idx];
+        if let Some(idx) = slab_idx {
+            let slab = &mut self.slabs[idx];
 
-            // Ensure the slab block size is actually sufficient
-            // best_fit returns Size8K for <= 8192.
-            // If needed_total is 4136, it fits.
-            // If needed_total is 4096, it fits.
-            // If needed_total is 4100, best_fit returns Size16K. Fits.
-            // So this check is mostly sanity.
             if slab.config.block_size >= needed_total {
                 if let Some(index) = slab.free_indices.pop() {
                     let block_ptr =
                         unsafe { slab.memory.as_ptr().add(index * slab.config.block_size) };
 
                     // Encode slab_idx (0-3) and index (0-512) into usize context
-                    let context = (slab_idx << 16) | index;
+                    let context = (idx << 16) | index;
 
                     if slab.allocated.set(index).is_err() {
                         return None;
@@ -198,13 +145,19 @@ impl HybridAllocator {
                     return Some(RawAlloc {
                         ptr: unsafe { NonNull::new_unchecked(block_ptr) },
                         cap: slab.config.block_size,
-                        global_index: slab_idx as u16,
+                        global_index: idx as u16,
                         context,
                     });
                 }
-            } else {
-                // If the "best fit" slab is too small (should not happen with correct best_fit), fall through
             }
+            // If full, fall through to global or fail?
+            // Currently assuming fall through if slab is full is not implemented in previous version either,
+            // (Wait, previously it did not fall through if `best.slab_index()` was some).
+            // But if slab is full (free_indices empty), it returns None here.
+            // Previous code: if slab valid -> try alloc. if fail -> None?
+            // Previous code: `if let Some(index) = slab.free_indices.pop() ... else { // If the "best fit" slab is too small... }`
+            // Actually previous code returned None if slab match but full. It did NOT fall back to global alloc unless size > 64K.
+            // So I should keep that behavior.
         }
 
         // Fallback: Global Allocator
@@ -326,19 +279,7 @@ impl HybridPool {
         })
     }
 
-    pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf> {
-        self.alloc_mem_inner(size.size())
-            .map(|(ptr, cap, idx, context)| unsafe {
-                let mut buf =
-                    FixedBuf::new(ptr, cap, idx, self.pool_data(), self.vtable(), context);
-                if buf.capacity() > size.size() {
-                    buf.set_len(size.size());
-                }
-                buf
-            })
-    }
-
-    pub fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
+    pub fn alloc(&self, len: usize) -> Option<FixedBuf> {
         self.alloc_mem_inner(len)
             .map(|(ptr, cap, idx, context)| unsafe {
                 let mut buf =
@@ -414,15 +355,6 @@ impl BufPool for HybridPool {
     }
 }
 
-impl BufPoolExt for HybridPool {
-    type BufferSize = BufferSize;
-
-    #[inline(always)]
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf> {
-        self.alloc(size)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,7 +407,7 @@ mod tests {
     #[test]
     fn test_hybrid_pool_integration() {
         let pool = HybridPool::new().unwrap();
-        let buf = pool.alloc(BufferSize::Size4K).unwrap();
+        let buf = pool.alloc(4096).unwrap();
         // Size4K request implies 4096 block.
         assert!(buf.capacity() >= 4096);
         let idx = buf.buf_index();
@@ -488,7 +420,7 @@ mod tests {
     #[test]
     fn test_hybrid_alloc_clamping() {
         let pool = HybridPool::new().unwrap();
-        let buf = pool.alloc(BufferSize::Size4K).unwrap();
+        let buf = pool.alloc(4096).unwrap();
         // 4K Block. 0 alignment. Capacity 4096.
         assert_eq!(buf.len(), 4096);
         assert_eq!(buf.capacity(), 4096);
@@ -498,24 +430,11 @@ mod tests {
     fn test_hybrid_all_sizes() {
         let pool = HybridPool::new().unwrap();
 
-        let sizes = [
-            BufferSize::Size4K,
-            BufferSize::Size8K,
-            BufferSize::Size16K,
-            BufferSize::Size32K,
-            BufferSize::Size64K,
-        ];
+        let sizes = [4096, 8192, 16384, 32768, 65536];
 
         for size in sizes {
             let buf = pool.alloc(size).unwrap();
-            let min_expected = match size {
-                BufferSize::Size4K => 4096,
-                BufferSize::Size8K => 8192,
-                BufferSize::Size16K => 16384,
-                BufferSize::Size32K => 32768,
-                BufferSize::Size64K => 65536,
-                _ => 0,
-            };
+            let min_expected = size;
             assert!(buf.capacity() >= min_expected);
             // Verify alignment
             let ptr = buf.as_slice().as_ptr() as usize;
