@@ -6,8 +6,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::rc::Weak;
-use std::sync::{Arc, Mutex, Weak as SyncWeak};
+use std::rc::{Rc, Weak};
 
 use crate::io::buffer::{AnyBufPool, BufPool};
 use crate::io::driver::PlatformDriver;
@@ -63,7 +62,7 @@ pub fn try_current() -> Option<RuntimeContext> {
 #[derive(Clone)]
 pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
-    pub(crate) queue: SyncWeak<Mutex<VecDeque<Arc<Task>>>>,
+    pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     pub(crate) spawner: Option<Spawner>,
     pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
 }
@@ -72,7 +71,7 @@ impl RuntimeContext {
     /// Create a new RuntimeContext.
     pub(crate) fn new(
         driver: Weak<RefCell<PlatformDriver>>,
-        queue: SyncWeak<Mutex<VecDeque<Arc<Task>>>>,
+        queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
         spawner: Option<Spawner>,
         mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
     ) -> Self {
@@ -168,7 +167,7 @@ impl RuntimeContext {
             },
             self.queue.clone(),
         );
-        queue.lock().unwrap().push_back(task);
+        queue.borrow_mut().push_back(task);
         handle
     }
 

@@ -17,7 +17,6 @@
 - **构建**: `cargo build`
 - **测试**: `cargo test`
 - **运行单个测试**: `cargo test test_name`
-- **运行 Loom 测试**: `cargo test -p veloq-queue --features loom --test loom --release` (推荐使用 release 模式以加快验证)
 - **Lint**: `cargo clippy`
 - **格式化**: `cargo fmt`
 
@@ -40,13 +39,6 @@
 - **关键机制**:
   - **惰性取消 (Lazy Cancellation)**: `cancel()` 仅将任务标记为已移除（将 `item` 设为 `None`）。任务在 `advance()` 推进到相应槽位时才会被物理移除。这避免了昂贵的链表解绑操作。
   - **级联 (Cascading)**: 随着时间推进，高层级 (L1) 的任务会被移动到 L0 或过期。
-
-### `veloq-queue`
-高性能并发队列库。
-- **MpscQueue**:
-  - 无锁、线性化、多生产者单消费者队列。
-  - 基于 Vyukov MPSC 算法。
-  - **Loom 测试**: 使用 `loom` 验证并发安全性（内存顺序、原子操作）。
 
 ### `veloq-runtime`
 高性能异步 I/O 运行时。
@@ -82,7 +74,6 @@
 
 ## 代码结构 (Code Structure)
 - `veloq-wheel/`: 核心时间轮库。
-- `veloq-queue/`: 高性能并发队列。
 - `veloq-runtime/`: 异步运行时。
   - `src/io/`: I/O 驱动和缓冲区管理。
   - `src/runtime/`: 任务执行、调度逻辑及 Mesh 网络。

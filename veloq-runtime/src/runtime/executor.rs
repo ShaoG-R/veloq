@@ -12,6 +12,7 @@ use crate::runtime::task::Task;
 use crate::io::driver::RemoteWaker;
 use crate::runtime::context::RuntimeContext;
 use std::pin::Pin;
+use std::rc::Weak;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -57,8 +58,8 @@ impl MeshContext {
 
     fn poll_ingress(
         &mut self,
-        local_queue: &Mutex<VecDeque<Arc<Task>>>,
-        queue_handle: &std::sync::Weak<Mutex<VecDeque<Arc<Task>>>>,
+        local_queue: &RefCell<VecDeque<Rc<Task>>>,
+        queue_handle: &Weak<RefCell<VecDeque<Rc<Task>>>>,
         injected_load: &AtomicUsize,
         local_load: &AtomicUsize,
     ) -> bool {
@@ -70,7 +71,7 @@ impl MeshContext {
                 local_load.fetch_add(1, Ordering::Relaxed);
 
                 let task = Task::new(job, queue_handle.clone());
-                local_queue.lock().unwrap().push_back(task);
+                local_queue.borrow_mut().push_back(task);
 
                 did_work = true;
             }
@@ -230,7 +231,7 @@ impl LocalExecutorBuilder {
         #[allow(unused_mut)]
         let mut driver = PlatformDriver::new(&self.config).expect("Failed to create driver");
 
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
 
         LocalExecutor {
             driver: Rc::new(RefCell::new(driver)),
@@ -248,7 +249,7 @@ impl LocalExecutorBuilder {
 
 pub struct LocalExecutor {
     driver: Rc<RefCell<PlatformDriver>>,
-    queue: Arc<Mutex<VecDeque<Arc<Task>>>>,
+    queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
 
     // Always present components for task injection
     injector: Arc<SegQueue<Job>>,
@@ -340,9 +341,9 @@ impl LocalExecutor {
                 let output = future.await;
                 producer.set(output);
             },
-            Arc::downgrade(&self.queue),
+            Rc::downgrade(&self.queue),
         );
-        self.queue.lock().unwrap().push_back(task);
+        self.queue.borrow_mut().push_back(task);
         self.local_load.fetch_add(1, Ordering::Relaxed);
         handle
     }
@@ -376,7 +377,7 @@ impl LocalExecutor {
 
         let context = RuntimeContext::new(
             Rc::downgrade(&self.driver),
-            Arc::downgrade(&self.queue),
+            Rc::downgrade(&self.queue),
             spawner,
             mesh_weak,
         );
@@ -402,7 +403,7 @@ impl LocalExecutor {
 
         const BUDGET: usize = 64;
 
-        let queue_weak = Arc::downgrade(&self.queue);
+        let queue_weak = Rc::downgrade(&self.queue);
 
         loop {
             let mut executed = 0;
@@ -434,7 +435,7 @@ impl LocalExecutor {
                 }
 
                 // 2. Poll Local Queue
-                let task = self.queue.lock().unwrap().pop_front();
+                let task = self.queue.borrow_mut().pop_front();
                 if let Some(task) = task {
                     self.local_load.fetch_sub(1, Ordering::Relaxed);
                     // task is Arc<Task>, run() takes self: Arc<Task>
@@ -447,8 +448,8 @@ impl LocalExecutor {
                 if let Some(job) = self.injector.pop() {
                     self.injected_load.fetch_sub(1, Ordering::Relaxed);
                     self.local_load.fetch_add(1, Ordering::Relaxed);
-                    let task = Task::new(job, Arc::downgrade(&self.queue));
-                    self.queue.lock().unwrap().push_back(task);
+                    let task = Task::new(job, Rc::downgrade(&self.queue));
+                    self.queue.borrow_mut().push_back(task);
                     continue;
                 }
 
@@ -478,8 +479,8 @@ impl LocalExecutor {
                             if let Some(job) = target.injector.pop() {
                                 target.injected_load.fetch_sub(1, Ordering::Relaxed);
                                 self.local_load.fetch_add(1, Ordering::Relaxed);
-                                let task = Task::new(job, Arc::downgrade(&self.queue));
-                                self.queue.lock().unwrap().push_back(task);
+                                let task = Task::new(job, Rc::downgrade(&self.queue));
+                                self.queue.borrow_mut().push_back(task);
                                 did_work = true;
                                 break;
                             }
@@ -493,7 +494,7 @@ impl LocalExecutor {
             }
 
             // 5. IO Wait
-            let has_pending_tasks = !self.queue.lock().unwrap().is_empty() || *main_woken.borrow();
+            let has_pending_tasks = !self.queue.borrow().is_empty() || *main_woken.borrow();
             let mut driver = self.driver.borrow_mut();
 
             if has_pending_tasks {
@@ -540,7 +541,7 @@ impl Drop for LocalExecutor {
     fn drop(&mut self) {
         // Clear the task queue to drop all futures.
         // This explicitly drops tasks (and their buffers/sockets) before the driver is dropped.
-        if let Ok(mut queue) = self.queue.lock() {
+        if let Ok(mut queue) = self.queue.try_borrow_mut() {
             queue.clear();
         }
 
