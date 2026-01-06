@@ -112,41 +112,50 @@ impl RuntimeContext {
             && let Some(mesh_rc) = mesh_weak.upgrade()
             && let Some(driver_rc) = self.driver.upgrade()
         {
-            let registry = spawner.registry();
-            let workers = registry.get_all_handles();
+            let dispatched = spawner.with_workers(|workers| {
+                if !workers.is_empty() {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static RND: AtomicUsize = AtomicUsize::new(0);
 
-            if !workers.is_empty() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static RND: AtomicUsize = AtomicUsize::new(0);
+                    let seed = RND.fetch_add(1, Ordering::Relaxed);
+                    let count = workers.len();
+                    let idx1 = seed % count;
+                    let idx2 = (idx1 + 7) % count;
 
-                let seed = RND.fetch_add(1, Ordering::Relaxed);
-                let count = workers.len();
-                let idx1 = seed % count;
-                let idx2 = (idx1 + 7) % count;
+                    let w1 = &workers[idx1];
+                    let w2 = &workers[idx2];
+                    let target = if w1.total_load() <= w2.total_load() {
+                        w1
+                    } else {
+                        w2
+                    };
 
-                let w1 = &workers[idx1];
-                let w2 = &workers[idx2];
-                let target = if w1.total_load() <= w2.total_load() {
-                    w1
-                } else {
-                    w2
-                };
+                    if target.id() != usize::MAX {
+                        let mut mesh = mesh_rc.borrow_mut();
+                        let mut driver = driver_rc.borrow_mut();
 
-                if target.id() != usize::MAX {
-                    let mut mesh = mesh_rc.borrow_mut();
-                    let mut driver = driver_rc.borrow_mut();
-
-                    if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
-                        // Fallback on full/error
-                        spawner.registry().spawn(returned_job);
+                        if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
+                            // Fallback on full/error - return ownership of job
+                            return Err(returned_job);
+                        }
+                        return Ok(());
                     }
+                }
+                Err(job)
+            });
+
+            match dispatched {
+                Ok(_) => return,
+                Err(job) => {
+                    // Fallback to global injector
+                    spawner.spawn_job(job);
                     return;
                 }
             }
         }
 
         // Default Fallback
-        spawner.registry().spawn(job);
+        spawner.spawn_job(job);
     }
 
     /// Spawn a new local task on the current executor.

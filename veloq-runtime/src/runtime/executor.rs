@@ -11,10 +11,11 @@ use crate::runtime::task::Task;
 
 use crate::io::driver::RemoteWaker;
 use crate::runtime::context::RuntimeContext;
+use smr_swap::{LocalReader, SmrReader, SmrSwap};
 use std::pin::Pin;
 use std::rc::Weak;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
 
@@ -102,8 +103,11 @@ impl ExecutorHandle {
 
 /// A registry that maintains the set of all active executors.
 /// Used for global task spawning (P2C) and work stealing.
+/// A registry that maintains the set of all active executors.
+/// Used for global task spawning (P2C) and work stealing.
 pub struct ExecutorRegistry {
-    workers: RwLock<Vec<ExecutorHandle>>,
+    writer: Mutex<SmrSwap<Vec<ExecutorHandle>>>,
+    reader_factory: SmrReader<Vec<ExecutorHandle>>,
     epoch: AtomicUsize, // Incremented whenever a new worker is added
     next: AtomicUsize,  // Source of randomness for P2C
 }
@@ -116,56 +120,28 @@ impl Default for ExecutorRegistry {
 
 impl ExecutorRegistry {
     pub fn new() -> Self {
+        let swap = SmrSwap::new(Vec::new());
+        let reader_factory = swap.reader();
         Self {
-            workers: RwLock::new(Vec::new()),
+            writer: Mutex::new(swap),
+            reader_factory,
             epoch: AtomicUsize::new(0),
             next: AtomicUsize::new(0),
         }
     }
 
     pub fn register(&self, handle: ExecutorHandle) {
-        let mut workers = self.workers.write().unwrap();
-        workers.push(handle);
+        let mut guard = self.writer.lock().unwrap();
+        guard.update(|current| {
+            let mut new = current.clone();
+            new.push(handle.clone());
+            new
+        });
         self.epoch.fetch_add(1, Ordering::Release);
     }
 
-    pub fn current_epoch(&self) -> usize {
-        self.epoch.load(Ordering::Acquire)
-    }
-
-    pub fn get_all_handles(&self) -> Vec<ExecutorHandle> {
-        self.workers.read().unwrap().clone()
-    }
-
-    /// Spawn a task using Power of Two Choices (P2C)
-    pub fn spawn(&self, job: Job) {
-        let workers = self.workers.read().unwrap();
-        let count = workers.len();
-        if count == 0 {
-            panic!("No workers available in registry");
-        }
-
-        let seed = self.next.fetch_add(1, Ordering::Relaxed);
-        let idx1 = seed % count;
-        let idx2 = {
-            let mut x = seed;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            x % count
-        };
-
-        let w1 = &workers[idx1];
-        let w2 = &workers[idx2]; // It's okay if idx1 == idx2
-
-        let load1 = w1.total_load();
-        let load2 = w2.total_load();
-
-        let target = if load1 <= load2 { w1 } else { w2 };
-
-        target.injector.push(job);
-        target.injected_load.fetch_add(1, Ordering::Relaxed);
-        target.waker.wake().expect("Failed to wake worker");
+    pub fn reader(&self) -> SmrReader<Vec<ExecutorHandle>> {
+        self.reader_factory.clone()
     }
 }
 
@@ -173,11 +149,16 @@ impl ExecutorRegistry {
 #[derive(Clone)]
 pub struct Spawner {
     registry: Arc<ExecutorRegistry>,
+    reader: RefCell<LocalReader<Vec<ExecutorHandle>>>,
 }
 
 impl Spawner {
     pub fn new(registry: Arc<ExecutorRegistry>) -> Self {
-        Self { registry }
+        let reader = registry.reader().local();
+        Self {
+            registry,
+            reader: RefCell::new(reader),
+        }
     }
 
     pub fn spawn<F>(&self, future: F) -> crate::runtime::join::JoinHandle<F::Output>
@@ -192,12 +173,46 @@ impl Spawner {
             producer.set(output);
         });
 
-        self.registry.spawn(job);
+        self.spawn_job(job);
         handle
     }
 
-    pub(crate) fn registry(&self) -> &Arc<ExecutorRegistry> {
-        &self.registry
+    pub(crate) fn spawn_job(&self, job: Job) {
+        let reader = self.reader.borrow();
+        let workers = reader.load();
+        let count = workers.len();
+
+        if count == 0 {
+            panic!("No workers available in registry");
+        }
+
+        let seed = self.registry.next.fetch_add(1, Ordering::Relaxed);
+        let idx1 = seed % count;
+        let idx2 = {
+            let mut x = seed;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x % count
+        };
+
+        let w1 = &workers[idx1];
+        let w2 = &workers[idx2];
+
+        let load1 = w1.total_load();
+        let load2 = w2.total_load();
+
+        let target = if load1 <= load2 { w1 } else { w2 };
+
+        target.injector.push(job);
+        target.injected_load.fetch_add(1, Ordering::Relaxed);
+        target.waker.wake().expect("Failed to wake worker");
+    }
+
+    pub(crate) fn with_workers<R>(&self, f: impl FnOnce(&[ExecutorHandle]) -> R) -> R {
+        let reader = self.reader.borrow();
+        let guard = reader.load();
+        f(&guard)
     }
 }
 
@@ -240,8 +255,7 @@ impl LocalExecutorBuilder {
             injected_load: Arc::new(AtomicUsize::new(0)),
             local_load: Arc::new(AtomicUsize::new(0)),
             registry: None,
-            cached_peers: Vec::new(),
-            local_epoch: 0,
+            registry_reader: None,
             mesh: None,
         }
     }
@@ -258,10 +272,7 @@ pub struct LocalExecutor {
 
     // Optional connection to the global registry
     registry: Option<Arc<ExecutorRegistry>>,
-
-    // Local cache for work stealing (Lazy Cache)
-    cached_peers: Vec<ExecutorHandle>,
-    local_epoch: usize,
+    registry_reader: Option<LocalReader<Vec<ExecutorHandle>>>,
 
     // Mesh Networking
     mesh: Option<Rc<RefCell<MeshContext>>>,
@@ -292,7 +303,9 @@ impl LocalExecutor {
     /// Attach this executor to a registry.
     /// This enables the executor to steal tasks from others in the registry.
     pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
+        let reader = registry.reader().local();
         self.registry = Some(registry);
+        self.registry_reader = Some(reader);
         self
     }
 
@@ -454,21 +467,17 @@ impl LocalExecutor {
                 }
 
                 // 4. Steal from Registry (Work Stealing)
-                if let Some(registry) = &self.registry {
-                    let current_epoch = registry.current_epoch();
-                    if self.local_epoch != current_epoch {
-                        self.cached_peers = registry.get_all_handles();
-                        self.local_epoch = current_epoch;
-                    }
+                if let Some(reader) = &self.registry_reader {
+                    let workers = reader.load();
+                    let count = workers.len();
 
-                    if !self.cached_peers.is_empty() {
+                    if count > 0 {
                         let seed = self as *const _ as usize;
                         let start_idx = seed.wrapping_add(executed);
-                        let count = self.cached_peers.len();
 
                         for i in 0..count {
                             let idx = (start_idx + i) % count;
-                            let target = &self.cached_peers[idx];
+                            let target = &workers[idx];
 
                             if Arc::ptr_eq(&target.injector, &self.injector) {
                                 continue;
