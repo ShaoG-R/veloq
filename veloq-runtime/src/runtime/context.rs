@@ -66,7 +66,7 @@ pub struct RuntimeContext {
     pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     pub(crate) spawner: Option<Spawner>,
     pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
-    pub(crate) handle: Option<ExecutorHandle>,
+    pub(crate) handle: ExecutorHandle,
 }
 
 impl RuntimeContext {
@@ -76,7 +76,7 @@ impl RuntimeContext {
         queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
         spawner: Option<Spawner>,
         mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
-        handle: Option<ExecutorHandle>,
+        handle: ExecutorHandle,
     ) -> Self {
         Self {
             driver,
@@ -122,19 +122,15 @@ impl RuntimeContext {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        if let Some(handle) = &self.handle {
-            let (join_handle, job) = crate::runtime::executor::pack_job(future);
+        let (join_handle, job) = crate::runtime::executor::pack_job(future);
 
-            handle.injector.push(job);
-            handle
-                .injected_load
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.handle.injector.push(job);
+        self.handle
+            .injected_load
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            // We are running on this thread, so no need to wake.
-            join_handle
-        } else {
-            self.spawn_balanced(future)
-        }
+        // We are running on this thread, so no need to wake.
+        join_handle
     }
 
     fn spawn_impl(&self, job: crate::runtime::executor::Job, spawner: &Spawner) {
@@ -211,16 +207,14 @@ impl RuntimeContext {
         let (handle, job) = crate::runtime::executor::pack_job(future);
 
         // Optimization: If spawning to self, just push to local queue
-        if let Some(my_handle) = &self.handle {
-            if my_handle.id() == worker_id {
-                let queue = self
-                    .queue
-                    .upgrade()
-                    .expect("executor has been dropped but context remains?");
-                let task = Task::new(job, self.queue.clone());
-                queue.borrow_mut().push_back(task);
-                return handle;
-            }
+        if self.handle.id() == worker_id {
+            let queue = self
+                .queue
+                .upgrade()
+                .expect("executor has been dropped but context remains?");
+            let task = Task::new(job, self.queue.clone());
+            queue.borrow_mut().push_back(task);
+            return handle;
         }
 
         // Try Mesh

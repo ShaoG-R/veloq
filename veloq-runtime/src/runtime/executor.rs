@@ -13,7 +13,6 @@ use crate::io::driver::RemoteWaker;
 use crate::runtime::context::RuntimeContext;
 use smr_swap::{LocalReader, SmrReader, SmrSwap};
 use std::pin::Pin;
-use std::rc::Weak;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -70,23 +69,15 @@ impl MeshContext {
         Ok(())
     }
 
-    fn poll_ingress(
-        &mut self,
-        local_queue: &RefCell<VecDeque<Rc<Task>>>,
-        queue_handle: &Weak<RefCell<VecDeque<Rc<Task>>>>,
-        injected_load: &AtomicUsize,
-        local_load: &AtomicUsize,
-    ) -> bool {
+    fn poll_ingress<F>(&mut self, mut on_job: F) -> bool
+    where
+        F: FnMut(Job),
+    {
         let mut did_work = false;
 
         for consumer in &mut self.ingress {
             if let Some(job) = consumer.pop() {
-                injected_load.fetch_sub(1, Ordering::Relaxed);
-                local_load.fetch_add(1, Ordering::Relaxed);
-
-                let task = Task::new(job, queue_handle.clone());
-                local_queue.borrow_mut().push_back(task);
-
+                on_job(job);
                 did_work = true;
             }
         }
@@ -105,6 +96,12 @@ pub struct ExecutorHandle {
 }
 
 impl ExecutorHandle {
+    pub(crate) fn schedule(&self, job: Job) {
+        self.injector.push(job);
+        self.injected_load.fetch_add(1, Ordering::Relaxed);
+        self.waker.wake().expect("Failed to wake worker");
+    }
+
     pub fn total_load(&self) -> usize {
         self.injected_load.load(Ordering::Relaxed) + self.local_load.load(Ordering::Relaxed)
     }
@@ -187,9 +184,7 @@ impl Spawner {
         let workers = reader.load();
 
         if let Some(target) = self.p2c_select(&workers) {
-            target.injector.push(job);
-            target.injected_load.fetch_add(1, Ordering::Relaxed);
-            target.waker.wake().expect("Failed to wake worker");
+            target.schedule(job);
         } else {
             panic!("No workers available in registry");
         }
@@ -214,17 +209,13 @@ impl Spawner {
                     // Fallback on full/error -> inject
                     drop(mesh);
                     drop(driver);
-                    target.injector.push(returned_job);
-                    target.injected_load.fetch_add(1, Ordering::Relaxed);
-                    target.waker.wake().expect("Failed to wake worker");
+                    target.schedule(returned_job);
                 }
                 return;
             }
 
             // No valid ID (unlikely for registered worker) -> inject
-            target.injector.push(job);
-            target.injected_load.fetch_add(1, Ordering::Relaxed);
-            target.waker.wake().expect("Failed to wake worker");
+            target.schedule(job);
         } else {
             panic!("No workers available in registry");
         }
@@ -274,9 +265,7 @@ impl Spawner {
         let workers = reader.load();
 
         if let Some(target) = workers.get(worker_id) {
-            target.injector.push(job);
-            target.injected_load.fetch_add(1, Ordering::Relaxed);
-            target.waker.wake().expect("Failed to wake worker");
+            target.schedule(job);
         } else {
             // Panic if the worker_id is invalid, as this implies a logic error in the caller
             // assuming the existence of a specific worker.
@@ -481,7 +470,7 @@ impl LocalExecutor {
             Rc::downgrade(&self.queue),
             spawner,
             mesh_weak,
-            Some(self.handle()),
+            self.handle(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -506,9 +495,17 @@ impl LocalExecutor {
         const BUDGET: usize = 64;
 
         let queue_weak = Rc::downgrade(&self.queue);
+        let local_load = self.local_load.clone();
+        let queue = self.queue.clone();
 
         loop {
             let mut executed = 0;
+
+            let mut activate_job = |job: Job| {
+                local_load.fetch_add(1, Ordering::Relaxed);
+                let task = Task::new(job, queue_weak.clone());
+                queue.borrow_mut().push_back(task);
+            };
 
             while executed < BUDGET {
                 let mut did_work = false;
@@ -517,12 +514,7 @@ impl LocalExecutor {
                 if let Some(mesh_rc) = &self.mesh {
                     // Start a scope to borrow mesh temporarily
                     let mut mesh = mesh_rc.borrow_mut();
-                    if mesh.poll_ingress(
-                        &self.queue, // Mismatch here? poll_ingress expects RefCell
-                        &queue_weak, // poll_ingress expects Weak<RefCell>
-                        &self.injected_load,
-                        &self.local_load,
-                    ) {
+                    if mesh.poll_ingress(&mut activate_job) {
                         did_work = true;
                     }
                 }
@@ -549,9 +541,7 @@ impl LocalExecutor {
                 // 3. Poll Injector
                 if let Some(job) = self.injector.pop() {
                     self.injected_load.fetch_sub(1, Ordering::Relaxed);
-                    self.local_load.fetch_add(1, Ordering::Relaxed);
-                    let task = Task::new(job, Rc::downgrade(&self.queue));
-                    self.queue.borrow_mut().push_back(task);
+                    activate_job(job);
                     continue;
                 }
 
@@ -576,9 +566,7 @@ impl LocalExecutor {
                             // SegQueue is safe for concurrent pop (MPMC)
                             if let Some(job) = target.injector.pop() {
                                 target.injected_load.fetch_sub(1, Ordering::Relaxed);
-                                self.local_load.fetch_add(1, Ordering::Relaxed);
-                                let task = Task::new(job, Rc::downgrade(&self.queue));
-                                self.queue.borrow_mut().push_back(task);
+                                activate_job(job);
                                 did_work = true;
                                 break;
                             }
@@ -607,12 +595,7 @@ impl LocalExecutor {
                     mesh.state.store(mesh::PARKING, Ordering::Release);
 
                     // 2. Poll Mesh (Double check)
-                    if mesh.poll_ingress(
-                        &self.queue,
-                        &queue_weak,
-                        &self.injected_load,
-                        &self.local_load,
-                    ) {
+                    if mesh.poll_ingress(&mut activate_job) {
                         mesh.state.store(mesh::RUNNING, Ordering::Relaxed);
                         can_park = false;
                     } else {
