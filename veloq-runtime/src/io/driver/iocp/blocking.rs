@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use crossbeam_queue::SegQueue;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -212,7 +212,9 @@ pub enum ThreadPoolError {
 }
 
 struct PoolState {
-    queue: Mutex<VecDeque<BlockingTask>>,
+    queue: SegQueue<BlockingTask>,
+    task_count: AtomicUsize,
+    sleeper_lock: Mutex<()>,
     cond: Condvar,
     active_workers: AtomicUsize,
     idle_workers: AtomicUsize,
@@ -246,7 +248,9 @@ impl ThreadPool {
         assert!(core_threads <= max_threads);
 
         let state = Arc::new(PoolState {
-            queue: Mutex::new(VecDeque::with_capacity(queue_capacity)),
+            queue: SegQueue::new(),
+            task_count: AtomicUsize::new(0),
+            sleeper_lock: Mutex::new(()),
             cond: Condvar::new(),
             active_workers: AtomicUsize::new(0),
             idle_workers: AtomicUsize::new(0),
@@ -263,11 +267,14 @@ impl ThreadPool {
 
     pub fn execute(&self, task: BlockingTask) -> Result<(), ThreadPoolError> {
         let state = &self.state;
-        let mut queue = state.queue.lock().unwrap();
 
-        // 1. Try to wake an idle worker
+        // 1. If there represent idle workers, push and notify
         if state.idle_workers.load(Ordering::SeqCst) > 0 {
-            queue.push_back(task);
+            state.task_count.fetch_add(1, Ordering::SeqCst);
+            state.queue.push(task);
+
+            // Notify one worker
+            let _guard = state.sleeper_lock.lock().unwrap();
             state.cond.notify_one();
             return Ok(());
         }
@@ -280,7 +287,8 @@ impl ThreadPool {
             let keep_alive = self.keep_alive;
             let core_threads = self.core_threads;
 
-            queue.push_back(task);
+            state.task_count.fetch_add(1, Ordering::SeqCst);
+            state.queue.push(task);
 
             let _ = thread::Builder::new()
                 .name("veloq-blocking-worker".into())
@@ -289,10 +297,17 @@ impl ThreadPool {
             return Ok(());
         }
 
-        // 3. Queue if capable
-        if queue.len() < self.queue_capacity {
-            queue.push_back(task);
-            state.cond.notify_one();
+        // 3. Queue if capable (using atomic count for O(1) check)
+        let count = state.task_count.load(Ordering::SeqCst);
+        if count < self.queue_capacity {
+            state.task_count.fetch_add(1, Ordering::SeqCst);
+            state.queue.push(task);
+
+            // Need to notify? Maybe a worker became idle just now
+            if state.idle_workers.load(Ordering::SeqCst) > 0 {
+                let _guard = state.sleeper_lock.lock().unwrap();
+                state.cond.notify_one();
+            }
             Ok(())
         } else {
             Err(ThreadPoolError::Overloaded)
@@ -305,23 +320,39 @@ impl ThreadPool {
         };
 
         loop {
-            let task = {
-                let mut queue = state.queue.lock().unwrap();
-
-                while queue.is_empty() {
-                    state.idle_workers.fetch_add(1, Ordering::SeqCst);
-                    let (guard, result) = state.cond.wait_timeout(queue, keep_alive).unwrap();
-                    state.idle_workers.fetch_sub(1, Ordering::SeqCst);
-                    queue = guard;
-
-                    if result.timed_out()
-                        && queue.is_empty()
-                        && state.active_workers.load(Ordering::SeqCst) > core_threads
-                    {
-                        return;
-                    }
+            // Task popping logic
+            let task = loop {
+                // 1. Try to pop from queue (Fast path)
+                if let Some(task) = state.queue.pop() {
+                    state.task_count.fetch_sub(1, Ordering::SeqCst);
+                    break Some(task);
                 }
-                queue.pop_front()
+
+                // 2. Queue empty: Prepare to sleep
+                state.idle_workers.fetch_add(1, Ordering::SeqCst);
+                let guard = state.sleeper_lock.lock().unwrap();
+
+                // 3. Double check queue under lock to avoid race conditions
+                if let Some(task) = state.queue.pop() {
+                    drop(guard); // Unlock before running
+                    state.idle_workers.fetch_sub(1, Ordering::SeqCst);
+                    state.task_count.fetch_sub(1, Ordering::SeqCst);
+                    break Some(task);
+                }
+
+                // 4. Wait for signal
+                let (guard, result) = state.cond.wait_timeout(guard, keep_alive).unwrap();
+                drop(guard);
+                state.idle_workers.fetch_sub(1, Ordering::SeqCst);
+
+                // 5. If timed out and still empty, maybe exit
+                if result.timed_out()
+                    && state.queue.is_empty()
+                    && state.active_workers.load(Ordering::SeqCst) > core_threads
+                {
+                    return;
+                }
+                // Loop back to try pop or sleep again
             };
 
             if let Some(task) = task {
