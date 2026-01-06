@@ -283,6 +283,25 @@ impl Spawner {
             panic!("Worker {} not found in registry", worker_id);
         }
     }
+    pub(crate) fn spawn_to_with_mesh(
+        &self,
+        job: Job,
+        worker_id: usize,
+        mesh: &RefCell<MeshContext>,
+        driver: &RefCell<PlatformDriver>,
+    ) {
+        // Try Mesh
+        let mut mesh = mesh.borrow_mut();
+        let mut driver = driver.borrow_mut();
+
+        if let Err(returned_job) = mesh.send_to(worker_id, job, &mut driver) {
+            // Mesh full or error, fallback to global injector
+            // Drop locks before fallback
+            drop(mesh);
+            drop(driver);
+            self.spawn_job_to(returned_job, worker_id);
+        }
+    }
 }
 
 /// Builder for LocalExecutor.

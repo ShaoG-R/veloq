@@ -211,10 +211,8 @@ impl RuntimeContext {
         let (handle, job) = crate::runtime::executor::pack_job(future);
 
         // Optimization: If spawning to self, just push to local queue
-        if let Some(mesh_weak) = &self.mesh
-            && let Some(mesh_rc) = mesh_weak.upgrade()
-        {
-            if mesh_rc.borrow().id == worker_id {
+        if let Some(my_handle) = &self.handle {
+            if my_handle.id() == worker_id {
                 let queue = self
                     .queue
                     .upgrade()
@@ -223,18 +221,15 @@ impl RuntimeContext {
                 queue.borrow_mut().push_back(task);
                 return handle;
             }
+        }
 
-            // Try Mesh
-            if let Some(driver_rc) = self.driver.upgrade() {
-                let mut mesh = mesh_rc.borrow_mut();
-                let mut driver = driver_rc.borrow_mut();
-
-                if let Err(returned_job) = mesh.send_to(worker_id, job, &mut driver) {
-                    // Mesh full or error, fallback to global injector
-                    spawner.spawn_job_to(returned_job, worker_id);
-                }
-                return handle;
-            }
+        // Try Mesh
+        if let Some(mesh_weak) = &self.mesh
+            && let Some(mesh_rc) = mesh_weak.upgrade()
+            && let Some(driver_rc) = self.driver.upgrade()
+        {
+            spawner.spawn_to_with_mesh(job, worker_id, &mesh_rc, &driver_rc);
+            return handle;
         }
 
         // Fallback (e.g., no mesh or driver dropped)
