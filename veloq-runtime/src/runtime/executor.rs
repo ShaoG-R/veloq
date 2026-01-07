@@ -397,9 +397,12 @@ impl LocalExecutor {
         }
 
         let mut pinned_future = Box::pin(future);
-        let main_woken = Arc::new(AtomicBool::new(true));
         let remote_waker = self.driver.borrow().create_waker();
-        let waker = atomic_waker(main_woken.clone(), remote_waker);
+        let state = Arc::new(AtomicWakerState {
+            flag: AtomicBool::new(true),
+            remote: remote_waker,
+        });
+        let waker = waker_from_state(state.clone());
         let mut cx = Context::from_waker(&waker);
 
         const BUDGET: usize = 64;
@@ -416,7 +419,7 @@ impl LocalExecutor {
                 }
 
                 // 1. Poll Main Future
-                if main_woken.swap(false, Ordering::AcqRel) {
+                if state.flag.swap(false, Ordering::AcqRel) {
                     did_work = true;
                     executed += 1;
                     if let Poll::Ready(val) = pinned_future.as_mut().poll(&mut cx) {
@@ -450,7 +453,7 @@ impl LocalExecutor {
             }
 
             // 5. IO Wait & Park
-            self.park_and_wait(&main_woken);
+            self.park_and_wait(&state.flag);
         }
     }
 }
@@ -482,12 +485,11 @@ impl Default for LocalExecutor {
 // ============ Thread-Safe Main Task Waker Implementation ============
 
 struct AtomicWakerState {
-    flag: Arc<AtomicBool>,
+    flag: AtomicBool,
     remote: Arc<dyn RemoteWaker>,
 }
 
-fn atomic_waker(flag: Arc<AtomicBool>, remote: Arc<dyn RemoteWaker>) -> Waker {
-    let state = Arc::new(AtomicWakerState { flag, remote });
+fn waker_from_state(state: Arc<AtomicWakerState>) -> Waker {
     let ptr = Arc::into_raw(state) as *const ();
     let raw = RawWaker::new(ptr, &ATOMIC_WAKER_VTABLE);
     unsafe { Waker::from_raw(raw) }
