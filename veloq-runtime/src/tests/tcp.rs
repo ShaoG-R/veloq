@@ -2,7 +2,7 @@
 
 use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool};
 use crate::net::tcp::{TcpListener, TcpStream};
-use crate::runtime::executor::{LocalExecutor, Runtime};
+use crate::runtime::{LocalExecutor, Runtime};
 use crate::spawn_local;
 use std::net::SocketAddr;
 use std::rc::Rc;

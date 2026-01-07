@@ -69,10 +69,10 @@ You can execute cargo commands directly inside the container without SSH:
 
 ```bash
 # Run cargo check
-docker-compose run --rm dev cargo check
+docker-compose run --rm standalone cargo check
 
 # Run tests
-docker-compose run --rm dev cargo test
+docker-compose run --rm standalone cargo test
 
 # Open a shell
 docker-compose run --rm dev bash

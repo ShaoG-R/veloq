@@ -25,8 +25,8 @@
 ### Docker
 - **构建镜像**: `docker build -t veloq .`
 - **运行容器**: `docker run -it veloq`
-- **直接运行检查**: `docker-compose run --rm dev cargo check`
-- **直接运行测试**: `docker-compose run --rm dev cargo test`
+- **直接运行检查**: `docker-compose run --rm standalone cargo check`
+- **直接运行测试**: `docker-compose run --rm standalone cargo test`
 - **运行性能基准测试**: `docker-compose run --rm standalone cargo bench`
 - **更新 nix 依赖**: `docker-compose run --rm flake-update`
 

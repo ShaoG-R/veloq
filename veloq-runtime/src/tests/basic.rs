@@ -1,6 +1,6 @@
 //! Basic runtime tests for spawn and spawn_local functionality.
 
-use crate::runtime::executor::{LocalExecutor, Runtime};
+use crate::runtime::{LocalExecutor, Runtime};
 use crate::spawn_local;
 use std::cell::RefCell;
 use std::rc::Rc;
