@@ -86,7 +86,15 @@ docker-compose run --rm dev bash
 4. Enter password `root` when prompted.
 5. Once connected, open the `/root/workspace` folder.
 
-## 5. Notes
+## 6. Performance Benchmarking
+
+For consistent results, run benchmarks in `standalone` mode to avoid filesystem bridging overhead:
+
+```bash
+docker-compose run --rm standalone cargo bench
+```
+
+## 7. Notes
 
 - **Source Code**: The current directory is mounted to `/root/workspace` in the container. Changes propagate instantly.
 - **Port Mapping**:
