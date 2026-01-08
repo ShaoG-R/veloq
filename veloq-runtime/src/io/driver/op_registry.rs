@@ -72,6 +72,8 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
         self.slab.page_count()
     }
 
+    // Expose mask to drivers
+    pub const INDEX_MASK: usize = StableSlab::<OpEntry<Op, P>>::index_mask();
     pub const PAGE_SHIFT: usize = StableSlab::<OpEntry<Op, P>>::PAGE_SHIFT;
 
     pub fn poll_op(
