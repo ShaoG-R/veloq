@@ -61,6 +61,7 @@ pub const NO_REGISTRATION_INDEX: u16 = u16::MAX;
 #[derive(Debug)]
 pub struct PoolVTable {
     pub dealloc: unsafe fn(pool_data: NonNull<()>, params: DeallocParams),
+    pub resolve_region_info: unsafe fn(pool_data: NonNull<()>, buf: &FixedBuf) -> (usize, usize),
 }
 
 #[derive(Debug)]
@@ -187,6 +188,13 @@ impl FixedBuf {
     #[inline(always)]
     pub fn buf_index(&self) -> u16 {
         self.global_index
+    }
+
+    /// Resolve which region this buffer belongs to and its offset.
+    /// This is used for driver submission (RIO / io_uring).
+    #[inline(always)]
+    pub fn resolve_region_info(&self) -> (usize, usize) {
+        unsafe { (self.vtable.resolve_region_info)(self.pool_data, self) }
     }
 
     #[inline(always)]

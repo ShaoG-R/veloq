@@ -3,7 +3,7 @@
 //! This module implements the logic for submitting operations, handling completions,
 //! and accessing FDs, exposed as static functions for VTable construction.
 
-use crate::io::buffer::FixedBuf;
+use crate::io::buffer::{FixedBuf, NO_REGISTRATION_INDEX};
 use crate::io::driver::iocp::blocking::{BlockingTask, CompletionInfo};
 use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::op::{IocpOp, SubmitContext};
@@ -235,38 +235,42 @@ pub(crate) unsafe fn submit_recv(
 
     // Try RIO upgrade
     if let Some(_) = ctx.rio_cq {
-        let buf_addr = val.buf.as_mut_ptr() as usize;
-        let buf_len = val.buf.capacity();
+        if val.buf.buf_index() != NO_REGISTRATION_INDEX {
+            let (idx, offset) = val.buf.resolve_region_info();
+            if let Some(info) = ctx.registered_bufs.get(idx) {
+                let buf_id = info.id;
+                let buf_len = val.buf.capacity();
+                // RIO Offset is relative to the registered buffer start
+                let offset = offset as u32;
 
-        // Check if buffer is registered
-        if let Ok((buf_id, offset)) = resolve_rio_buffer(buf_addr, buf_len, ctx.registered_bufs) {
-            // Check/Create RQ
-            if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
-                // RIO Path
-                let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                    BufferId: buf_id,
-                    Offset: offset,
-                    Length: buf_len as u32,
-                };
+                // Check/Create RQ
+                if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
+                    // RIO Path
+                    let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
+                        BufferId: buf_id,
+                        Offset: offset,
+                        Length: buf_len as u32,
+                    };
 
-                let table = ctx.ext.rio_table.as_ref().unwrap();
-                let recv_fn = table.RIOReceive.unwrap();
-                let request_context = op.header.user_data as *mut std::ffi::c_void;
+                    let table = ctx.ext.rio_table.as_ref().unwrap();
+                    let recv_fn = table.RIOReceive.unwrap();
+                    let request_context = op.header.user_data as *mut std::ffi::c_void;
 
-                let ret = unsafe {
-                    recv_fn(
-                        rq,
-                        &rio_buf,
-                        1,
-                        0, // flags
-                        request_context,
-                    )
-                };
+                    let ret = unsafe {
+                        recv_fn(
+                            rq,
+                            &rio_buf,
+                            1,
+                            0, // flags
+                            request_context,
+                        )
+                    };
 
-                if ret == 0 {
-                    return Err(io::Error::last_os_error());
+                    if ret == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    return Ok(SubmissionResult::Pending);
                 }
-                return Ok(SubmissionResult::Pending);
             }
         }
     }
@@ -311,27 +315,31 @@ pub(crate) unsafe fn submit_send(
 
     // Try RIO upgrade
     if let Some(_) = ctx.rio_cq {
-        let buf_addr = val.buf.as_slice().as_ptr() as usize;
-        let buf_len = val.buf.len();
+        if val.buf.buf_index() != NO_REGISTRATION_INDEX {
+            let (idx, offset) = val.buf.resolve_region_info();
+            if let Some(info) = ctx.registered_bufs.get(idx) {
+                let buf_id = info.id;
+                let buf_len = val.buf.len();
+                let offset = offset as u32;
 
-        if let Ok((buf_id, offset)) = resolve_rio_buffer(buf_addr, buf_len, ctx.registered_bufs) {
-            if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
-                let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                    BufferId: buf_id,
-                    Offset: offset,
-                    Length: buf_len as u32,
-                };
+                if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
+                    let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
+                        BufferId: buf_id,
+                        Offset: offset,
+                        Length: buf_len as u32,
+                    };
 
-                let table = ctx.ext.rio_table.as_ref().unwrap();
-                let send_fn = table.RIOSend.unwrap();
-                let request_context = op.header.user_data as *mut std::ffi::c_void;
+                    let table = ctx.ext.rio_table.as_ref().unwrap();
+                    let send_fn = table.RIOSend.unwrap();
+                    let request_context = op.header.user_data as *mut std::ffi::c_void;
 
-                let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
+                    let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
 
-                if ret == 0 {
-                    return Err(io::Error::last_os_error());
+                    if ret == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    return Ok(SubmissionResult::Pending);
                 }
-                return Ok(SubmissionResult::Pending);
             }
         }
     }
@@ -841,57 +849,5 @@ fn ensure_rio_rq(ctx: &mut SubmitContext, fd: IoFd, handle: HANDLE) -> io::Resul
             io::ErrorKind::Unsupported,
             "RIO not initialized",
         ))
-    }
-}
-
-// Helper to find RIO buffer info based on address
-fn resolve_rio_buffer(
-    addr: usize,
-    len: usize,
-    registered_bufs: &[crate::io::driver::iocp::RioBufferInfo],
-) -> io::Result<(windows_sys::Win32::Networking::WinSock::RIO_BUFFERID, u32)> {
-    // Optimization 1: Single Region
-    // Most high-performance scenarios will use a single large registered buffer.
-    if registered_bufs.len() == 1 {
-        let reg = &registered_bufs[0];
-        if addr >= reg.addr && addr + len <= reg.addr + reg.len {
-            let offset = (addr - reg.addr) as u32;
-            return Ok((reg.id, offset));
-        }
-        // If not in single region, fail early or fall through (will fail binary search anyway)
-    }
-
-    // Binary search for the region containing the start address
-    // We are looking for the region where region.addr <= addr < region.addr + region.len
-    // sort_by returns Ordering.
-
-    let res = registered_bufs.binary_search_by(|reg| {
-        if addr < reg.addr {
-            std::cmp::Ordering::Greater
-        } else if addr >= reg.addr + reg.len {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
-
-    match res {
-        Ok(idx) => {
-            let reg = &registered_bufs[idx];
-            // Verify the whole buffer fits in the region
-            if addr + len <= reg.addr + reg.len {
-                let offset = (addr - reg.addr) as u32;
-                Ok((reg.id, offset))
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Buffer spans multiple RIO regions or overflows",
-                ))
-            }
-        }
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Buffer not registered with RIO (not found)",
-        )),
     }
 }

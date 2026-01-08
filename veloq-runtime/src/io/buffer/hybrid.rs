@@ -253,6 +253,7 @@ impl std::fmt::Debug for HybridPool {
 // VTable Shim
 static HYBRID_POOL_VTABLE: PoolVTable = PoolVTable {
     dealloc: hybrid_dealloc_shim,
+    resolve_region_info: hybrid_resolve_region_info_shim,
 };
 
 unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
@@ -270,6 +271,26 @@ unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
             eprintln!("HybridPool dealloc error: {}", _e);
         }
     }
+}
+
+unsafe fn hybrid_resolve_region_info_shim(
+    pool_data: NonNull<()>,
+    buf: &FixedBuf,
+) -> (usize, usize) {
+    let raw = pool_data.as_ptr() as *const RefCell<HybridAllocator>;
+    let rc = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
+
+    let idx = buf.buf_index();
+    if idx == NO_REGISTRATION_INDEX {
+        panic!("Accessing region info of global fallback buffer");
+    }
+
+    let inner = rc.borrow();
+    let slab = &inner.slabs[idx as usize];
+    let base = slab.memory.as_ptr() as usize;
+    let ptr = buf.as_ptr() as usize;
+
+    (idx as usize, ptr - base)
 }
 
 impl HybridPool {

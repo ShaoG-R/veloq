@@ -283,6 +283,7 @@ impl std::fmt::Debug for BuddyPool {
 // Static VTable for Type Erasure
 static BUDDY_POOL_VTABLE: PoolVTable = PoolVTable {
     dealloc: buddy_dealloc_shim,
+    resolve_region_info: buddy_resolve_region_info_shim,
 };
 
 unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
@@ -300,6 +301,16 @@ unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     // 4. Perform dealloc
     let mut inner = pool_rc.borrow_mut();
     unsafe { inner.dealloc(block_start_non_null, order) };
+}
+
+unsafe fn buddy_resolve_region_info_shim(pool_data: NonNull<()>, buf: &FixedBuf) -> (usize, usize) {
+    let raw = pool_data.as_ptr() as *const RefCell<BuddyAllocator>;
+    let rc = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
+    let inner = rc.borrow();
+    (
+        0,
+        (buf.as_ptr() as usize).saturating_sub(inner.base_ptr as usize),
+    )
 }
 
 impl BuddyPool {

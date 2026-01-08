@@ -4,122 +4,107 @@
 
 ## 1. 概要 (Overview)
 
-`veloq-runtime` 的 Windows 驱动层位于 `src/io/driver/iocp/` 目录下。它实现了 `Driver` trait，为上层运行时提供异步 I/O 支持。该驱动采用了 **Proactor** 模式，利用 Windows 内核提供的 IOCP 机制来处理网络和文件 I/O 事件。
+`veloq-runtime` 的 Windows 驱动层实现了 `Driver` trait，为上层运行时提供异步 I/O 支持。该驱动采用了 **Proactor** 模式，利用 Windows 内核提供的 IOCP 机制来处理网络和文件 I/O 事件。
 
-## 2. 理念和思路 (Philosophy and Design)
+一个显著的特点是它实现了 **混合 I/O 模型**：对于标准句柄使用传统的 IOCP 模型，而对于支持 Registered I/O (RIO) 的网络操作，则自动尝试升级到更高效的 RIO 路径，以降低内核开销。
+
+## 2. 理念和思路 (Concepts)
 
 ### 2.1 Proactor 模型
-与 Linux 下常用的 Reactor 模型（如 epoll，尽管 io_uring 也是 Proactor）不同，IOCP 是原生的 Proactor 模型。应用程序“投递”一个 I/O 请求（如 `ReadFile`），内核在操作完成后通知应用程序。
-
-在此驱动中，我们提交操作时会将 `OVERLAPPED` 结构体的指针传递给内核。为了安全地做到这一点，我们必须保证 `OVERLAPPED` 结构体在操作期间内存地址固定且有效。
+IOCP 是原生的 Proactor 模型。应用程序“投递”一个 I/O 请求（如 `ReadFile` 或 `RIOReceive`），内核在操作完成后通知应用程序。在此期间，驱动必须保证传递给内核的数据结构（如 `OVERLAPPED` 或 `RIO_BUF`）地址固定且有效。
 
 ### 2.2 内存稳定性与 StableSlab
-由于异步操作通过指针引用 `OVERLAPPED`，我们使用了 `StableSlab` (`src/io/driver/stable_slab.rs`) 来存储飞行中（In-Flight）的操作。
-- `StableSlab` 保证元素在插入后直到由于完成被移除前，其内存地址不会改变（即使 `Slab` 扩容）。
-- 它通过分配一系列固定大小的页面（Page）来实现这一点，而不是像普通 `Vec` 那样重新分配。
+由于异步操作通过指针引用 `OVERLAPPED`，我们使用了 `StableSlab` 来存储飞行中（In-Flight）的操作。
+- `StableSlab` 保证元素在插入后直到被移除前，其内存地址不会改变。
+- 这允许我们将 `IocpOp` 的指针直接转换为 `OVERLAPPED` 指针传递给系统 API。
 
 ### 2.3 类型擦除与 VTable (Type Erasure)
-为了避免使用巨大的 `Enum` 来定义所有可能的 I/O 操作（这会导致 `Op` 结构体膨胀到最大变体的大小），本驱动使用了自定义的类型擦除技术 (`src/io/driver/iocp/op.rs`)。
-- **Union Payload**: 所有具体的 Op 负载（如 `ReadFixed`, `Connect`）存储在一个 `union` 中。
-- **VTable**: 每个 Op 类型提供一个 `OpVTable`（包含 `submit`, `on_complete`, `drop` 等函数指针）。
-- 这使得 `IocpOp` 结构体保持紧凑，同时支持动态分发，且无需动态分配（Heap Allocation）每个 Op。
+为了避免使用巨大的 `Enum` 定义所有 I/O 操作，驱动使用了自定义的类型擦除技术 (`src/io/driver/iocp/op.rs`)。
+- **Union Payload**: 所有具体的 Op 负载（如 `ReadFixed`, `Connect`, `SendToPayload`）存储在一个 `union` 中。
+- **VTable Logic**: 配合 `define_iocp_ops!` 宏，自动为每个 Op 生成 `OpVTable`（包含 `submit`, `on_complete`, `drop`, `get_fd` 等函数指针）。
+- 这使得 `IocpOp` 结构体保持紧凑，同时支持动态分发，无需堆分配。
 
 ### 2.4 阻塞操作分流 (Blocking Offload)
-Windows 的文件 I/O 即使使用 `OVERLAPPED`，在某些元数据操作（如 `Open`, `Close`）或由于缓存原因，仍可能在调用线程上同步阻塞。为了不阻塞运行时的 Reactor 线程，我们将这些操作分流到专用的线程池 (`src/io/driver/iocp/blocking.rs`)。
-- 线程池执行完阻塞任务后，通过 `PostQueuedCompletionStatus` 向 IOCP 端口发送完成通知，使其看起来像一个普通的异步完成事件。
+文件系统的某些元数据操作（如 `Open`, `Close`, `Fsync`）在 Windows 上往往是同步阻塞的。为了不阻塞 Reactor 线程，这些操作被自动分流到内部的 `ThreadPool` (`src/io/driver/iocp/blocking.rs`)。
+- 线程池任务完成后，手动调用 `PostQueuedCompletionStatus` 向 IOCP 端口发送完成通知，使其在主循环中表现为普通的异步事件。
+
+### 2.5 Registered I/O (RIO) 集成
+为了追求极致的网络性能，驱动集成了 Windows RIO 扩展。
+- **缓冲区注册**: 通过 `register_buffers` 接口，预先将内存注册到内核。
+- **逻辑区域映射 (Logical Region Mapping)**: Veloq 引入了创新的缓冲区管理设计。`BufferPool` 负责将内存划分为若干“逻辑区域”，每个区域对应一个索引。Windows 驱动将这些索引直接映射到 RIO Buffer ID，避免了在提交路径进行二分查找 (O(logN))，实现了 O(1) 的超高速缓冲区解析。
+- **请求队列 (RQ)**: 为每个 Socket 创建 RIO Request Queue。
+- **完成队列 (CQ)**: 全局使用一个 RIO Completion Queue，并将其完成通知绑定到 IOCP 端口。
+- **自动降级**: 在提交操作时 (`submit.rs`)，驱动会通过 `resolve_region_info` 快速判断 Buffer 是否已注册。如果环境支持 RIO 且 Buffer 有效，则走 RIO 路径；否则回退到普通 `ReadFile`/`WSARecv`。
 
 ## 3. 模块内结构 (Internal Structure)
 
-目录结构如下：
-
 ```
-src/io/driver/
-├── iocp.rs         // 驱动入口，IocpDriver 结构体定义，主循环逻辑
-└── iocp/
-    ├── op.rs       // IocpOp 定义，VTable 定义，Union Payload 宏
-    ├── submit.rs   // 各个 Op 的具体提交逻辑 (submit_*) 和辅助函数
-    ├── blocking.rs // 阻塞任务线程池 (ThreadPool) 用于文件 Open/Close 等
-    ├── ext.rs      // Winsock 扩展函数加载 (ConnectEx, AcceptEx)
-    └── tests.rs    // 测试用例
+src/io/driver/iocp/
+├── op.rs       // IocpOp 定义, VTable, Union Payload, 宏定义
+├── submit.rs   // 核心提交逻辑，包含各 Op 的 submit_* 函数及 RIO 升级检查
+├── blocking.rs // 阻塞任务线程池
+├── ext.rs      // Winsock 扩展加载 (ConnectEx, AcceptEx, RIO Table)
+└── tests.rs    // 单元测试
 ```
 
-外部辅助模块：
-- `../op_registry.rs`: 管理操作生命周期，将 `user_data` 映射到 `IocpOp`。
-- `../stable_slab.rs`: 提供稳定地址的内存分配。
+外部交互：
+- `iocp.rs`: 驱动入口，包含 `IocpDriver` 结构体和主 `Poll` 循环。
 
 ## 4. 代码详细分析 (Detailed Analysis)
 
 ### 4.1 IocpDriver (`iocp.rs`)
-核心结构体 `IocpDriver` 拥有：
-- `port`: IOCP 句柄。
-- `ops`: `OpRegistry`，存储所有未完成的操作。
-- `pool`: `ThreadPool`，用于执行阻塞任务。
-- `wheel`: 时间轮，用于管理超时。
+`IocpDriver` 是整个驱动的核心，它管理着 IOCP 端口和 RIO 资源：
+- **资源管理**:
+    - `port`: IOCP 句柄。
+    - `rio_cq`: 全局 RIO 完成队列（如果可用）。
+    - `rio_rqs`: 句柄到 RIO 请求队列的映射。
+    - `registered_bufs`: 已注册的 RIO 缓冲区信息。
+- **主循环 (`get_completion`)**:
+    1. 计算定时器超时。
+    2. 调用 `GetQueuedCompletionStatus` 等待事件。
+    3. 如果收到 `RIO_EVENT_KEY`，则进入 `process_rio_completions` 处理 RIO 完成事件。
+    4. 如果是普通 IOCP 事件或阻塞池任务，直接处理 `OVERLAPPED` 关联的 `user_data`。
+    5. 处理时间轮（Wheel）超时。
 
-**主循环 (`get_completion`)**:
-1. 计算下一个定时器的超时时间 `wait_ms`。
-2. 调用 `GetQueuedCompletionStatus` 阻塞等待 I/O 完成或超时。
-3. 处理超时事件：从时间轮中取出过期的 `user_data` 并唤醒对应任务。
-4. 处理 I/O 完成事件：
-   - 提取 `user_data`。
-   - 在 `ops` 中找到对应的操作。
-   - 如果是普通 I/O，调用 `vtable.on_complete`（如果存在），设置 `op.result`。
-   - 如果是阻塞任务，从 `blocking_result` 获取结果。
-   - 唤醒 `Waker`。
+### 4.2 扩展加载 (`ext.rs`)
+Windows 的高性能扩展 API 需要在运行时加载。`Extensions::new()` 负责：
+- 创建临时 Socket。
+- 使用 `WSAIoctl` 加载 `AcceptEx`, `ConnectEx`, `GetAcceptExSockaddrs`。
+- 尝试加载 `RIO_EXTENSION_FUNCTION_TABLE`。如果系统不支持（如 Win7），则无缝降级，`rio_table` 为 `None`。
 
-### 4.2 操作定义 (`op.rs`)
-`IocpOp` 结构体设计精巧：
-```rust
-#[repr(C)]
-pub struct IocpOp {
-    pub header: OverlappedEntry, // 包含 OVERLAPPED，其地址传递给内核
-    pub vtable: &'static OpVTable,
-    pub payload: IocpOpPayload, // Union
-}
-```
-宏 `define_iocp_ops!` 自动生成了 `IntoPlatformOp` 实现，将高层的 `Op` 结构体（如 `ReadFixed`）转换为底层的 `IocpOp`，并设置正确的 VTable。
+### 4.3 智能提交 (`submit.rs`)
+该模块定义了所有操作的提交逻辑。宏 `submit_io_op!` 和 `impl_lifecycle!` 大简化了代码。
+- **Recv/Send 的双路径**:
+    以 `submit_recv` 为例：
+    1. 检查 `ctx.rio_cq` 是否存在（RIO 可用）。
+    2. **O(1) 缓冲区解析**: 调用 `val.buf.resolve_region_info()` 获取区域索引。直接使用该索引访问 `registered_bufs` 数组获取 RIO Buffer ID，不再需要昂贵的二分查找。
+    3. 检查/创建 Socket 对应的 Request Queue (`ensure_rio_rq`)。
+    4. 若条件满足，调用 `RIOReceive`；否则调用 `ReadFile` / `WSARecv`。
+    这种设计对上层透明，用户只需使用 `register_buffers` 即可享受 RIO 加速。
 
-### 4.3 提交逻辑 (`submit.rs`)
-该模块包含一系列静态函数，如 `submit_read_fixed`。
-- 它们接收 `&mut IocpOp`。
-- 通过 `resolve_fd` 将逻辑句柄转换为 `HANDLE`。
-- 调用 Windows API（如 `ReadFile`, `WSASendTo`）。
-- 如果 API 返回 `ERROR_IO_PENDING`，返回 `SubmissionResult::Pending`。
-- 对于 `Open`/`Close` 等，返回 `SubmissionResult::Offload(task)`，指示驱动将其放入线程池。
+### 4.4 操作定义 (`op.rs`)
+通过 `define_iocp_ops!` 宏定义了如 `Accept`, `SendTo`, `Wakeup` 等操作。
+- 对于复杂操作（如 `Accept` 需要预分配 buffer，`SendTo` 需要地址结构），宏支持自定义 `contruct` 和 `destruct` 闭包来管理 `Payload` 中的附加数据。
+- `SubmitContext` 结构体在提交时被借用传递，包含了 `ext` (扩展表), `rio_rqs`, `registered_files` 等所有提交所需的上下文。
 
-### 4.4 阻塞线程池 (`blocking.rs`)
-实现了一个基于条件变量和 `SegQueue` 的动态线程池。
-- **任务模型**: 定义了 `BlockingTask` 枚举 (`Open`, `Close`, `Fsync`, `Fallocate`)。
-- **完成通知**: 任务完成后，调用 `BlockingTask::complete`，它会更新 `IocpOp` 中的 `blocking_result`，并通过 `PostQueuedCompletionStatus` 唤醒 IOCP 端口。这保证了所有完成事件（无论是真异步还是线程池模拟）都在同一个入口 (`get_completion`) 被处理。
+## 5. 存在的问题和 TODO
 
-### 4.5 扩展函数 (`ext.rs`)
-Windows 的高性能网络 API（如 `ConnectEx` 和 `AcceptEx`）不是直接导出的，需要通过 `WSAIoctl` 在运行时获取函数指针。`Extensions` 结构体负责加载和持有这些指针。
+1.  **SyncFileRange 语义**:
+    - Windows 缺乏对应 Linux `sync_file_range` 的细粒度刷新 API。目前实现为全文件 Flush，性能可能低于预期。
 
-## 5. 存在的问题和 TODO (Issues and TODOs)
+2.  **RIO 覆盖范围**:
+    - 目前 RIO 路径主要覆盖了 `Recv` 和 `Send`。`SendTo`/`RecvFrom` (UDP) 的 RIO 路径尚未完全实现或测试。
 
-1.  **SyncFileRange 支持**:
-    - Windows 没有对应 Linux `sync_file_range` 的细粒度控制。当前实现 (`submit_sync_range` -> `FlushFileBuffers`) 等同于全文件 `fsync`，性能开销较大。
-    - **TODO**: 调研是否有更优替代方案，或者文档明确此行为差异。
-
-2.  **线程池策略**:
-    - 当前 `ThreadPool` 使用简单的动态伸缩策略。对于高并发且大量阻塞文件操作的场景，可能需要更复杂的调度或限制策略以防止线程爆炸。
-
-3.  **缓冲区管理**:
-    - 目前 `send` / `recv` 使用了 `FixedBuf`，但并未完全利用 Windows 的注册 I/O (Registered I/O, RIO) 特性。RIO 可以进一步减少内核开销。
-
-4.  **AcceptEx 地址解析**:
-    - `on_complete_accept` 中使用了 `GetAcceptExSockaddrs` 解析地址。这部分代码涉及复杂的指针操作，需要持续关注安全性。
+3.  **线程池策略**:
+    - `blocking.rs` 中的线程池虽然支持动态伸缩，但缺乏基于负载的精细化调度，海量阻塞文件操作可能导致线程数抖动。
 
 ## 6. 未来的方向 (Future Directions)
 
-1.  **Registered I/O (RIO)**:
-    - 探索集成 Windows RIO API，以显著降低高吞吐网络应用的 CPU 使用率。这将需要重构 buffer 管理部分以适应 RIO 的 Buffer Region 机制。
+1.  **UDP RIO 优化**:
+    - 完善 `submit_send_to`和 `submit_recv_from` 的 RIO 分支，使 UDP 应用也能利用 RIO 的高性能。
 
-2.  **完成通知优化**:
-    - 目前使用 `GetQueuedCompletionStatus` 一次取一个事件。可以使用 `GetQueuedCompletionStatusEx` 一次批量获取多个完成事件，减少系统调用次数（类似于 io_uring 的批量周转）。
+2.  **完成通知批处理**:
+    - 目前 `GetQueuedCompletionStatus` 是一次处理一个。可以引入 `GetQueuedCompletionStatusEx` 批量获取，减少系统调用。`process_rio_completions` 已经实现了批量出队。
 
-3.  **取消机制 (Cancellation)**:
-    - 目前的 `cancel_op` 尝试使用 `CancelIoEx`。需要确保在所有边缘情况下（如驱动正在析构、操作已经部分完成）该机制都能安全工作。
-
-4.  **错误处理细化**:
-    - 将 Windows特定的错误码更友好的映射到 `std::io::Error`，特别是网络相关的错误。
+3.  **错误码标准化**:
+    - 进一步完善 WSA Error 到 `std::io::Error` 的映射，提供更跨平台一致的错误语义。

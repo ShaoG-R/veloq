@@ -45,8 +45,6 @@ pub enum PlatformData {
 #[derive(Debug, Clone, Copy)]
 pub struct RioBufferInfo {
     pub(crate) id: RIO_BUFFERID,
-    pub(crate) addr: usize,
-    pub(crate) len: usize,
 }
 
 pub struct IocpDriver {
@@ -351,7 +349,6 @@ impl IocpDriver {
             self.registered_bufs.reserve(regions.len());
 
             for region in regions {
-                let addr = region.ptr.as_ptr() as usize;
                 let len = region.len;
                 // Register buffer with RIO
                 let id = unsafe { reg_fn(region.ptr.as_ptr() as *const u8, len as u32) };
@@ -360,10 +357,8 @@ impl IocpDriver {
                     return Err(io::Error::last_os_error());
                 }
 
-                self.registered_bufs.push(RioBufferInfo { id, addr, len });
+                self.registered_bufs.push(RioBufferInfo { id });
             }
-            // Sort by address to enable binary search in submission path
-            self.registered_bufs.sort_by_key(|info| info.addr);
         }
         Ok(())
     }

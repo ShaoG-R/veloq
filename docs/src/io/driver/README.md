@@ -116,9 +116,11 @@ pub trait Driver {
     - **Windows**: IOCP 本身没有“提交队列满”的概念（它是直接调 API），但为了防止内存无限增长，我们人为限制了 `Slab` 的大小。
     - **TODO**: 统一 Backpressure（背压）策略，当驱动过载时，向上层返回明确的错误或挂起信号，而不是无限缓冲。
 
-2.  **Buffer Registration 抽象泄漏**:
-    - `register_buffers` 目前主要服务于 io_uring 的 Fixed Buffers。Windows 虽有 RIO (Registered I/O)，但 API 模型完全不同。目前的 Trait 定义偏向 Linux。
-    - **TODO**: 设计更通用的 Buffer Pool 注册接口，能够适配 RIO 的 Buffer Region 模型。
+2.  **Buffer Registration 抽象泄漏 (已解决)**:
+    - 引入了**逻辑区域映射 (Logical Region Mapping)** 层。
+    - `BufferPool` 将内存暴露为带索引的 Region。
+    - 驱动层（IOCP/Uring）分别将这些索引映射为 RIO Buffer ID 或 io_uring fixed indices。
+    - 结果：`FixedBuf` 只需携带一个通用的 `region_index`，实现了跨平台的 O(1) 提交，完全屏蔽了底层差异。
 
 3.  **同步文件 I/O**:
     - 在 io_uring 上文件 I/O 是真异步的。在 IOCP 上，部分文件操作（特别是打开/关闭）仍通过线程池模拟。这种差异导致性能特性的不一致。
