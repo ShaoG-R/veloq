@@ -22,8 +22,10 @@ Veloq 引入了 **Mesh** 概念：
 
 ### 2.3 显式上下文 (Explicit Context)
 为了避免隐式的全局状态（如 TLS 中的隐藏变量），Veloq 提供了 `RuntimeContext`：
-- 显式通过上下文访问 Spawner、Driver 和 Mesh。
-- `bind_pool` 强制要求缓冲区池与当前线程绑定，确保 I/O 内存操作的安全性（避免跨线程释放）。
+- 显式通过上下文访问 `Spawner` (用于负载均衡生成任务)、`Driver` (I/O) 和 `Mesh` (通信)。
+- `spawn_balanced`: 使用 P2C 算法进行负载均衡的任务生成。
+- `spawn`: 优先注入当前 Worker 的 Injector 队列。
+- `bind_pool`: 强制要求缓冲区池与当前线程绑定，确保 I/O 内存操作的安全性。
 
 ## 3. 模块内结构 (Internal Structure)
 
@@ -31,48 +33,56 @@ Veloq 引入了 **Mesh** 概念：
 
 ```
 src/runtime/
-├── context.rs    // 线程局部上下文 (TLS)，提供 spawn 接口和资源访问
+├── runtime.rs    // Runtime 主入口，包含 Runtime 结构体、RuntimeBuilder 及 Worker 线程启动逻辑
+├── context.rs    // 线程局部上下文 (TLS)，提供 spawn 接口和资源访问 (RuntimeContext)
 ├── task.rs       // 任务 (Task) 定义，手动实现的 RawWakerVTable
 ├── mesh.rs       // Mesh 网络通信原语 (SPSC Channel)
 ├── join.rs       // JoinHandle 实现，管理任务结果的异步等待
-├── executor.rs   // (入口) LocalExecutor 定义，Runtime 组装
+├── executor.rs   // LocalExecutor 定义，Worker 线程主循环
 └── executor/     // 执行器内部实现细节
     └── spawner.rs // 任务生成器、注册表 (Registry) 和负载均衡逻辑
 ```
 
 ## 4. 代码详细分析 (Detailed Analysis)
 
-### 4.1 Task (`task.rs`)
+### 4.1 Runtime & Initialization (`runtime.rs`)
+`Runtime` 结构体持有所有 Worker 线程的句柄 (`JoinHandle`) 和全局注册表 (`ExecutorRegistry`)。
+在 `RuntimeBuilder::build()` 过程中，会进行如下关键初始化：
+- **MeshMatrix**: 创建一个扁平化的 SPSC 通道矩阵，负责所有 Worker 之间的两两互联。
+- **Shared States**: 预分配所有 Worker 的共享状态 (`ExecutorShared`)，包含注入队列 (`Injector`) 和负载计数器。
+- **Thread Spawning**: 启动 Worker 线程，每个线程运行一个 `LocalExecutor`，并绑定对应的 Mesh 通道和 Buffer Pool。
+
+### 4.2 Context (`context.rs`)
+`RuntimeContext` 是运行时与任务之间的桥梁。它包含：
+- **Driver**: 指向底层 `PlatformDriver` 的弱引用。
+- **ExecutorHandle**: 当前执行器的句柄，包含共享状态 (Shared State)。
+- **Spawner**: 全局生成器，用于 `spawn_balanced`。
+- **Mesh**: 访问 Mesh 网络的能力。
+
+**Spawn 策略**:
+- `spawn_balanced(future)`: 使用 P2C (Power of Two Choices) 算法选择两个负载最小的 Worker 之一，通过 Mesh 发送任务。
+- `spawn(future)`: 将任务推入当前 Worker 的 Global Injector 队列。这比 Local Queue 慢一点（有原子操作），但允许任务被其他 Worker 窃取。
+
+### 4.3 Task (`task.rs`)
 Veloq 的 Task 是对 `Future` 的轻量级封装。
 - **RawWakerVTable**: 手动实现了虚函数表，而不是使用 `Arc::new(Mutex::new(..))`。
 - **内存布局**:
   `Rc<Task>` 包含 `RefCell<Option<Pin<Box<Future>>>>` 和指向执行器队列的 `Weak` 指针。
-  使用 `Rc` 而非 `Arc` 是因为 Task 通常在本地队列中流转，且 Veloq 鼓励本地计算。跨线程调度时，Task 会被打包成 `Job` (Box<FnOnce>) 传输，到达目标线程后再重新封装为本地 Task。
+  使用 `Rc` 而非 `Arc` 是因为 Task 通常在本地队列中流转，且 Veloq 鼓励本地计算。跨线程调度时，Task 会被打包成 `Job` (Box<FnOnce>) 传输。
 
-### 4.2 Mesh (`mesh.rs`)
-实现了高性能的 SPSC 环形缓冲区。
-- **Cache Padding**: 使用 `#[repr(align(128))]` 对 `Producer` 和 `Consumer` 的头尾指针进行隔离，防止伪共享 (False Sharing)。
-- **Batching**: 支持批量处理（虽然目前主要单次 pop），为未来的吞吐优化留出空间。
-- **Notify-on-Park**: 生产者在 push 时可以检查目标消费者的状态。如果目标处于 `PARKED` 状态，生产者会触发 I/O 驱动的唤醒机制 (Notify System)，确保目标及时处理消息。
-
-### 4.3 JoinHandle (`join.rs`)
+### 4.4 JoinHandle (`join.rs`)
 实现了任务结果的异步获取。
 - **无锁状态机**: 使用 `AtomicU8` 维护状态 (`IDLE` -> `WAITING` -> `READY`)。
-- **原子性**: 只有当消费者进入 `WAITING` 状态时，生产者才会尝试唤醒。这避免了不必要的 `Waker` 克隆和唤醒开销。
 - **Local vs Send**: 区分 `LocalJoinHandle` (单线程内) 和 `JoinHandle` (跨线程)，分别优化开销。
-
-### 4.4 Context (`context.rs`)
-- **Guard 模式**: 使用 `ContextGuard` 确保 `enter()` 和退出时的环境恢复。
-- **Buffer Pool 集成**: `bind_pool` 和 `try_bind_pool` 负责将 `BufPool` 注册到当前上下文，这是 io_uring 固定缓冲区机制生效的关键路径。
 
 ## 5. 存在的问题和 TODO (Issues and TODOs)
 
 1.  **Blocking IO 支持不足**:
-    目前缺乏一个专用的 `blocking_spawn` 线程池来处理重 CPU 或阻塞系统调用（非 I/O 类）。如果在 Veloq 任务中执行长时间同步代码，会阻塞整个 Worker Loop。
+    目前缺乏一个专用的 `blocking_spawn` 线程池来处理重 CPU 或阻塞系统调用（非 I/O 类）。
     *TODO*: 引入专用的 Blocking Thread Pool。
 
 2.  **Task Debugging**:
-    目前的 Task 结构体非常精简，缺乏调试信息（如任务名称、创建堆栈）。
+    目前的 Task 结构体非常精简，缺乏调试信息。
     *TODO*: 在 Debug 模式下注入追踪信息。
 
 3.  **Local Task 饿死**:
@@ -81,7 +91,7 @@ Veloq 的 Task 是对 `Future` 的轻量级封装。
 ## 6. 未来的方向 (Future Directions)
 
 1.  **结构化并发 (Structured Concurrency)**:
-    实现类似 `TaskScope` 的机制，支持任务组的自动取消和错误传播。
+    实现类似 `TaskScope` 的机制。
 
 2.  **协作式抢占 (Cooperative Preemption)**:
     目前依赖用户代码中的 `.await` 点进行调度。如果用户写了死循环，Worker 会卡死。未来可考虑结合编译器插件或计时器信号进行强制让出检测。

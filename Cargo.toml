@@ -1,7 +1,8 @@
 [workspace]
 members = [
-    "veloq-bitset", 
+    "veloq-bitset",
     "veloq-runtime",
     "veloq-wheel",
+    "veloq-examples/disk-bench",
 ]
 resolver = "3"

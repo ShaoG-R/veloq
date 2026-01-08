@@ -48,6 +48,7 @@
 高性能异步 I/O 运行时。
 - **核心组件**:
   - **Runtime Core (`src/runtime/`)**:
+    - **Runtime (`runtime.rs`)**: 运行时入口，定义 `Runtime` 结构体和组装逻辑。
     - **Mesh (`mesh.rs`)**: 无锁 SPSC 环形缓冲区，用于 Worker 间通信。使用 `#[repr(align(128))]` 防止伪共享。
     - **Executor (`executor.rs`)**:
       - `LocalExecutor`: 线程局部执行器。启动时会自动检测并注册当前线程绑定的 `BufPool`。
