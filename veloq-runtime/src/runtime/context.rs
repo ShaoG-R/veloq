@@ -178,17 +178,11 @@ impl RuntimeContext {
 
     /// Register buffers with the underlying driver.
     pub fn register_buffers(&self, pool: &dyn BufPool) {
-        #[cfg(target_os = "linux")]
         if let Some(driver) = self.driver.upgrade() {
-            let bufs = pool.get_registration_buffers();
             driver
                 .borrow_mut()
-                .register_buffers(&bufs)
+                .register_buffers(pool)
                 .expect("Failed to register buffer pool");
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = pool;
         }
     }
 

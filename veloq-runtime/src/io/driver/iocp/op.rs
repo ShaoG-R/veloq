@@ -11,7 +11,7 @@ use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::submit::{self, SubmissionResult};
 use crate::io::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    RecvFrom, RioRecv, RioSend, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
+    RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
 use crate::io::socket::SockAddrStorage;
 use std::io;
@@ -378,17 +378,5 @@ define_iocp_ops! {
         get_fd: submit::get_fd_wakeup,
         construct: |op| WakeupPayload { op },
         destruct: |p: WakeupPayload| p.op,
-    },
-    RioRecv {
-        field: rio_recv,
-        submit: submit::submit_rio_recv,
-        drop: submit::drop_rio_recv,
-        get_fd: submit::get_fd_rio_recv,
-    },
-    RioSend {
-        field: rio_send,
-        submit: submit::submit_rio_send,
-        drop: submit::drop_rio_send,
-        get_fd: submit::get_fd_rio_send,
     },
 }

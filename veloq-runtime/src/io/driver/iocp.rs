@@ -336,6 +336,37 @@ impl IocpDriver {
         }
         Ok(())
     }
+
+    pub fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()> {
+        // If RIO is not available, this is a no-op (or maybe we should return error if user expects it?)
+        // For now, we assume graceful fallback, so just return Ok if no RIO.
+        let register_fn = match &self.extensions.rio_table {
+            Some(table) if self.rio_cq.is_some() => table.RIORegisterBuffer,
+            _ => return Ok(()),
+        };
+
+        if let Some(reg_fn) = register_fn {
+            let regions = pool.get_memory_regions();
+            self.registered_bufs.clear();
+            self.registered_bufs.reserve(regions.len());
+
+            for region in regions {
+                let addr = region.ptr.as_ptr() as usize;
+                let len = region.len;
+                // Register buffer with RIO
+                let id = unsafe { reg_fn(region.ptr.as_ptr() as *const u8, len as u32) };
+
+                if id == RIO_INVALID_BUFFERID {
+                    return Err(io::Error::last_os_error());
+                }
+
+                self.registered_bufs.push(RioBufferInfo { id, addr, len });
+            }
+            // Sort by address to enable binary search in submission path
+            self.registered_bufs.sort_by_key(|info| info.addr);
+        }
+        Ok(())
+    }
 }
 
 impl Driver for IocpDriver {
@@ -512,34 +543,7 @@ impl Driver for IocpDriver {
     }
 
     fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()> {
-        // If RIO is not available, this is a no-op (or maybe we should return error if user expects it?)
-        // For now, we assume graceful fallback, so just return Ok if no RIO.
-        let register_fn = match &self.extensions.rio_table {
-            Some(table) if self.rio_cq.is_some() => table.RIORegisterBuffer,
-            _ => return Ok(()),
-        };
-
-        if let Some(reg_fn) = register_fn {
-            let regions = pool.get_memory_regions();
-            self.registered_bufs.clear();
-            self.registered_bufs.reserve(regions.len());
-
-            for region in regions {
-                let addr = region.ptr.as_ptr() as usize;
-                let len = region.len;
-                // Register buffer with RIO
-                let id = unsafe { reg_fn(region.ptr.as_ptr() as *const u8, len as u32) };
-
-                if id == RIO_INVALID_BUFFERID {
-                    return Err(io::Error::last_os_error());
-                }
-
-                self.registered_bufs.push(RioBufferInfo { id, addr, len });
-            }
-            // Sort by address to enable binary search in submission path
-            self.registered_bufs.sort_by_key(|info| info.addr);
-        }
-        Ok(())
+        self.register_buffers(pool)
     }
 
     fn register_files(
