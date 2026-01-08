@@ -1,11 +1,19 @@
 use std::io;
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, IPPROTO_TCP, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET, SOCK_STREAM,
-    WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_GETACCEPTEXSOCKADDRS, WSASocketW, WSA_FLAG_OVERLAPPED,
-    WSAIoctl, closesocket, INVALID_SOCKET,
+    AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCK_STREAM, SOCKADDR, SOCKET, WSA_FLAG_OVERLAPPED,
+    WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_GETACCEPTEXSOCKADDRS, WSAIoctl, WSASocketW, closesocket,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
-use windows_sys::Win32::Networking::WinSock::SOCKADDR;
+
+// Manually define RIO GUID if missing from windows-sys
+// 8509e081-96dd-4005-9cae-1123a3c2002f
+pub const WSAID_RIO_EXTENSION_FUNCTION_TABLE: windows_sys::core::GUID = windows_sys::core::GUID {
+    data1: 0x8509e081,
+    data2: 0x96dd,
+    data3: 0x4005,
+    data4: [0x9c, 0xae, 0x11, 0x23, 0xa3, 0xc2, 0x00, 0x2f],
+};
 
 // Function pointer types for WinSock extensions
 pub(crate) type LpfnAcceptEx = unsafe extern "system" fn(
@@ -40,10 +48,12 @@ pub(crate) type LpfnGetAcceptExSockaddrs = unsafe extern "system" fn(
     remotesockaddrlength: *mut i32,
 );
 
+#[derive(Clone, Copy)]
 pub struct Extensions {
     pub(crate) accept_ex: LpfnAcceptEx,
     pub(crate) connect_ex: LpfnConnectEx,
     pub(crate) get_accept_ex_sockaddrs: LpfnGetAcceptExSockaddrs,
+    pub(crate) rio_table: Option<RIO_EXTENSION_FUNCTION_TABLE>,
 }
 
 impl Extensions {
@@ -65,15 +75,28 @@ impl Extensions {
             let connect_ex = Self::get_extension(socket, WSAID_CONNECTEX)?;
             let get_accept_ex_sockaddrs = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
 
+            // Try to load RIO table. If it fails (e.g. strict Windows 7 without updates?), we can continue without RIO.
+            // But RIO was introduced in Win8/Server2012.
+            let rio_table = match Self::get_extension_struct::<RIO_EXTENSION_FUNCTION_TABLE>(
+                socket,
+                WSAID_RIO_EXTENSION_FUNCTION_TABLE,
+            ) {
+                Ok(table) => Some(table),
+                Err(_) => None,
+            };
+
             closesocket(socket);
 
             Ok(Self {
                 accept_ex: std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex),
-                connect_ex: std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex),
+                connect_ex: std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(
+                    connect_ex,
+                ),
                 get_accept_ex_sockaddrs: std::mem::transmute::<
                     *const std::ffi::c_void,
                     LpfnGetAcceptExSockaddrs,
                 >(get_accept_ex_sockaddrs),
+                rio_table,
             })
         }
     }
@@ -105,5 +128,34 @@ impl Extensions {
         }
 
         Ok(ptr as *const _)
+    }
+
+    unsafe fn get_extension_struct<T>(
+        socket: SOCKET,
+        guid: windows_sys::core::GUID,
+    ) -> io::Result<T> {
+        let mut guid = guid;
+        let mut output: T = unsafe { std::mem::zeroed() };
+        let mut bytes_returned = 0;
+
+        let ret = unsafe {
+            WSAIoctl(
+                socket,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                &mut guid as *mut _ as *mut _,
+                std::mem::size_of_val(&guid) as u32,
+                &mut output as *mut _ as *mut _,
+                std::mem::size_of_val(&output) as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(output)
     }
 }

@@ -328,19 +328,18 @@ impl BufPool for HybridPool {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn get_registration_buffers(&self) -> Vec<libc::iovec> {
+    fn get_memory_regions(&self) -> Vec<crate::io::buffer::BufferRegion> {
         let inner = self.inner.borrow();
-        let mut iovecs = Vec::with_capacity(inner.slabs.len());
+        let mut regions = Vec::with_capacity(inner.slabs.len());
 
         for slab in &inner.slabs {
             // Register the entire slab memory as a single buffer
-            iovecs.push(libc::iovec {
-                iov_base: slab.memory.as_ptr() as *mut _,
-                iov_len: slab.config.block_size * slab.config.count,
+            regions.push(crate::io::buffer::BufferRegion {
+                ptr: unsafe { NonNull::new_unchecked(slab.memory.as_ptr() as *mut _) },
+                len: slab.config.block_size * slab.config.count,
             });
         }
-        iovecs
+        regions
     }
 
     fn vtable(&self) -> &'static PoolVTable {

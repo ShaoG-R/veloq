@@ -406,11 +406,20 @@ impl UringDriver {
         Some(head)
     }
 
-    pub fn register_buffers(&mut self, iovecs: &[libc::iovec]) -> io::Result<()> {
+    pub fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()> {
         if self.buffers_registered {
             return Ok(());
         }
-        match unsafe { self.ring.submitter().register_buffers(iovecs) } {
+        let regions = pool.get_memory_regions();
+        let iovecs: Vec<libc::iovec> = regions
+            .iter()
+            .map(|region| libc::iovec {
+                iov_base: region.ptr.as_ptr() as *mut _,
+                iov_len: region.len,
+            })
+            .collect();
+
+        match unsafe { self.ring.submitter().register_buffers(&iovecs) } {
             Ok(_) => {
                 self.buffers_registered = true;
                 Ok(())
@@ -551,8 +560,8 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffers(&mut self, vec: &[libc::iovec]) -> io::Result<()> {
-        self.register_buffers(vec)
+    fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()> {
+        self.register_buffers(pool)
     }
 
     fn register_files(

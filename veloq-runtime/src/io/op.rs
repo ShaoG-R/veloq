@@ -309,6 +309,20 @@ pub struct Fallocate {
     pub len: u64,
 }
 
+#[cfg(windows)]
+/// Receive data using Windows Registered I/O (RIO).
+pub struct RioRecv {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+}
+
+#[cfg(windows)]
+/// Send data using Windows Registered I/O (RIO).
+pub struct RioSend {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+}
+
 // ============================================================================
 // OpLifecycle Implementations
 // ============================================================================

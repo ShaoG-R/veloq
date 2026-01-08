@@ -139,23 +139,11 @@ impl LocalExecutor {
         }
     }
 
-    /// Register buffers from a buffer pool with the underlying driver.
-    ///
-    /// This is primarily for io_uring on Linux to register fixed buffers.
-    /// On other platforms, this may be a no-op.
     pub fn register_buffers(&self, pool: &dyn BufPool) {
-        #[cfg(target_os = "linux")]
-        {
-            let bufs = pool.get_registration_buffers();
-            self.driver
-                .borrow_mut()
-                .register_buffers(&bufs)
-                .expect("Failed to register buffer pool");
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = pool;
-        }
+        self.driver
+            .borrow_mut()
+            .register_buffers(pool)
+            .expect("Failed to register buffer pool");
     }
 
     pub fn spawn_local<F, T>(&self, future: F) -> LocalJoinHandle<T>

@@ -11,7 +11,7 @@ use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::submit::{self, SubmissionResult};
 use crate::io::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
+    RecvFrom, RioRecv, RioSend, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
 use crate::io::socket::SockAddrStorage;
 use std::io;
@@ -45,13 +45,33 @@ impl OverlappedEntry {
 // VTable Definition
 // ============================================================================
 
-pub type SubmitFn = unsafe fn(
-    op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
-) -> io::Result<SubmissionResult>;
+use crate::io::driver::iocp::RioBufferInfo;
+use std::collections::HashMap;
+use windows_sys::Win32::Networking::WinSock::{RIO_CQ, RIO_RQ};
+
+// ============================================================================
+// SubmitContext Definition
+// ============================================================================
+
+pub struct SubmitContext<'a> {
+    pub port: HANDLE,
+    pub overlapped: *mut OVERLAPPED,
+    pub ext: &'a Extensions,
+    pub registered_files: &'a [Option<HANDLE>],
+
+    // RIO Support
+    pub rio_rqs: &'a mut HashMap<HANDLE, RIO_RQ>,
+    pub registered_rio_rqs: &'a mut [Option<RIO_RQ>],
+    pub rio_cq: Option<RIO_CQ>,
+    pub registered_bufs: &'a [RioBufferInfo],
+}
+
+// ============================================================================
+// VTable Definition
+// ============================================================================
+
+pub type SubmitFn =
+    unsafe fn(op: &mut IocpOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>;
 
 pub type OnCompleteFn =
     unsafe fn(op: &mut IocpOp, result: usize, ext: &Extensions) -> io::Result<usize>;
@@ -358,5 +378,17 @@ define_iocp_ops! {
         get_fd: submit::get_fd_wakeup,
         construct: |op| WakeupPayload { op },
         destruct: |p: WakeupPayload| p.op,
+    },
+    RioRecv {
+        field: rio_recv,
+        submit: submit::submit_rio_recv,
+        drop: submit::drop_rio_recv,
+        get_fd: submit::get_fd_rio_recv,
+    },
+    RioSend {
+        field: rio_send,
+        submit: submit::submit_rio_send,
+        drop: submit::drop_rio_send,
+        get_fd: submit::get_fd_rio_send,
     },
 }

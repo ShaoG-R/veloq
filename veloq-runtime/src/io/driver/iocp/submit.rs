@@ -6,7 +6,7 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::driver::iocp::blocking::{BlockingTask, CompletionInfo};
 use crate::io::driver::iocp::ext::Extensions;
-use crate::io::driver::iocp::op::IocpOp;
+use crate::io::driver::iocp::op::{IocpOp, SubmitContext};
 use crate::io::op::IoFd;
 use std::io;
 use std::mem::ManuallyDrop;
@@ -14,12 +14,12 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, WSARecvFrom,
-    WSASendTo, bind, getsockname, setsockopt,
+    AF_INET, AF_INET6, RIO_RQ, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR,
+    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError,
+    WSARecvFrom, WSASendTo, bind, getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
+use windows_sys::Win32::System::IO::CreateIoCompletionPort;
 
 // ============================================================================
 // Macros
@@ -65,21 +65,18 @@ macro_rules! impl_blocking_offload {
     ($fn_name:ident, $variant:ident, $task_variant:ident) => {
         pub(crate) unsafe fn $fn_name(
             op: &mut IocpOp,
-            port: HANDLE,
-            overlapped: *mut OVERLAPPED,
-            _ext: &Extensions,
-            registered_files: &[Option<HANDLE>],
+            ctx: &mut SubmitContext,
         ) -> io::Result<SubmissionResult> {
             let payload = unsafe { &*op.payload.$variant };
-            let handle = resolve_fd(payload.fd, registered_files)?;
+            let handle = resolve_fd(payload.fd, ctx.registered_files)?;
 
             let entry = &op.header;
             let user_data = entry.user_data;
 
             let completion = CompletionInfo {
-                port: port as usize,
+                port: ctx.port as usize,
                 user_data,
-                overlapped: overlapped as usize,
+                overlapped: ctx.overlapped as usize,
             };
 
             let task = BlockingTask::$task_variant {
@@ -130,10 +127,7 @@ macro_rules! submit_io_op {
     ($fn_name:ident, $field:ident, $win_api:ident, offset, $ptr_fn:expr) => {
         pub(crate) unsafe fn $fn_name(
             op: &mut IocpOp,
-            port: HANDLE,
-            overlapped: *mut OVERLAPPED,
-            _ext: &Extensions,
-            registered_files: &[Option<HANDLE>],
+            ctx: &mut SubmitContext,
         ) -> io::Result<SubmissionResult> {
             let val = unsafe { &mut *op.payload.$field };
             let entry = &mut op.header;
@@ -141,9 +135,9 @@ macro_rules! submit_io_op {
             entry.inner.Anonymous.Anonymous.Offset = val.offset as u32;
             entry.inner.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
 
-            let handle = resolve_fd(val.fd, registered_files)?;
+            let handle = resolve_fd(val.fd, ctx.registered_files)?;
             unsafe {
-                CreateIoCompletionPort(handle, port, 0, 0);
+                CreateIoCompletionPort(handle, ctx.port, 0, 0);
             }
 
             let mut bytes = 0;
@@ -157,7 +151,7 @@ macro_rules! submit_io_op {
                     ptr as _,
                     val.buf.len() as u32, // using len() which is common for buf/slice
                     &mut bytes,
-                    overlapped,
+                    ctx.overlapped,
                 )
             };
 
@@ -173,18 +167,15 @@ macro_rules! submit_io_op {
     ($fn_name:ident, $field:ident, $win_api:ident, no_offset, $ptr_fn:expr) => {
         pub(crate) unsafe fn $fn_name(
             op: &mut IocpOp,
-            port: HANDLE,
-            overlapped: *mut OVERLAPPED,
-            _ext: &Extensions,
-            registered_files: &[Option<HANDLE>],
+            ctx: &mut SubmitContext,
         ) -> io::Result<SubmissionResult> {
             let val = unsafe { &mut *op.payload.$field };
             op.header.inner.Anonymous.Anonymous.Offset = 0;
             op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
 
-            let handle = resolve_fd(val.fd, registered_files)?;
+            let handle = resolve_fd(val.fd, ctx.registered_files)?;
             unsafe {
-                CreateIoCompletionPort(handle, port, 0, 0);
+                CreateIoCompletionPort(handle, ctx.port, 0, 0);
             }
 
             let mut bytes = 0;
@@ -197,7 +188,7 @@ macro_rules! submit_io_op {
                     ptr as _,
                     val.buf.len() as u32,
                     &mut bytes,
-                    overlapped,
+                    ctx.overlapped,
                 )
             };
 
@@ -232,22 +223,145 @@ impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
 
 // Note: Recv/Send for IOCP usually use ReadFile/WriteFile for streams?
 // The original code used ReadFile for Recv and WriteFile for Send.
-submit_io_op!(
-    submit_recv,
-    recv,
-    ReadFile,
-    no_offset,
-    |b: &mut FixedBuf| b.as_mut_ptr()
-);
+pub(crate) unsafe fn submit_recv(
+    op: &mut IocpOp,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    let val = unsafe { &mut *op.payload.recv };
+    op.header.inner.Anonymous.Anonymous.Offset = 0;
+    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
+
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+
+    // Try RIO upgrade
+    if let Some(_) = ctx.rio_cq {
+        let buf_addr = val.buf.as_mut_ptr() as usize;
+        let buf_len = val.buf.capacity();
+
+        // Check if buffer is registered
+        if let Ok((buf_id, offset)) = resolve_rio_buffer(buf_addr, buf_len, ctx.registered_bufs) {
+            // Check/Create RQ
+            if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
+                // RIO Path
+                let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
+                    BufferId: buf_id,
+                    Offset: offset,
+                    Length: buf_len as u32,
+                };
+
+                let table = ctx.ext.rio_table.as_ref().unwrap();
+                let recv_fn = table.RIOReceive.unwrap();
+                let request_context = op.header.user_data as *mut std::ffi::c_void;
+
+                let ret = unsafe {
+                    recv_fn(
+                        rq,
+                        &rio_buf,
+                        1,
+                        0, // flags
+                        request_context,
+                    )
+                };
+
+                if ret == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(SubmissionResult::Pending);
+            }
+        }
+    }
+
+    // Fallback to normal IOCP
+    unsafe {
+        CreateIoCompletionPort(handle, ctx.port, 0, 0);
+    }
+
+    let mut bytes = 0;
+    let ptr = val.buf.as_mut_ptr();
+
+    let ret = unsafe {
+        ReadFile(
+            handle,
+            ptr as _,
+            val.buf.len() as u32,
+            &mut bytes,
+            ctx.overlapped,
+        )
+    };
+
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
 impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 
-submit_io_op!(
-    submit_send,
-    send,
-    WriteFile,
-    no_offset,
-    |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
-);
+pub(crate) unsafe fn submit_send(
+    op: &mut IocpOp,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    let val = unsafe { &mut *op.payload.send };
+    op.header.inner.Anonymous.Anonymous.Offset = 0;
+    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
+
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+
+    // Try RIO upgrade
+    if let Some(_) = ctx.rio_cq {
+        let buf_addr = val.buf.as_slice().as_ptr() as usize;
+        let buf_len = val.buf.len();
+
+        if let Ok((buf_id, offset)) = resolve_rio_buffer(buf_addr, buf_len, ctx.registered_bufs) {
+            if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
+                let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
+                    BufferId: buf_id,
+                    Offset: offset,
+                    Length: buf_len as u32,
+                };
+
+                let table = ctx.ext.rio_table.as_ref().unwrap();
+                let send_fn = table.RIOSend.unwrap();
+                let request_context = op.header.user_data as *mut std::ffi::c_void;
+
+                let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
+
+                if ret == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(SubmissionResult::Pending);
+            }
+        }
+    }
+
+    // Fallback
+    unsafe {
+        CreateIoCompletionPort(handle, ctx.port, 0, 0);
+    }
+
+    let mut bytes = 0;
+    let ptr = val.buf.as_slice().as_ptr() as *mut u8;
+
+    let ret = unsafe {
+        WriteFile(
+            handle,
+            ptr as _,
+            val.buf.len() as u32,
+            &mut bytes,
+            ctx.overlapped,
+        )
+    };
+
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
 // ============================================================================
@@ -256,15 +370,12 @@ impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
 pub(crate) unsafe fn submit_connect(
     op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
+    ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let connect_op = unsafe { &mut *op.payload.connect };
-    let handle = resolve_fd(connect_op.fd, registered_files)?;
+    let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
     unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
+        CreateIoCompletionPort(handle, ctx.port, 0, 0);
     }
 
     let mut need_bind = true;
@@ -319,14 +430,14 @@ pub(crate) unsafe fn submit_connect(
 
     let mut bytes_sent = 0;
     let ret = unsafe {
-        (ext.connect_ex)(
+        (ctx.ext.connect_ex)(
             handle as SOCKET,
             &connect_op.addr as *const _ as *const SOCKADDR,
             connect_op.addr_len as i32,
             std::ptr::null(),
             0,
             &mut bytes_sent,
-            overlapped,
+            ctx.overlapped,
         )
     };
 
@@ -370,17 +481,14 @@ impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
 
 pub(crate) unsafe fn submit_accept(
     op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
+    ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &mut *op.payload.accept };
-    let handle = resolve_fd(payload.op.fd, registered_files)?;
+    let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
     let accept_socket = payload.op.accept_socket as HANDLE;
 
     unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
+        CreateIoCompletionPort(handle, ctx.port, 0, 0);
     }
 
     const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
@@ -388,7 +496,7 @@ pub(crate) unsafe fn submit_accept(
     let mut bytes_received = 0;
 
     let ret = unsafe {
-        (ext.accept_ex)(
+        (ctx.ext.accept_ex)(
             handle as SOCKET,
             accept_socket as SOCKET,
             payload.accept_buffer.as_mut_ptr() as *mut _,
@@ -396,7 +504,7 @@ pub(crate) unsafe fn submit_accept(
             split as u32,
             split as u32,
             &mut bytes_received,
-            overlapped,
+            ctx.overlapped,
         )
     };
 
@@ -481,15 +589,12 @@ impl_lifecycle!(drop_accept, get_fd_accept, accept, nested_fd);
 
 pub(crate) unsafe fn submit_send_to(
     op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
+    ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &mut *op.payload.send_to };
-    let handle = resolve_fd(payload.op.fd, registered_files)?;
+    let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
     unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
+        CreateIoCompletionPort(handle, ctx.port, 0, 0);
     }
 
     payload.wsabuf.len = payload.op.buf.len() as u32;
@@ -505,7 +610,7 @@ pub(crate) unsafe fn submit_send_to(
             0,
             &payload.addr as *const _ as *const SOCKADDR,
             payload.addr_len,
-            overlapped,
+            ctx.overlapped,
             None,
         )
     };
@@ -513,7 +618,7 @@ pub(crate) unsafe fn submit_send_to(
     if ret == SOCKET_ERROR {
         let err = unsafe { WSAGetLastError() };
         if err != ERROR_IO_PENDING as i32 {
-            return Err(io::Error::from_raw_os_error(err));
+            return Err(io::Error::from_raw_os_error(err as i32));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -527,15 +632,12 @@ impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 
 pub(crate) unsafe fn submit_recv_from(
     op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
+    ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &mut *op.payload.recv_from };
-    let handle = resolve_fd(payload.op.fd, registered_files)?;
+    let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
     unsafe {
-        CreateIoCompletionPort(handle, port, 0, 0);
+        CreateIoCompletionPort(handle, ctx.port, 0, 0);
     }
 
     payload.wsabuf.len = payload.op.buf.capacity() as u32;
@@ -551,7 +653,7 @@ pub(crate) unsafe fn submit_recv_from(
             &mut payload.flags,
             &mut payload.addr as *mut _ as *mut SOCKADDR,
             &mut payload.addr_len,
-            overlapped,
+            ctx.overlapped,
             None,
         )
     };
@@ -559,7 +661,7 @@ pub(crate) unsafe fn submit_recv_from(
     if ret == SOCKET_ERROR {
         let err = unsafe { WSAGetLastError() };
         if err != ERROR_IO_PENDING as i32 {
-            return Err(io::Error::from_raw_os_error(err));
+            return Err(io::Error::from_raw_os_error(err as i32));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -573,10 +675,7 @@ impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
 
 pub(crate) unsafe fn submit_open(
     op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    _registered_files: &[Option<HANDLE>],
+    ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &*op.payload.open };
     let path_ptr = payload.op.path.as_slice().as_ptr() as usize;
@@ -585,9 +684,9 @@ pub(crate) unsafe fn submit_open(
     let user_data = entry.user_data;
 
     let completion = CompletionInfo {
-        port: port as usize,
+        port: ctx.port as usize,
         user_data,
-        overlapped: overlapped as usize,
+        overlapped: ctx.overlapped as usize,
     };
 
     let task = BlockingTask::Open {
@@ -628,21 +727,18 @@ impl_lifecycle!(drop_sync_range, get_fd_sync_range, sync_range, direct_fd);
 
 pub(crate) unsafe fn submit_fallocate(
     op: &mut IocpOp,
-    port: HANDLE,
-    overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    registered_files: &[Option<HANDLE>],
+    ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &*op.payload.fallocate };
-    let handle = resolve_fd(payload.fd, registered_files)?;
+    let handle = resolve_fd(payload.fd, ctx.registered_files)?;
 
     let entry = &op.header;
     let user_data = entry.user_data;
 
     let completion = CompletionInfo {
-        port: port as usize,
+        port: ctx.port as usize,
         user_data,
-        overlapped: overlapped as usize,
+        overlapped: ctx.overlapped as usize,
     };
 
     let task = BlockingTask::Fallocate {
@@ -662,10 +758,7 @@ impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
 
 pub(crate) unsafe fn submit_wakeup(
     _op: &mut IocpOp,
-    _port: HANDLE,
-    _overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    _registered_files: &[Option<HANDLE>],
+    _ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     Ok(SubmissionResult::PostToQueue)
 }
@@ -678,13 +771,209 @@ impl_lifecycle!(drop_wakeup, get_fd_wakeup, wakeup, no_fd);
 
 pub(crate) unsafe fn submit_timeout(
     op: &mut IocpOp,
-    _port: HANDLE,
-    _overlapped: *mut OVERLAPPED,
-    _ext: &Extensions,
-    _registered_files: &[Option<HANDLE>],
+    _ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let duration = unsafe { op.payload.timeout.duration };
     Ok(SubmissionResult::Timer(duration))
 }
 
 impl_lifecycle!(drop_timeout, get_fd_timeout, timeout, no_fd);
+
+// ============================================================================
+// RIO Support (Stubs/Impl)
+// ============================================================================
+
+fn ensure_rio_rq(ctx: &mut SubmitContext, fd: IoFd, handle: HANDLE) -> io::Result<RIO_RQ> {
+    // fast path for registered files
+    if let IoFd::Fixed(idx) = fd {
+        let idx = idx as usize;
+        if let Some(Some(rq)) = ctx.registered_rio_rqs.get(idx) {
+            return Ok(*rq);
+        }
+        // Not created yet, create it below and store in vector
+    } else {
+        // Fallback for raw handles
+        if let Some(&rq) = ctx.rio_rqs.get(&handle) {
+            return Ok(rq);
+        }
+    }
+
+    if let Some(cq) = ctx.rio_cq {
+        let table = ctx.ext.rio_table.as_ref().ok_or(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "RIO not initialized",
+        ))?;
+
+        let create_fn = table.RIOCreateRequestQueue.unwrap();
+
+        // Queue sizes
+        const MAX_OUTSTANDING_RECVS: u32 = 1024;
+        const MAX_OUTSTANDING_SENDS: u32 = 1024;
+
+        let rq = unsafe {
+            create_fn(
+                handle as _,
+                MAX_OUTSTANDING_RECVS,
+                1, // Max Receive Data Buffers
+                MAX_OUTSTANDING_SENDS,
+                1, // Max Send Data Buffers
+                cq,
+                cq,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if rq == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if let IoFd::Fixed(idx) = fd {
+            let idx = idx as usize;
+            if idx < ctx.registered_rio_rqs.len() {
+                ctx.registered_rio_rqs[idx] = Some(rq);
+            }
+        } else {
+            ctx.rio_rqs.insert(handle, rq);
+        }
+        Ok(rq)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "RIO not initialized",
+        ))
+    }
+}
+
+// Helper to find RIO buffer info based on address
+fn resolve_rio_buffer(
+    addr: usize,
+    len: usize,
+    registered_bufs: &[crate::io::driver::iocp::RioBufferInfo],
+) -> io::Result<(windows_sys::Win32::Networking::WinSock::RIO_BUFFERID, u32)> {
+    // Optimization 1: Single Region
+    // Most high-performance scenarios will use a single large registered buffer.
+    if registered_bufs.len() == 1 {
+        let reg = &registered_bufs[0];
+        if addr >= reg.addr && addr + len <= reg.addr + reg.len {
+            let offset = (addr - reg.addr) as u32;
+            return Ok((reg.id, offset));
+        }
+        // If not in single region, fail early or fall through (will fail binary search anyway)
+    }
+
+    // Binary search for the region containing the start address
+    // We are looking for the region where region.addr <= addr < region.addr + region.len
+    // sort_by returns Ordering.
+
+    let res = registered_bufs.binary_search_by(|reg| {
+        if addr < reg.addr {
+            std::cmp::Ordering::Greater
+        } else if addr >= reg.addr + reg.len {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+
+    match res {
+        Ok(idx) => {
+            let reg = &registered_bufs[idx];
+            // Verify the whole buffer fits in the region
+            if addr + len <= reg.addr + reg.len {
+                let offset = (addr - reg.addr) as u32;
+                Ok((reg.id, offset))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Buffer spans multiple RIO regions or overflows",
+                ))
+            }
+        }
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Buffer not registered with RIO (not found)",
+        )),
+    }
+}
+
+pub(crate) unsafe fn submit_rio_recv(
+    op: &mut IocpOp,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    let payload = unsafe { &mut *op.payload.rio_recv };
+    let handle = resolve_fd(payload.fd, ctx.registered_files)?;
+
+    let rq = ensure_rio_rq(ctx, payload.fd, handle)?;
+
+    let buf_addr = payload.buf.as_mut_ptr() as usize;
+    let buf_len = payload.buf.capacity();
+
+    let (buf_id, offset) = resolve_rio_buffer(buf_addr, buf_len, ctx.registered_bufs)?;
+
+    let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
+        BufferId: buf_id,
+        Offset: offset,
+        Length: buf_len as u32,
+    };
+
+    let table = ctx.ext.rio_table.as_ref().unwrap(); // ensure_rio_rq ensures table exists
+    let recv_fn = table.RIOReceive.unwrap();
+
+    // RequestContext is usze (user_data)
+    let request_context = op.header.user_data as *mut std::ffi::c_void;
+
+    let ret = unsafe {
+        recv_fn(
+            rq,
+            &rio_buf,
+            1,
+            0, // flags
+            request_context,
+        )
+    };
+
+    // Correction:
+    // windows-sys BOOL functions: 0 is FALSE, non-zero is TRUE.
+    // Documentation: RIOReceive returns TRUE if successful.
+    if ret == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(SubmissionResult::Pending)
+}
+impl_lifecycle!(drop_rio_recv, get_fd_rio_recv, rio_recv, direct_fd);
+
+pub(crate) unsafe fn submit_rio_send(
+    op: &mut IocpOp,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    let payload = unsafe { &mut *op.payload.rio_send };
+    let handle = resolve_fd(payload.fd, ctx.registered_files)?;
+
+    let rq = ensure_rio_rq(ctx, payload.fd, handle)?;
+
+    let buf_addr = payload.buf.as_ptr() as usize;
+    let buf_len = payload.buf.len();
+
+    let (buf_id, offset) = resolve_rio_buffer(buf_addr, buf_len, ctx.registered_bufs)?;
+
+    let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
+        BufferId: buf_id,
+        Offset: offset,
+        Length: buf_len as u32,
+    };
+
+    let table = ctx.ext.rio_table.as_ref().unwrap();
+    let send_fn = table.RIOSend.unwrap();
+
+    let request_context = op.header.user_data as *mut std::ffi::c_void;
+
+    let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
+
+    if ret == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(SubmissionResult::Pending)
+}
+impl_lifecycle!(drop_rio_send, get_fd_rio_send, rio_send, direct_fd);

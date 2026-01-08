@@ -353,12 +353,11 @@ impl BufPool for BuddyPool {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn get_registration_buffers(&self) -> Vec<libc::iovec> {
+    fn get_memory_regions(&self) -> Vec<crate::io::buffer::BufferRegion> {
         let inner = self.inner.borrow();
-        vec![libc::iovec {
-            iov_base: inner.base_ptr as *mut _,
-            iov_len: ARENA_SIZE,
+        vec![crate::io::buffer::BufferRegion {
+            ptr: unsafe { NonNull::new_unchecked(inner.base_ptr as *mut _) },
+            len: ARENA_SIZE,
         }]
     }
 

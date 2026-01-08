@@ -81,6 +81,15 @@ pub enum AllocResult {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BufferRegion {
+    pub ptr: NonNull<u8>,
+    pub len: usize,
+}
+
+unsafe impl Send for BufferRegion {}
+unsafe impl Sync for BufferRegion {}
+
 /// Trait for memory pool implementation allows custom memory management
 pub trait BufPool: std::fmt::Debug + 'static {
     /// Allocate memory with specific length.
@@ -110,15 +119,31 @@ pub trait BufPool: std::fmt::Debug + 'static {
     /// Allocate memory of at least `size` bytes (Low level).
     fn alloc_mem(&self, size: usize) -> AllocResult;
 
-    /// Get all buffers for io_uring registration.
-    #[cfg(target_os = "linux")]
-    fn get_registration_buffers(&self) -> Vec<libc::iovec>;
+    /// Get all memory regions managed by this pool.
+    /// Used for registering buffers with kernel (Fixed Buffers / RIO).
+    fn get_memory_regions(&self) -> Vec<BufferRegion>;
 
     /// Get the VTable for this pool.
     fn vtable(&self) -> &'static PoolVTable;
 
     /// Get the raw pool data pointer (e.g. Rc<RefCell<Allocator>> as void ptr).
     fn pool_data(&self) -> NonNull<()>;
+
+    /// Resolve Buffer to Region Index and Offset
+    /// Returns (region_index, offset_in_region)
+    /// Used for RIO IO submissions.
+    /// By default scans get_memory_regions (slow). Overridable.
+    fn resolve_region_info(&self, buf: &FixedBuf) -> (usize, usize) {
+        let ptr = buf.as_ptr() as usize;
+        let regions = self.get_memory_regions();
+        for (i, region) in regions.iter().enumerate() {
+            let base = region.ptr.as_ptr() as usize;
+            if ptr >= base && ptr < base + region.len {
+                return (i, ptr - base);
+            }
+        }
+        panic!("Buffer not found in pool regions");
+    }
 }
 
 #[derive(Debug)]
@@ -285,8 +310,8 @@ impl Drop for AlignedMemory {
 /// 手写 VTable，用于动态分发 BufPool 的方法而不使用 dyn
 pub struct BufPoolVTable {
     pub alloc_mem: unsafe fn(*const (), usize) -> AllocResult,
-    #[cfg(target_os = "linux")]
-    pub get_registration_buffers: unsafe fn(*const ()) -> Vec<libc::iovec>,
+    pub get_memory_regions: unsafe fn(*const ()) -> Vec<BufferRegion>,
+    pub resolve_region_info: unsafe fn(*const (), &FixedBuf) -> (usize, usize),
     pub vtable: unsafe fn(*const ()) -> &'static PoolVTable,
     pub pool_data: unsafe fn(*const ()) -> NonNull<()>,
     pub clone: unsafe fn(*const ()) -> *mut (),
@@ -311,11 +336,20 @@ impl AnyBufPool {
             }
         }
 
-        #[cfg(target_os = "linux")]
-        unsafe fn get_registration_buffers_shim<P: BufPool>(ptr: *const ()) -> Vec<libc::iovec> {
+        unsafe fn get_memory_regions_shim<P: BufPool>(ptr: *const ()) -> Vec<BufferRegion> {
             unsafe {
                 let pool = &*(ptr as *const P);
-                pool.get_registration_buffers()
+                pool.get_memory_regions()
+            }
+        }
+
+        unsafe fn resolve_region_info_shim<P: BufPool>(
+            ptr: *const (),
+            buf: &FixedBuf,
+        ) -> (usize, usize) {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                pool.resolve_region_info(buf)
             }
         }
 
@@ -362,8 +396,8 @@ impl AnyBufPool {
         impl<P: BufPool + Clone + 'static> VTableGen<P> {
             const VTABLE: BufPoolVTable = BufPoolVTable {
                 alloc_mem: alloc_mem_shim::<P>,
-                #[cfg(target_os = "linux")]
-                get_registration_buffers: get_registration_buffers_shim::<P>,
+                get_memory_regions: get_memory_regions_shim::<P>,
+                resolve_region_info: resolve_region_info_shim::<P>,
                 vtable: vtable_shim::<P>,
                 pool_data: pool_data_shim::<P>,
                 clone: clone_shim::<P>,
@@ -384,9 +418,12 @@ impl BufPool for AnyBufPool {
         unsafe { (self.vtable.alloc_mem)(self.data, size) }
     }
 
-    #[cfg(target_os = "linux")]
-    fn get_registration_buffers(&self) -> Vec<libc::iovec> {
-        unsafe { (self.vtable.get_registration_buffers)(self.data) }
+    fn get_memory_regions(&self) -> Vec<BufferRegion> {
+        unsafe { (self.vtable.get_memory_regions)(self.data) }
+    }
+
+    fn resolve_region_info(&self, buf: &FixedBuf) -> (usize, usize) {
+        unsafe { (self.vtable.resolve_region_info)(self.data, buf) }
     }
 
     // For non-Linux, generic trait impl doesn't require this method inside the impl
