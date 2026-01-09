@@ -36,7 +36,7 @@ where
 // --- Shared State ---
 pub(crate) struct ExecutorShared {
     pub(crate) injector: SegQueue<Job>,
-    pub(crate) pinned: SegQueue<Job>,
+    pub(crate) pinned: std::sync::mpsc::Sender<Job>,
     pub(crate) remote_queue: std::sync::mpsc::Sender<Task>,
     pub(crate) waker: LateBoundWaker,
     pub(crate) injected_load: CachePadded<AtomicUsize>,
@@ -144,7 +144,10 @@ impl ExecutorHandle {
     }
 
     pub(crate) fn schedule_pinned(&self, job: Job) {
-        self.shared.pinned.push(job);
+        // We ignore the error here because if the receiver is dropped,
+        // the worker is dead and thus strictly speaking "not available".
+        // However, in a robust system we might want to log this.
+        let _ = self.shared.pinned.send(job);
         self.shared.injected_load.fetch_add(1, Ordering::Relaxed);
         self.shared.waker.wake().expect("Failed to wake executor");
     }

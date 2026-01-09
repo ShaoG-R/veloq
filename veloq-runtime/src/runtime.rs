@@ -139,12 +139,14 @@ impl RuntimeBuilder {
         let mut shared_states = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
         let mut remote_receivers = Vec::with_capacity(worker_count);
+        let mut pinned_receivers = Vec::with_capacity(worker_count);
 
         for i in 0..worker_count {
             let (tx, rx) = std::sync::mpsc::channel();
+            let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
             let shared = Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
-                pinned: SegQueue::new(),
+                pinned: pinned_tx,
                 remote_queue: tx,
                 waker: LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
@@ -152,6 +154,7 @@ impl RuntimeBuilder {
             });
             shared_states.push(shared.clone());
             remote_receivers.push(Some(rx));
+            pinned_receivers.push(Some(pinned_rx));
 
             handles.push(ExecutorHandle { id: i, shared });
         }
@@ -174,7 +177,10 @@ impl RuntimeBuilder {
             let shared = shared_states[worker_id].clone(); // Get pre-allocated shared
             let remote_receiver = remote_receivers[worker_id]
                 .take()
-                .expect(" Receiver already taken");
+                .expect("Receiver already taken");
+            let pinned_receiver = pinned_receivers[worker_id]
+                .take()
+                .expect("Pinned receiver already taken");
 
             let builder = std::thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
             let barrier = barrier.clone();
@@ -184,6 +190,7 @@ impl RuntimeBuilder {
                     .config(config_clone)
                     .with_shared(shared) // Inject shared state
                     .with_remote_receiver(remote_receiver) // Inject remote receiver
+                    .with_pinned_receiver(pinned_receiver) // Inject pinned receiver
                     .build();
 
                 executor = executor.with_registry(registry.clone()); // Inject registry

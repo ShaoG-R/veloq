@@ -28,6 +28,7 @@ pub struct LocalExecutorBuilder {
     config: crate::config::Config,
     shared: Option<Arc<ExecutorShared>>,
     remote_receiver: Option<mpsc::Receiver<Task>>,
+    pinned_receiver: Option<mpsc::Receiver<SpawnedTask>>,
 }
 
 impl Default for LocalExecutorBuilder {
@@ -42,6 +43,7 @@ impl LocalExecutorBuilder {
             config: crate::config::Config::default(),
             shared: None,
             remote_receiver: None,
+            pinned_receiver: None,
         }
     }
 
@@ -52,6 +54,11 @@ impl LocalExecutorBuilder {
 
     pub(crate) fn with_remote_receiver(mut self, receiver: mpsc::Receiver<Task>) -> Self {
         self.remote_receiver = Some(receiver);
+        self
+    }
+
+    pub(crate) fn with_pinned_receiver(mut self, receiver: mpsc::Receiver<SpawnedTask>) -> Self {
+        self.pinned_receiver = Some(receiver);
         self
     }
 
@@ -69,22 +76,26 @@ impl LocalExecutorBuilder {
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let waker = driver.create_waker();
 
-        let (shared, remote_receiver) = if let Some(shared) = self.shared {
-            let receiver = self
+        let (shared, remote_receiver, pinned_receiver) = if let Some(shared) = self.shared {
+            let remote_rec = self
                 .remote_receiver
                 .expect("Shared state provided without remote receiver");
-            (shared, receiver)
+            let pinned_rec = self
+                .pinned_receiver
+                .expect("Shared state provided without pinned receiver");
+            (shared, remote_rec, pinned_rec)
         } else {
-            let (tx, rx) = mpsc::channel();
+            let (remote_tx, remote_rx) = mpsc::channel();
+            let (pinned_tx, pinned_rx) = mpsc::channel();
             let shared = Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
-                pinned: SegQueue::new(),
-                remote_queue: tx,
+                pinned: pinned_tx,
+                remote_queue: remote_tx,
                 waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
                 local_load: CachePadded::new(AtomicUsize::new(0)),
             });
-            (shared, rx)
+            (shared, remote_rx, pinned_rx)
         };
 
         // Bind the driver's waker to the shared state (Late Binding)
@@ -95,6 +106,7 @@ impl LocalExecutorBuilder {
             queue,
             shared,
             remote_receiver,
+            pinned_receiver,
             registry: None,
             mesh: None,
         }
@@ -108,6 +120,7 @@ pub struct LocalExecutor {
     // Shared components
     shared: Arc<ExecutorShared>,
     remote_receiver: mpsc::Receiver<Task>,
+    pinned_receiver: mpsc::Receiver<SpawnedTask>,
 
     // Optional connection to the global registry
     registry: Option<Arc<ExecutorRegistry>>,
@@ -228,7 +241,7 @@ impl LocalExecutor {
 
     fn try_poll_injector(&self) -> bool {
         // Check pinned first (strictly specific to this worker)
-        if let Some(job) = self.shared.pinned.pop() {
+        if let Ok(job) = self.pinned_receiver.try_recv() {
             self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
             self.enqueue_job(job);
             return true;
