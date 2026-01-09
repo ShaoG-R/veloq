@@ -7,7 +7,6 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::Weak;
-use std::sync::Arc;
 
 use crate::io::buffer::{AnyBufPool, BufPool};
 use crate::io::driver::PlatformDriver;
@@ -75,7 +74,7 @@ pub fn try_current() -> Option<RuntimeContext> {
 #[derive(Clone)]
 pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
-    pub(crate) queue: Weak<RefCell<VecDeque<Arc<Task>>>>,
+    pub(crate) queue: Weak<RefCell<VecDeque<Task>>>,
     pub(crate) spawner: Option<Spawner>,
     pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
     pub(crate) handle: ExecutorHandle,
@@ -85,7 +84,7 @@ impl RuntimeContext {
     /// Create a new RuntimeContext.
     pub(crate) fn new(
         driver: Weak<RefCell<PlatformDriver>>,
-        queue: Weak<RefCell<VecDeque<Arc<Task>>>>,
+        queue: Weak<RefCell<VecDeque<Task>>>,
         spawner: Option<Spawner>,
         mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
         handle: ExecutorHandle,

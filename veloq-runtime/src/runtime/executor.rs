@@ -26,7 +26,7 @@ pub mod spawner;
 pub struct LocalExecutorBuilder {
     config: crate::config::Config,
     shared: Option<Arc<ExecutorShared>>,
-    remote_receiver: Option<mpsc::Receiver<Arc<Task>>>,
+    remote_receiver: Option<mpsc::Receiver<Task>>,
 }
 
 impl Default for LocalExecutorBuilder {
@@ -49,7 +49,7 @@ impl LocalExecutorBuilder {
         self
     }
 
-    pub(crate) fn with_remote_receiver(mut self, receiver: mpsc::Receiver<Arc<Task>>) -> Self {
+    pub(crate) fn with_remote_receiver(mut self, receiver: mpsc::Receiver<Task>) -> Self {
         self.remote_receiver = Some(receiver);
         self
     }
@@ -102,11 +102,11 @@ impl LocalExecutorBuilder {
 
 pub struct LocalExecutor {
     driver: Rc<RefCell<PlatformDriver>>,
-    queue: Rc<RefCell<VecDeque<Arc<Task>>>>,
+    queue: Rc<RefCell<VecDeque<Task>>>,
 
     // Shared components
     shared: Arc<ExecutorShared>,
-    remote_receiver: mpsc::Receiver<Arc<Task>>,
+    remote_receiver: mpsc::Receiver<Task>,
 
     // Optional connection to the global registry
     registry: Option<Arc<ExecutorRegistry>>,
