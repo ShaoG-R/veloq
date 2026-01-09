@@ -34,9 +34,12 @@ where
 #[repr(align(128))]
 pub(crate) struct CachePadded<T>(pub(crate) T);
 
+use crate::runtime::task::Task;
+
 pub(crate) struct ExecutorShared {
     pub(crate) injector: SegQueue<Job>,
     pub(crate) pinned: SegQueue<Job>,
+    pub(crate) remote_queue: SegQueue<Arc<Task>>,
     pub(crate) waker: LateBoundWaker,
     pub(crate) injected_load: CachePadded<AtomicUsize>,
     pub(crate) local_load: CachePadded<AtomicUsize>,

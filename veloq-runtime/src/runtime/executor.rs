@@ -65,6 +65,7 @@ impl LocalExecutorBuilder {
             Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
                 pinned: SegQueue::new(),
+                remote_queue: SegQueue::new(),
                 waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
                 injected_load: CachePadded(AtomicUsize::new(0)),
                 local_load: CachePadded(AtomicUsize::new(0)),
@@ -86,7 +87,7 @@ impl LocalExecutorBuilder {
 
 pub struct LocalExecutor {
     driver: Rc<RefCell<PlatformDriver>>,
-    queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
+    queue: Rc<RefCell<VecDeque<Arc<Task>>>>,
 
     // Shared components
     shared: Arc<ExecutorShared>,
@@ -156,7 +157,9 @@ impl LocalExecutor {
                 let output = future.await;
                 producer.set(output);
             },
+            self.handle().id,
             Rc::downgrade(&self.queue),
+            self.shared.clone(),
         );
         self.queue.borrow_mut().push_back(task);
         self.shared.local_load.0.fetch_add(1, Ordering::Relaxed);
@@ -184,7 +187,12 @@ impl LocalExecutor {
     fn enqueue_job(&self, job_factory: Job) {
         self.shared.local_load.0.fetch_add(1, Ordering::Relaxed);
         let future = job_factory();
-        let task = Task::from_boxed(future, Rc::downgrade(&self.queue));
+        let task = Task::from_boxed(
+            future,
+            self.handle().id,
+            Rc::downgrade(&self.queue),
+            self.shared.clone(),
+        );
         self.queue.borrow_mut().push_back(task);
     }
 
@@ -201,6 +209,12 @@ impl LocalExecutor {
         if let Some(job) = self.shared.pinned.pop() {
             self.shared.injected_load.0.fetch_sub(1, Ordering::Relaxed);
             self.enqueue_job(job);
+            return true;
+        }
+
+        // Check remote queue (Woken tasks from other threads)
+        if let Some(task) = self.shared.remote_queue.pop() {
+            self.queue.borrow_mut().push_back(task);
             return true;
         }
 

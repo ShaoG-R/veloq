@@ -6,7 +6,8 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::rc::{Rc, Weak};
+use std::rc::Weak;
+use std::sync::Arc;
 
 use crate::io::buffer::{AnyBufPool, BufPool};
 use crate::io::driver::PlatformDriver;
@@ -28,6 +29,16 @@ pub(crate) fn enter(context: RuntimeContext) -> ContextGuard {
     CONTEXT.with(|ctx| {
         let prev = ctx.borrow_mut().replace(context);
         ContextGuard { prev }
+    })
+}
+
+pub(crate) fn is_current_worker(id: usize) -> bool {
+    CONTEXT.with(|ctx| {
+        if let Some(ctx) = ctx.borrow().as_ref() {
+            ctx.handle.id == id
+        } else {
+            false
+        }
     })
 }
 
@@ -64,7 +75,7 @@ pub fn try_current() -> Option<RuntimeContext> {
 #[derive(Clone)]
 pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
-    pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+    pub(crate) queue: Weak<RefCell<VecDeque<Arc<Task>>>>,
     pub(crate) spawner: Option<Spawner>,
     pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
     pub(crate) handle: ExecutorHandle,
@@ -74,7 +85,7 @@ impl RuntimeContext {
     /// Create a new RuntimeContext.
     pub(crate) fn new(
         driver: Weak<RefCell<PlatformDriver>>,
-        queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+        queue: Weak<RefCell<VecDeque<Arc<Task>>>>,
         spawner: Option<Spawner>,
         mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
         handle: ExecutorHandle,
@@ -165,7 +176,9 @@ impl RuntimeContext {
                 let output = future.await;
                 producer.set(output);
             },
+            self.handle.id,
             self.queue.clone(),
+            self.handle.shared.clone(),
         );
         queue.borrow_mut().push_back(task);
         handle
@@ -207,7 +220,12 @@ impl RuntimeContext {
 
             // Instantiate Future!
             let future = job();
-            let task = Task::from_boxed(future, self.queue.clone());
+            let task = Task::from_boxed(
+                future,
+                self.handle.id,
+                self.queue.clone(),
+                self.handle.shared.clone(),
+            );
             queue.borrow_mut().push_back(task);
             return handle;
         }

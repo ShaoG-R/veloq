@@ -1,35 +1,69 @@
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::{Rc, Weak};
+use std::rc::Weak;
+use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use crate::io::driver::RemoteWaker;
+use crate::runtime::executor::ExecutorShared;
+
 pub(crate) struct Task {
-    future: RefCell<Option<Pin<Box<dyn Future<Output = ()>>>>>,
-    queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+    future: UnsafeCell<Option<Pin<Box<dyn Future<Output = ()>>>>>,
+    policy: SchedulePolicy,
 }
+
+pub(crate) enum SchedulePolicy {
+    Local {
+        owner_id: usize,
+        local_queue: Weak<RefCell<VecDeque<Arc<Task>>>>,
+        shared: Arc<ExecutorShared>,
+    },
+}
+
+// SAFETY:
+// 1. `future` is accessed only by the owner thread (guaranteed by logic in run()).
+// 2. `policy` is immutable after creation.
+// 3. `SchedulePolicy::Local` fields:
+//    - `owner_id`: usize, Copy, Send, Sync.
+//    - `local_queue`: Weak<...>, not Send/Sync normally. But we only access it
+//      if `is_current_worker(owner_id)` returns true.
+//    - `shared`: Arc<ExecutorShared>, Send + Sync.
+// We must implement Send + Sync manually and ensure safety invariant.
+unsafe impl Send for Task {}
+unsafe impl Sync for Task {}
 
 impl Task {
     pub(crate) fn new(
         future: impl Future<Output = ()> + 'static,
-        queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
-    ) -> Rc<Self> {
-        Self::from_boxed(Box::pin(future), queue)
+        owner_id: usize,
+        local_queue: Weak<RefCell<VecDeque<Arc<Task>>>>,
+        shared: Arc<ExecutorShared>,
+    ) -> Arc<Self> {
+        Self::from_boxed(Box::pin(future), owner_id, local_queue, shared)
     }
 
     pub(crate) fn from_boxed(
         future: Pin<Box<dyn Future<Output = ()>>>,
-        queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
-    ) -> Rc<Self> {
-        Rc::new(Self {
-            future: RefCell::new(Some(future)),
-            queue,
+        owner_id: usize,
+        local_queue: Weak<RefCell<VecDeque<Arc<Task>>>>,
+        shared: Arc<ExecutorShared>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            future: UnsafeCell::new(Some(future)),
+            policy: SchedulePolicy::Local {
+                owner_id,
+                local_queue,
+                shared,
+            },
         })
     }
 
-    pub(crate) fn run(self: Rc<Self>) {
-        let mut future_slot = self.future.borrow_mut();
+    pub(crate) fn run(self: Arc<Self>) {
+        // SAFETY: Only the owner thread calls run() on a Task.
+        // We can verify this with debug_assert if we want.
+        let future_slot = unsafe { &mut *self.future.get() };
         if let Some(future) = future_slot.as_mut() {
             let waker = waker(self.clone());
             let mut cx = Context::from_waker(&waker);
@@ -47,34 +81,49 @@ impl Task {
 const VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake, wake_by_ref, drop_waker);
 
 unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
-    let rc = unsafe { Rc::from_raw(ptr as *const Task) };
-    std::mem::forget(rc.clone()); // Increment count for new waker
-    std::mem::forget(rc); // Keep original valid
+    let task = unsafe { Arc::from_raw(ptr as *const Task) };
+    std::mem::forget(task.clone()); // Increment count for new waker
+    std::mem::forget(task); // Keep original valid
     RawWaker::new(ptr, &VTABLE)
 }
 
 unsafe fn wake(ptr: *const ()) {
-    let rc = unsafe { Rc::from_raw(ptr as *const Task) };
-    // self-schedule
-    if let Some(queue) = rc.queue.upgrade() {
-        queue.borrow_mut().push_back(rc);
-    }
+    let task = unsafe { Arc::from_raw(ptr as *const Task) };
+    wake_task(&task);
 }
 
 unsafe fn wake_by_ref(ptr: *const ()) {
-    let rc = unsafe { Rc::from_raw(ptr as *const Task) };
-    if let Some(queue) = rc.queue.upgrade() {
-        queue.borrow_mut().push_back(rc.clone());
-    }
-    std::mem::forget(rc);
+    let task = unsafe { Arc::from_raw(ptr as *const Task) };
+    let task_clone = task.clone();
+    std::mem::forget(task);
+    wake_task(&task_clone);
 }
 
 unsafe fn drop_waker(ptr: *const ()) {
-    let _ = unsafe { Rc::from_raw(ptr as *const Task) }; // Decrement count
+    let _ = unsafe { Arc::from_raw(ptr as *const Task) }; // Decrement count
 }
 
-pub(crate) fn waker(task: Rc<Task>) -> Waker {
-    let ptr = Rc::into_raw(task) as *const ();
+fn wake_task(task: &Arc<Task>) {
+    match &task.policy {
+        SchedulePolicy::Local {
+            owner_id,
+            local_queue,
+            shared,
+        } => {
+            if crate::runtime::context::is_current_worker(*owner_id) {
+                if let Some(queue) = local_queue.upgrade() {
+                    queue.borrow_mut().push_back(task.clone());
+                }
+            } else {
+                shared.remote_queue.push(task.clone());
+                let _ = shared.waker.wake();
+            }
+        }
+    }
+}
+
+pub(crate) fn waker(task: Arc<Task>) -> Waker {
+    let ptr = Arc::into_raw(task) as *const ();
     let raw = RawWaker::new(ptr, &VTABLE);
     unsafe { Waker::from_raw(raw) }
 }

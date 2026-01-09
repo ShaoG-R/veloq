@@ -144,6 +144,7 @@ impl RuntimeBuilder {
             let shared = Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
                 pinned: SegQueue::new(),
+                remote_queue: SegQueue::new(),
                 waker: LateBoundWaker::new(),
                 injected_load: CachePadded(AtomicUsize::new(0)),
                 local_load: CachePadded(AtomicUsize::new(0)),
