@@ -19,10 +19,11 @@ Veloq 结合了发送端和接收端的负载均衡：
 
 ### 2.2 优先级倒置 (Priority Inversion for Latency)
 在 `LocalExecutor` 的主循环中，显式定义了轮询顺序：
-1.  **Mesh Messages** (最高优先级): 处理来自其他 Worker 的任务/消息。这保证了跨核通信的低延迟。
-2.  **Local Queue**: 处理 `spawn_local` 生成的、不可被窃取的本地任务。
-3.  **Global Injector**: 处理 `spawn` 生成的、或者是被 steal 来的任务。
-4.  **Work Stealing**: 最后尝试去偷任务。
+1.  **Mesh Messages** (最高优先级): 处理来自其他 Worker 的 P2C 任务分发。这保证了跨核通信的低延迟。
+2.  **Local Queue**: 处理 `spawn_local` 生成的、不可被窃取的本地任务（以及被 Mesh/Remote 唤醒后加入本地队列的任务）。
+3.  **Pinned Queue / Remote Queue**: 处理要求被绑定在当前 Worker 执行的任务，或从其他线程唤醒的任务。
+4.  **Global Injector**: 处理 `spawn` 生成的普通任务。
+5.  **Work Stealing**: 最后尝试去偷任务。
 
 ### 2.3 动态注册 (Dynamic Registry)
 `ExecutorRegistry` 支持动态扩缩容，并使用 `smr-swap` 实现了无锁的读取快照，确保调度器在遍历 Worker 列表时不会被锁阻塞。
@@ -54,15 +55,22 @@ loop {
     let mut executed = 0;
     while executed < BUDGET {
         // 1. Mesh Polling (Highest Priority)
+        // 处理 P2C 进来的 Job
         if self.try_poll_mesh() { ... }
         
         // 2. Local Queue
+        // 处理本地任务
         if let Some(task) = self.queue.pop() { ... }
         
-        // 3. Global Injector
+        // 3. Pinned / Remote / Injector
+        // try_poll_injector 内部会依次检查:
+        // - pinned queue (绑定任务)
+        // - remote receiver (唤醒的任务)
+        // - global injector (普通任务)
         if self.try_poll_injector() { ... }
         
         // 4. Stealing
+        // 从其他 Worker 偷任务
         if self.try_steal(executed) { ... }
     }
     

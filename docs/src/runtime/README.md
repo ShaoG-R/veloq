@@ -61,19 +61,26 @@ src/runtime/
 
 **Spawn 策略**:
 - `spawn_balanced(future)`: 使用 P2C (Power of Two Choices) 算法选择两个负载最小的 Worker 之一，通过 Mesh 发送任务。
-- `spawn(future)`: 将任务推入当前 Worker 的 Global Injector 队列。这比 Local Queue 慢一点（有原子操作），但允许任务被其他 Worker 窃取。
+- `spawn(future)`: 将任务推入当前 Worker 的 Global Injector 队列。
+- `spawn_to(future, worker_id)`: 将任务直接发送到指定 Worker 的 Mesh 通道或远程队列。
 
 ### 4.3 Task (`task.rs`)
-Veloq 的 Task 是对 `Future` 的轻量级封装。
-- **RawWakerVTable**: 手动实现了虚函数表，而不是使用 `Arc::new(Mutex::new(..))`。
-- **内存布局**:
-  `Rc<Task>` 包含 `RefCell<Option<Pin<Box<Future>>>>` 和指向执行器队列的 `Weak` 指针。
-  使用 `Rc` 而非 `Arc` 是因为 Task 通常在本地队列中流转，且 Veloq 鼓励本地计算。跨线程调度时，Task 会被打包成 `Job` (Box<FnOnce>) 传输。
+Veloq 的 Task 经过了深度优化，不再使用标准的 `Arc` 或 `Rc` 包装。
+- **手动内存布局**: Task 是一个指向堆内存的指针，内存布局为 `[Header][Future]`。这种紧凑布局减少了内存分配次数和指针解引用开销。
+- **VTable**: 手动实现了 `TaskVTable` (包含 `poll`, `drop_future`, `dealloc`)，用于动态分发，避免了标准 Trait Object 的某些开销。
+- **生命周期状态机**:
+  引入了明确的状态机 (`Spawned` -> `Bound` -> `Running` -> `Dead`)。
+  - `SpawnedTask`: 刚创建但未绑定 Executor 的任务。
+  - `Task`: 已绑定 Executor，准备运行或正在运行的任务。
+- **原子引用计数**: 结合原子状态字，实现了高效的并发访问控制。
+- **无锁竞争处理**: 当任务正在运行时如果被再次唤醒，会自动重新加入队列，避免并发 Poll。
 
 ### 4.4 JoinHandle (`join.rs`)
 实现了任务结果的异步获取。
-- **无锁状态机**: 使用 `AtomicU8` 维护状态 (`IDLE` -> `WAITING` -> `READY`)。
-- **Local vs Send**: 区分 `LocalJoinHandle` (单线程内) 和 `JoinHandle` (跨线程)，分别优化开销。
+- **无锁状态机**: 使用 `AtomicU8` 维护状态 (`IDLE` -> `WAITING` -> `READY`)，结合 `UnsafeCell` 存储结果。
+- **Local vs Send**:
+  - `LocalJoinHandle`: 单线程内使用，基于 `Rc<RefCell<...>>`，零原子开销。
+  - `JoinHandle`: 跨线程使用，基于 `Arc<JoinState>` 和原子操作，支持 `Send`。
 
 ## 5. 存在的问题和 TODO (Issues and TODOs)
 
