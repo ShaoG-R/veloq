@@ -4,7 +4,7 @@ use intrusive_collections::{
     Adapter, LinkedList, LinkedListLink, PointerOps, container_of, linked_list::LinkOps, offset_of,
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::VecDeque,
     fmt,
     marker::PhantomPinned,
@@ -66,28 +66,47 @@ pub struct LocalReceiver<T> {
     channel: LocalChannel<T>,
 }
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
-enum WaiterKind {
-    Sender,
-    Receiver,
+trait WaiterAction {
+    fn get_list<T>(state: &mut State<T>) -> &mut LinkedList<WaiterAdapter>;
+}
+
+struct SenderAction;
+
+impl WaiterAction for SenderAction {
+    fn get_list<T>(state: &mut State<T>) -> &mut LinkedList<WaiterAdapter> {
+        &mut state.send_waiters
+    }
+}
+
+struct ReceiverAction;
+
+impl WaiterAction for ReceiverAction {
+    fn get_list<T>(state: &mut State<T>) -> &mut LinkedList<WaiterAdapter> {
+        &mut state.recv_waiters
+    }
 }
 
 #[derive(Debug)]
-struct Waiter<'a, T, F> {
+struct Waiter<'a, T, A, F>
+where
+    A: WaiterAction,
+{
     node: WaiterNode,
     channel: &'a LocalChannel<T>,
     poll_fn: F,
+    _action: std::marker::PhantomData<A>,
 }
 
 #[derive(Debug)]
 enum PollResult<T> {
-    Pending(WaiterKind),
+    Pending,
     Ready(T),
 }
 
-impl<'a, T, F, R> Waiter<'a, T, F>
+impl<'a, T, A, F, R> Waiter<'a, T, A, F>
 where
     F: FnMut() -> PollResult<R>,
+    A: WaiterAction,
 {
     fn new(poll_fn: F, channel: &'a LocalChannel<T>) -> Self {
         Waiter {
@@ -96,16 +115,17 @@ where
             node: WaiterNode {
                 waker: RefCell::new(None),
                 link: LinkedListLink::new(),
-                kind: Cell::new(None),
                 _p: PhantomPinned,
             },
+            _action: std::marker::PhantomData,
         }
     }
 }
 
-impl<T, F, R> Future for Waiter<'_, T, F>
+impl<T, A, F, R> Future for Waiter<'_, T, A, F>
 where
     F: FnMut() -> PollResult<R>,
+    A: WaiterAction,
 {
     type Output = R;
 
@@ -115,18 +135,17 @@ where
 
         let result = (future_mut.poll_fn)();
         match result {
-            PollResult::Pending(kind) => {
-                pinned_node.kind.set(Some(kind));
+            PollResult::Pending => {
                 *pinned_node.waker.borrow_mut() = Some(cx.waker().clone());
 
-                register_into_waiting_queue(
+                register_into_waiting_queue::<T, A>(
                     pinned_node,
                     &mut future_mut.channel.state.borrow_mut(),
                 );
                 Poll::Pending
             }
             PollResult::Ready(result) => {
-                remove_from_the_waiting_queue(
+                remove_from_the_waiting_queue::<T, A>(
                     pinned_node,
                     &mut future_mut.channel.state.borrow_mut(),
                 );
@@ -136,66 +155,40 @@ where
     }
 }
 
-fn register_into_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut State<T>) {
+fn register_into_waiting_queue<T, A: WaiterAction>(
+    node: Pin<&mut WaiterNode>,
+    state: &mut State<T>,
+) {
     if node.link.is_linked() {
         return;
     }
 
-    let kind = node.kind.get().expect("Unknown part of the channel");
-    match kind {
-        WaiterKind::Sender => {
-            state
-                .send_waiters
-                .push_back(unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) });
-        }
-        WaiterKind::Receiver => {
-            state
-                .recv_waiters
-                .push_back(unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) });
-        }
-    }
+    A::get_list(state).push_back(unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) });
 }
 
-fn remove_from_the_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut State<T>) {
+fn remove_from_the_waiting_queue<T, A: WaiterAction>(
+    node: Pin<&mut WaiterNode>,
+    state: &mut State<T>,
+) {
     if !node.link.is_linked() {
         return;
     }
 
-    let kind = node.kind.get().expect("Unknown part of the channel");
-    let mut cursor = match kind {
-        WaiterKind::Sender => unsafe {
-            state
-                .send_waiters
-                .cursor_mut_from_ptr(node.get_unchecked_mut())
-        },
-        WaiterKind::Receiver => unsafe {
-            state
-                .recv_waiters
-                .cursor_mut_from_ptr(node.get_unchecked_mut())
-        },
-    };
+    let mut cursor = unsafe { A::get_list(state).cursor_mut_from_ptr(node.get_unchecked_mut()) };
 
     cursor.remove();
 }
 
-impl<T, F> Drop for Waiter<'_, T, F> {
+impl<T, A, F> Drop for Waiter<'_, T, A, F>
+where
+    A: WaiterAction,
+{
     fn drop(&mut self) {
         if self.node.link.is_linked() {
             let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
-            let kind = pinned_node
-                .kind
-                .get()
-                .expect("If Future is queued type of the queue has to be specified");
 
             let mut state = self.channel.state.borrow_mut();
-            let waiters = match kind {
-                WaiterKind::Sender => &mut state.send_waiters,
-                WaiterKind::Receiver => &mut state.recv_waiters,
-            };
-
-            let mut cursor =
-                unsafe { waiters.cursor_mut_from_ptr(pinned_node.get_unchecked_mut()) };
-            cursor.remove();
+            remove_from_the_waiting_queue::<T, A>(pinned_node, &mut state);
         }
     }
 }
@@ -204,7 +197,6 @@ impl<T, F> Drop for Waiter<'_, T, F> {
 struct WaiterNode {
     waker: RefCell<Option<Waker>>,
     link: LinkedListLink,
-    kind: Cell<Option<WaiterKind>>,
     _p: PhantomPinned,
 }
 
@@ -314,7 +306,7 @@ impl<T> State<T> {
         } else if !self.is_full() {
             PollResult::Ready(())
         } else {
-            PollResult::Pending(WaiterKind::Sender)
+            PollResult::Pending
         }
     }
 
@@ -328,7 +320,7 @@ impl<T> State<T> {
             ))),
             None => {
                 if self.tx_count > 0 {
-                    PollResult::Pending(WaiterKind::Receiver)
+                    PollResult::Pending
                 } else {
                     PollResult::Ready(None)
                 }
@@ -434,7 +426,7 @@ impl<T> LocalSender<T> {
     /// 异步发送数据，如果通道已满则等待
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
         // 先等待空间，但不持有 borrow
-        Waiter::new(|| self.wait_for_room(), &self.channel).await;
+        Waiter::<T, SenderAction, _>::new(|| self.wait_for_room(), &self.channel).await;
         // 等待结束后尝试发送
         self.try_send(item)
     }
@@ -508,7 +500,6 @@ impl<'a, T> ChannelStream<'a, T> {
             node: Box::pin(WaiterNode {
                 waker: RefCell::new(None),
                 link: LinkedListLink::new(),
-                kind: Cell::new(None),
                 _p: PhantomPinned,
             }),
         }
@@ -523,11 +514,10 @@ impl<T> Stream for ChannelStream<'_, T> {
         let this = unsafe { self.get_unchecked_mut() };
 
         match result {
-            PollResult::Pending(kind) => {
+            PollResult::Pending => {
                 *this.node.waker.borrow_mut() = Some(cx.waker().clone());
-                this.node.kind.set(Some(kind));
 
-                register_into_waiting_queue(
+                register_into_waiting_queue::<T, ReceiverAction>(
                     this.node.as_mut(),
                     &mut this.channel.state.borrow_mut(),
                 );
@@ -535,7 +525,7 @@ impl<T> Stream for ChannelStream<'_, T> {
                 Poll::Pending
             }
             PollResult::Ready(result) => {
-                remove_from_the_waiting_queue(
+                remove_from_the_waiting_queue::<T, ReceiverAction>(
                     this.node.as_mut(),
                     &mut this.channel.state.borrow_mut(),
                 );
@@ -557,14 +547,14 @@ impl<T> Drop for ChannelStream<'_, T> {
         // 使用 borrow_mut() 而非 try_borrow_mut() 以确保在异常情况下也能清理。
         // 如果 panic 发生，RefCell 已经 poison 也没关系，主要是防止后续 UB。
         let mut state = self.channel.state.borrow_mut();
-        remove_from_the_waiting_queue(self.node.as_mut(), &mut state);
+        remove_from_the_waiting_queue::<T, ReceiverAction>(self.node.as_mut(), &mut state);
     }
 }
 
 impl<T> LocalReceiver<T> {
     /// 接收下一条消息
     pub async fn recv(&self) -> Option<T> {
-        Waiter::new(|| self.recv_one(), &self.channel).await
+        Waiter::<T, ReceiverAction, _>::new(|| self.recv_one(), &self.channel).await
     }
 
     /// 转换为 Stream
@@ -575,7 +565,7 @@ impl<T> LocalReceiver<T> {
     fn recv_one(&self) -> PollResult<Option<T>> {
         let result = self.channel.state.borrow_mut().recv_one();
         match result {
-            PollResult::Pending(kind) => PollResult::Pending(kind),
+            PollResult::Pending => PollResult::Pending,
             PollResult::Ready(opt) => PollResult::Ready(opt.map(|(ret, mw)| {
                 if let Some(w) = mw {
                     w.wake();
