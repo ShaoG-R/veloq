@@ -91,6 +91,14 @@ pub struct BufferRegion {
 unsafe impl Send for BufferRegion {}
 unsafe impl Sync for BufferRegion {}
 
+/// Trait abstraction for driver-specific buffer registration
+pub trait BufferRegistrar: std::fmt::Debug {
+    /// Register memory regions with the kernel.
+    /// Returns a list of handles (tokens) corresponding to the regions.
+    /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
+    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>>;
+}
+
 /// Trait for memory pool implementation allows custom memory management
 pub trait BufPool: std::fmt::Debug + 'static {
     /// Allocate memory with specific length.
@@ -145,6 +153,8 @@ pub trait BufPool: std::fmt::Debug + 'static {
         }
         panic!("Buffer not found in pool regions");
     }
+    /// Bind a registrar to this pool to enable internal registration.
+    fn bind_registrar(&self, registrar: Box<dyn BufferRegistrar>) -> std::io::Result<()>;
 }
 
 #[derive(Debug)]
@@ -325,6 +335,7 @@ pub struct BufPoolVTable {
     pub clone: unsafe fn(*const ()) -> *mut (),
     pub drop: unsafe fn(*mut ()),
     pub fmt: unsafe fn(*const (), &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+    pub bind_registrar: unsafe fn(*const (), Box<dyn BufferRegistrar>) -> std::io::Result<()>,
 }
 
 /// 类型擦除的 Pool 句柄，可存储在 TLS 中。
@@ -399,6 +410,16 @@ impl AnyBufPool {
             }
         }
 
+        unsafe fn bind_registrar_shim<P: BufPool>(
+            ptr: *const (),
+            registrar: Box<dyn BufferRegistrar>,
+        ) -> std::io::Result<()> {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                pool.bind_registrar(registrar)
+            }
+        }
+
         struct VTableGen<P>(std::marker::PhantomData<P>);
 
         impl<P: BufPool + Clone + 'static> VTableGen<P> {
@@ -411,6 +432,7 @@ impl AnyBufPool {
                 clone: clone_shim::<P>,
                 drop: drop_shim::<P>,
                 fmt: fmt_shim::<P>,
+                bind_registrar: bind_registrar_shim::<P>,
             };
         }
 
@@ -444,6 +466,10 @@ impl BufPool for AnyBufPool {
 
     fn pool_data(&self) -> NonNull<()> {
         unsafe { (self.vtable.pool_data)(self.data) }
+    }
+
+    fn bind_registrar(&self, registrar: Box<dyn BufferRegistrar>) -> std::io::Result<()> {
+        unsafe { (self.vtable.bind_registrar)(self.data, registrar) }
     }
 }
 

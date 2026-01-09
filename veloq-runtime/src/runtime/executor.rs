@@ -140,10 +140,10 @@ impl LocalExecutor {
     }
 
     pub fn register_buffers(&self, pool: &dyn BufPool) {
-        self.driver
-            .borrow_mut()
-            .register_buffers(pool)
-            .expect("Failed to register buffer pool");
+        let weak = Rc::downgrade(&self.driver);
+        let registrar = crate::io::driver::PlatformDriver::create_registrar(weak);
+        pool.bind_registrar(registrar)
+            .expect("Failed to bind registrar");
     }
 
     pub fn spawn_local<F, T>(&self, future: F) -> LocalJoinHandle<T>

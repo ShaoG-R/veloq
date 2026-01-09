@@ -6,6 +6,7 @@ mod submit;
 #[cfg(test)]
 mod tests;
 
+use crate::io::buffer::{BufferRegion, BufferRegistrar};
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
 use crate::io::driver::{Driver, RemoteWaker};
 use blocking::ThreadPool;
@@ -72,6 +73,36 @@ impl Drop for IocpWaker {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IocpRegistrar {
+    extensions: Extensions,
+}
+
+impl BufferRegistrar for IocpRegistrar {
+    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
+        let table = self
+            .extensions
+            .rio_table
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "RIO not available"))?;
+
+        let register_fn = table.RIORegisterBuffer.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "RIORegisterBuffer not found")
+        })?;
+
+        let mut ids = Vec::with_capacity(regions.len());
+        for region in regions {
+            let buffer_id =
+                unsafe { (register_fn)(region.ptr.as_ptr() as *const u8, region.len as u32) };
+            if (buffer_id as usize) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            ids.push(buffer_id as usize);
+        }
+        Ok(ids)
     }
 }
 
@@ -233,6 +264,14 @@ impl IocpDriver {
             rio.register_buffers(pool, &self.extensions)?;
         }
         Ok(())
+    }
+
+    pub fn create_registrar(
+        handle: std::rc::Weak<std::cell::RefCell<Self>>,
+    ) -> Box<dyn BufferRegistrar> {
+        let driver = handle.upgrade().expect("Driver dropped");
+        let extensions = driver.borrow().extensions.clone();
+        Box::new(IocpRegistrar { extensions })
     }
 }
 

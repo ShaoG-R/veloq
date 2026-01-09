@@ -48,6 +48,14 @@ pub struct Extensions {
     pub(crate) rio_table: Option<RIO_EXTENSION_FUNCTION_TABLE>,
 }
 
+impl std::fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extensions")
+            .field("rio_table", &self.rio_table.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Extensions {
     pub(crate) fn new() -> io::Result<Self> {
         let socket = unsafe {

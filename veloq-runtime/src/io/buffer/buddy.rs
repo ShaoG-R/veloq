@@ -329,6 +329,11 @@ struct BuddyAllocator {
 
     // Slab 缓存：存储常用 Order 的空闲块 (Order 0..=MAX_SLAB_ORDER)
     slabs: [Vec<NonNull<u8>>; MAX_SLAB_ORDER + 1],
+
+    // Optional registrar for driver integration
+    registrar: Option<Box<dyn crate::io::buffer::BufferRegistrar>>,
+    // Registration ID (e.g. RIO Buffer ID) if registered
+    registration_id: Option<usize>,
 }
 
 impl BuddyAllocator {
@@ -336,6 +341,8 @@ impl BuddyAllocator {
         Ok(Self {
             raw: RawBuddyAllocator::new()?,
             slabs: Default::default(),
+            registrar: None,
+            registration_id: None,
         })
     }
 
@@ -476,7 +483,7 @@ impl BuddyPool {
                 let mut buf = FixedBuf::new(
                     block_ptr,
                     capacity,
-                    0, // Global index is 0
+                    inner.registration_id.map(|id| id as u16).unwrap_or(0),
                     self.pool_data(),
                     self.vtable(),
                     order, // Use order as context
@@ -502,7 +509,7 @@ impl BufPool for BuddyPool {
                 AllocResult::Allocated {
                     ptr: block_ptr,
                     cap: capacity,
-                    global_index: 0,
+                    global_index: inner.registration_id.map(|id| id as u16).unwrap_or(0),
                     context: order,
                 }
             }
@@ -527,6 +534,23 @@ impl BufPool for BuddyPool {
             let raw = Rc::into_raw(self.inner.clone());
             NonNull::new_unchecked(raw as *mut ())
         }
+    }
+    fn bind_registrar(
+        &self,
+        registrar: Box<dyn crate::io::buffer::BufferRegistrar>,
+    ) -> std::io::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        // Register the single arena region
+        let region = crate::io::buffer::BufferRegion {
+            ptr: unsafe { NonNull::new_unchecked(inner.base_ptr() as *mut _) },
+            len: ARENA_SIZE,
+        };
+        let ids = registrar.register(&[region])?;
+        if let Some(&id) = ids.first() {
+            inner.registration_id = Some(id);
+        }
+        inner.registrar = Some(registrar);
+        Ok(())
     }
 }
 

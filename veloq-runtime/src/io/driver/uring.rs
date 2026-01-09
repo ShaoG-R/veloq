@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 pub mod op;
 pub mod submit;
+use crate::io::buffer::{BufferRegion, BufferRegistrar};
+use std::cell::RefCell;
+use std::rc::Weak;
 
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IntoPlatformOp;
@@ -48,6 +51,46 @@ impl Drop for UringWaker {
         unsafe {
             libc::close(self.0);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UringRegistrar {
+    driver: Weak<RefCell<UringDriver>>,
+}
+
+impl BufferRegistrar for UringRegistrar {
+    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
+        let driver_rc = self
+            .driver
+            .upgrade()
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Driver dropped"))?;
+        let mut driver = driver_rc.borrow_mut();
+
+        // io_uring requires registering all buffers at once.
+        let iovecs: Vec<libc::iovec> = regions
+            .iter()
+            .map(|region| libc::iovec {
+                iov_base: region.ptr.as_ptr() as *mut _,
+                iov_len: region.len,
+            })
+            .collect();
+
+        match unsafe { driver.ring.submitter().register_buffers(&iovecs) } {
+            Ok(_) => {
+                driver.buffers_registered = true;
+            }
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    driver.buffers_registered = true;
+                    // Already registered.
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok((0..regions.len()).collect())
     }
 }
 
@@ -453,6 +496,10 @@ impl UringDriver {
         }
         // Remove from backlog if present? O(N).
         // We let flush_backlog handle it (it checks cancelled).
+    }
+
+    pub fn create_registrar(weak: Weak<RefCell<Self>>) -> Box<dyn BufferRegistrar> {
+        Box::new(UringRegistrar { driver: weak })
     }
 }
 

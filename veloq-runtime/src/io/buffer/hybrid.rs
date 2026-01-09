@@ -81,6 +81,8 @@ pub struct HybridAllocator {
     memory: AlignedMemory,
     total_size: usize,
     slabs: Vec<Slab>,
+    registrar: Option<Box<dyn crate::io::buffer::BufferRegistrar>>,
+    registration_id: Option<usize>,
 }
 
 impl Default for HybridAllocator {
@@ -137,6 +139,8 @@ impl HybridAllocator {
             memory,
             total_size: total_arena_size,
             slabs,
+            registrar: None,
+            registration_id: None,
         })
     }
 
@@ -181,7 +185,7 @@ impl HybridAllocator {
                     return Some(RawAlloc {
                         ptr: unsafe { NonNull::new_unchecked(block_ptr) },
                         cap: slab.config.block_size,
-                        global_index: 0, // All slabs are in the single region 0
+                        global_index: self.registration_id.map(|id| id as u16).unwrap_or(0),
                         context,
                     });
                 }
@@ -413,6 +417,23 @@ impl BufPool for HybridPool {
             let raw = Rc::into_raw(self.inner.clone());
             NonNull::new_unchecked(raw as *mut ())
         }
+    }
+
+    fn bind_registrar(
+        &self,
+        registrar: Box<dyn crate::io::buffer::BufferRegistrar>,
+    ) -> std::io::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        let regions = vec![crate::io::buffer::BufferRegion {
+            ptr: unsafe { NonNull::new_unchecked(inner.memory.as_ptr() as *mut _) },
+            len: inner.total_size,
+        }];
+        let ids = registrar.register(&regions)?;
+        if let Some(&id) = ids.first() {
+            inner.registration_id = Some(id);
+        }
+        inner.registrar = Some(registrar);
+        Ok(())
     }
 }
 
