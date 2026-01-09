@@ -151,6 +151,7 @@ impl RuntimeBuilder {
                 waker: LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
                 local_load: CachePadded::new(AtomicUsize::new(0)),
+                state: states[i].clone(),
             });
             shared_states.push(shared.clone());
             remote_receivers.push(Some(rx));
@@ -172,7 +173,6 @@ impl RuntimeBuilder {
 
             // Take ownership of the specific mesh components for this worker
             let (ingress, egress) = mesh_matrix.take_worker_channels(worker_id);
-            let state = states[worker_id].clone();
 
             let shared = shared_states[worker_id].clone(); // Get pre-allocated shared
             let remote_receiver = remote_receivers[worker_id]
@@ -196,7 +196,7 @@ impl RuntimeBuilder {
                 executor = executor.with_registry(registry.clone()); // Inject registry
 
                 // Attach Mesh
-                executor.attach_mesh(worker_id, state, ingress, egress, peer_handles_clone);
+                executor.attach_mesh(worker_id, ingress, egress, peer_handles_clone);
 
                 // Bind Buffer Pool
                 let registrar = executor.registrar();

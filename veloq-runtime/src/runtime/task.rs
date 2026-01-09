@@ -386,7 +386,14 @@ unsafe fn wake_task(ptr: NonNull<Header>) {
             let task = Task { ptr };
 
             let _ = shared.remote_queue.send(task);
-            let _ = shared.waker.wake();
+
+            // Optimization: Only wake the driver if the executor is parking or parked.
+            // If it is RUNNING, it will eventually check the queue (local or global).
+            // Note: `crate::runtime::mesh::RUNNING` is 0.
+            let state = shared.state.load(Ordering::Acquire);
+            if state != crate::runtime::mesh::RUNNING {
+                let _ = shared.waker.wake();
+            }
         }
     }
 }

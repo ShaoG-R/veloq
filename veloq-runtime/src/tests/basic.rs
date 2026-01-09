@@ -189,3 +189,141 @@ fn test_multi_worker_throughput() {
     let final_count = counter.load(Ordering::SeqCst);
     assert_eq!(final_count, 50);
 }
+
+/// Test local channel functionality using the runtime.
+#[test]
+fn test_local_channel() {
+    use crate::sync::mpsc;
+
+    let mut exec = LocalExecutor::default();
+
+    exec.block_on(async move {
+        let (tx, mut rx) = mpsc::channel();
+
+        // Spawn a local task to send messages
+        let tx1 = tx.clone();
+        spawn_local(async move {
+            tx1.send(1).unwrap();
+            crate::runtime::context::yield_now().await;
+            tx1.send(2).unwrap();
+        });
+
+        // Spawn another local task to send messages
+        let tx2 = tx.clone();
+        spawn_local(async move {
+            crate::runtime::context::yield_now().await;
+            tx2.send(3).unwrap();
+        });
+
+        // Drop original text to allow disconnect detection eventually (after clones drop)
+        drop(tx);
+
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(rx.recv().await, Some(3));
+        assert_eq!(rx.recv().await, None); // All senders dropped
+    });
+}
+
+/// Test local channel disconnect behavior.
+#[test]
+fn test_local_channel_disconnect() {
+    use crate::sync::mpsc;
+
+    let mut exec = LocalExecutor::default();
+
+    exec.block_on(async move {
+        let (tx, mut rx) = mpsc::channel::<i32>();
+
+        // Drop sender immediately
+        drop(tx);
+
+        // Receiver should see disconnected
+        assert_eq!(rx.recv().await, None);
+    });
+}
+
+// ============ Notifier Tests ============
+
+#[test]
+fn test_notifier_simple() {
+    let mut exec = LocalExecutor::default();
+    exec.block_on(async {
+        let notifier = crate::sync::notifier::Notifier::new();
+
+        // Notify before wait
+        notifier.notify_one();
+        notifier.notified().await; // Should complete immediately
+
+        // Verify state reset (implicit: if we wait again without notify, we would block)
+    });
+}
+
+#[test]
+fn test_notifier_async_wait() {
+    let mut exec = LocalExecutor::default();
+    exec.block_on(async {
+        let notifier = std::rc::Rc::new(crate::sync::notifier::Notifier::new());
+        let n2 = notifier.clone();
+
+        let handle = spawn_local(async move {
+            n2.notified().await;
+            "woke up"
+        });
+
+        // Yield to let task register
+        crate::runtime::context::yield_now().await;
+
+        // At this point, task should be WAITING
+        notifier.notify_one();
+
+        assert_eq!(handle.await, "woke up");
+    });
+}
+
+#[test]
+fn test_notifier_ping_pong() {
+    // Test repeated notifications
+    let mut exec = LocalExecutor::default();
+    exec.block_on(async {
+        let notifier = std::rc::Rc::new(crate::sync::notifier::Notifier::new());
+        let n2 = notifier.clone();
+
+        let handle = spawn_local(async move {
+            for i in 0..10 {
+                n2.notified().await;
+                if i == 5 {
+                    crate::runtime::context::yield_now().await;
+                }
+            }
+            "done"
+        });
+
+        for _ in 0..10 {
+            // Give the waiter a chance to register
+            crate::runtime::context::yield_now().await;
+            notifier.notify_one();
+        }
+
+        assert_eq!(handle.await, "done");
+    });
+}
+
+#[test]
+fn test_notifier_spurious_check() {
+    let mut exec = LocalExecutor::default();
+    exec.block_on(async {
+        let notifier = crate::sync::notifier::Notifier::new();
+
+        notifier.notify_one();
+
+        // This should consume the notification
+        notifier.notified().await;
+
+        // If we notify twice, it coalesces
+        notifier.notify_one();
+        notifier.notify_one();
+
+        notifier.notified().await; // Consumes one
+    });
+}

@@ -87,6 +87,9 @@ impl LocalExecutorBuilder {
         } else {
             let (remote_tx, remote_rx) = mpsc::channel();
             let (pinned_tx, pinned_rx) = mpsc::channel();
+            // Default state is RUNNING
+            let state = Arc::new(AtomicU8::new(mesh::RUNNING));
+
             let shared = Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
                 pinned: pinned_tx,
@@ -94,6 +97,7 @@ impl LocalExecutorBuilder {
                 waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
                 local_load: CachePadded::new(AtomicUsize::new(0)),
+                state,
             });
             (shared, remote_rx, pinned_rx)
         };
@@ -204,14 +208,18 @@ impl LocalExecutor {
     pub(crate) fn attach_mesh(
         &mut self,
         id: usize,
-        state: Arc<AtomicU8>,
         ingress: Vec<Consumer<Job>>,
         egress: Vec<Producer<Job>>,
         peer_handles: Arc<Vec<AtomicUsize>>,
     ) {
+        // We MUST ensure that the state passed here is consistent with self.shared.state
+        // For now, we assume RuntimeBuilder sets this up correctly (by passing shared.state's clone or same source).
+        // Since `ExecutorShared` is generally immutable once created, if they differ, it's a bug in setup.
+        // Ideally we should ASSERT here:
+        // assert!(Arc::ptr_eq(&self.shared.state, &state), "Mesh state must match Shared state");
+
         let mesh = MeshContext {
             id,
-            state,
             ingress,
             egress,
             peer_handles,
@@ -300,31 +308,50 @@ impl LocalExecutor {
             driver.process_completions();
         } else {
             let mut can_park = true;
+            let state = &self.shared.state;
 
+            // 1. Set PARKING
+            // This tells remote wakers: "I might sleep soon, so you should probably syscall wake me".
+            state.store(mesh::PARKING, Ordering::Release);
+
+            // 2. Poll Mesh (Double check)
             if let Some(mesh_rc) = &self.mesh {
                 let mut mesh = mesh_rc.borrow_mut();
-                // 1. Set PARKING
-                mesh.state.store(mesh::PARKING, Ordering::Release);
-
-                // 2. Poll Mesh (Double check)
                 if mesh.poll_ingress(|job| self.enqueue_job(job)) {
-                    mesh.state.store(mesh::RUNNING, Ordering::Relaxed);
+                    state.store(mesh::RUNNING, Ordering::Relaxed);
                     can_park = false;
-                } else {
-                    // 3. Commit PARKED
-                    mesh.state.store(mesh::PARKED, Ordering::Release);
+                }
+            }
+
+            // Double check remote queues
+            if can_park {
+                if !self.pinned_receiver.try_recv().is_err()
+                    || !self.remote_receiver.try_recv().is_err()
+                    || !self.shared.injector.is_empty()
+                {
+                    state.store(mesh::RUNNING, Ordering::Relaxed);
+                    can_park = false;
                 }
             }
 
             if can_park {
+                // 3. Commit PARKED
+                state.store(mesh::PARKED, Ordering::Release);
+
+                // Final check (race condition barrier) needed?
+                // In IOCP/Uring, if a wake happens after PARKED is set but before wait(), it posts to the port/fd.
+                // The wait() will picking it up immediately.
+                // The only race uses remote queues:
+                // A: Set PARKED.
+                // B: Push task. See PARKED. Wake().
+                // A: Wait(). Wakeup consumed.
+                // Correct.
+
                 driver.wait().unwrap();
             }
 
             // Restore RUNNING
-            if let Some(mesh_rc) = &self.mesh {
-                let mesh = mesh_rc.borrow();
-                mesh.state.store(mesh::RUNNING, Ordering::Release);
-            }
+            state.store(mesh::RUNNING, Ordering::Release);
         }
     }
 

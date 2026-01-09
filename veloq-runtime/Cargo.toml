@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+atomic-waker = "1.1.2"
+futures-core = "0.3"
 crossbeam-queue = "0.3"
 crossbeam-utils = { version = "0.8", default-features = false }
 num_cpus = "1.17.0"

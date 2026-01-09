@@ -41,6 +41,7 @@ pub(crate) struct ExecutorShared {
     pub(crate) waker: LateBoundWaker,
     pub(crate) injected_load: CachePadded<AtomicUsize>,
     pub(crate) local_load: CachePadded<AtomicUsize>,
+    pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
 }
 
 pub(crate) struct LateBoundWaker {
@@ -79,7 +80,6 @@ impl RemoteWaker for LateBoundWaker {
 
 pub struct MeshContext {
     pub(crate) id: usize,
-    pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
     pub(crate) ingress: Vec<Consumer<Job>>,
     pub(crate) egress: Vec<Producer<Job>>,
     pub(crate) peer_handles: Arc<Vec<AtomicUsize>>,
