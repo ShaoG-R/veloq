@@ -6,7 +6,9 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::rc::Weak;
+use std::rc::{Rc, Weak};
+
+use crossbeam_deque::Worker;
 
 use crate::io::buffer::AnyBufPool;
 use crate::io::driver::PlatformDriver;
@@ -14,6 +16,8 @@ use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
 use crate::runtime::executor::spawner::pack_job;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
+// Runnable is needed for context methods
+use crate::runtime::task::harness::{self, Runnable};
 use crate::runtime::task::{SpawnedTask, Task};
 
 thread_local! {
@@ -76,6 +80,7 @@ pub struct RuntimeContext {
     pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
     pub(crate) handle: ExecutorHandle,
     pub(crate) buf_pool: AnyBufPool,
+    pub(crate) stealable: Rc<Worker<Runnable>>,
 }
 
 impl RuntimeContext {
@@ -87,6 +92,7 @@ impl RuntimeContext {
         mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
         handle: ExecutorHandle,
         buf_pool: AnyBufPool,
+        stealable: Rc<Worker<Runnable>>,
     ) -> Self {
         Self {
             driver,
@@ -95,6 +101,7 @@ impl RuntimeContext {
             mesh,
             handle,
             buf_pool,
+            stealable,
         }
     }
 
@@ -245,6 +252,33 @@ impl RuntimeContext {
         // Fallback (e.g., no mesh or driver dropped)
         spawner.spawn_job_to(job, worker_id);
         handle
+    }
+
+    /// Spawn a new stealable task (Send Future) on the runtime.
+    ///
+    /// The task is initially assigned to a worker (via P2C), but can be stolen by other workers
+    /// if the target worker is busy. The task is wrapped in an `ArcTask` (Runnabe).
+    ///
+    /// # Panics
+    /// Panics if called outside of a runtime context.
+    pub fn spawn_future<F, Output>(&self, future: F) -> JoinHandle<Output>
+    where
+        F: Future<Output = Output> + Send + 'static,
+        Output: Send + 'static,
+    {
+        // We are on a worker that supports stealing.
+        // Create task bound to THIS executor's scheduler.
+        let scheduler = self.handle.shared.clone();
+        unsafe {
+            let (job, handle) = harness::spawn_arc(future, scheduler);
+            self.stealable.push(job);
+            // Increment load
+            self.handle
+                .shared
+                .injected_load
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            handle
+        }
     }
 }
 

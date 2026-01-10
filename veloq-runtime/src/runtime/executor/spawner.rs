@@ -13,6 +13,9 @@ use crate::runtime::task::{SpawnedTask, Task};
 
 pub type Job = SpawnedTask;
 
+// Alias for the new stealable task type
+use crate::runtime::task::harness::{self, Runnable, Schedule};
+
 pub(crate) fn pack_job<F, Output>(async_fn: F) -> (crate::runtime::join::JoinHandle<Output>, Job)
 where
     F: AsyncFnOnce() -> Output + Send + 'static,
@@ -38,11 +41,29 @@ pub(crate) struct ExecutorShared {
     pub(crate) injector: SegQueue<Job>,
     pub(crate) pinned: std::sync::mpsc::Sender<Job>,
     pub(crate) remote_queue: std::sync::mpsc::Sender<Task>,
+
+    // --- New Stealable Task Support ---
+    pub(crate) future_injector: SegQueue<Runnable>,
+    pub(crate) stealer: crossbeam_deque::Stealer<Runnable>,
+    // ----------------------------------
     pub(crate) waker: LateBoundWaker,
     pub(crate) injected_load: CachePadded<AtomicUsize>,
     pub(crate) local_load: CachePadded<AtomicUsize>,
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
     pub(crate) shutdown: AtomicBool,
+}
+
+impl harness::Schedule for ExecutorShared {
+    fn schedule(&self, task: Runnable) {
+        self.future_injector.push(task);
+        // We track load for stealable tasks separately or combined?
+        // For now, let's treat them as injected load for simplicity, or we might need a separate counter.
+        // Using injected_load is fine as it represents "tasks waiting to be run".
+        self.injected_load.fetch_add(1, Ordering::Relaxed);
+        self.waker
+            .wake()
+            .expect("Failed to wake executor via scheduler");
+    }
 }
 
 pub(crate) struct LateBoundWaker {
@@ -222,6 +243,24 @@ impl Spawner {
         match self.p2c_select(workers) {
             Some(target) => target.clone(),
             None => panic!("No workers available in registry"),
+        }
+    }
+
+    pub fn spawn_future<F, Output>(&self, future: F) -> crate::runtime::join::JoinHandle<Output>
+    where
+        F: Future<Output = Output> + Send + 'static,
+        Output: Send + 'static,
+    {
+        // Select a worker to "own" this task initially.
+        // This is important because the Runnable needs a "home" Injector (scheduler)
+        // to return to if it is remotely woken.
+        let target = self.select_worker();
+
+        unsafe {
+            let (job, handle) = harness::spawn_arc(future, target.shared.clone());
+            // We schedule it via the trait, which pushes to future_injector
+            target.shared.schedule(job);
+            handle
         }
     }
 

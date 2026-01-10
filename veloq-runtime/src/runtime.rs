@@ -13,6 +13,7 @@ use crate::io::driver::RemoteWaker;
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::mesh::{Consumer, Producer};
+use crossbeam_deque::Worker;
 use crossbeam_queue::SegQueue;
 
 pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
@@ -89,6 +90,8 @@ struct WorkerPrep {
     pinned_receiver: std::sync::mpsc::Receiver<crate::runtime::task::SpawnedTask>,
     ingress: Vec<Consumer<crate::runtime::executor::Job>>,
     egress: Vec<Producer<crate::runtime::executor::Job>>,
+    // Worker local queue for stealable tasks
+    stealable_worker: Worker<crate::runtime::task::harness::Runnable>,
     pool_constructor: PoolConstructor,
     config: crate::config::Config,
     barrier: Arc<std::sync::Barrier>,
@@ -160,14 +163,24 @@ impl RuntimeBuilder {
         let mut handles = Vec::with_capacity(worker_count);
         let mut remote_receivers = Vec::with_capacity(worker_count);
         let mut pinned_receivers = Vec::with_capacity(worker_count);
+        // Temporary storage for workers to be moved into threads
+        let mut stealable_workers = Vec::with_capacity(worker_count);
 
         for i in 0..worker_count {
             let (tx, rx) = std::sync::mpsc::channel();
             let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+
+            // Create stealable worker
+            let worker = Worker::new_fifo();
+            let stealer = worker.stealer();
+            stealable_workers.push(Some(worker));
+
             let shared = Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
                 pinned: pinned_tx,
                 remote_queue: tx,
+                future_injector: SegQueue::new(),
+                stealer,
                 waker: LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
                 local_load: CachePadded::new(AtomicUsize::new(0)),
@@ -206,6 +219,9 @@ impl RuntimeBuilder {
             let pinned_receiver = pinned_receivers[worker_id]
                 .take()
                 .expect("Pinned receiver already taken");
+            let stealable_worker = stealable_workers[worker_id]
+                .take()
+                .expect("Worker already taken");
 
             let builder = std::thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
             let barrier = barrier.clone();
@@ -216,6 +232,7 @@ impl RuntimeBuilder {
                     .with_shared(shared) // Inject shared state
                     .with_remote_receiver(remote_receiver) // Inject remote receiver
                     .with_pinned_receiver(pinned_receiver) // Inject pinned receiver
+                    .with_worker(stealable_worker) // Inject stealable worker
                     .build(|registrar| {
                         let pool = pool_constructor(worker_id, registrar);
                         crate::io::buffer::AnyBufPool::new(pool)
@@ -245,6 +262,7 @@ impl RuntimeBuilder {
         let shared = shared_states[0].clone();
         let remote_receiver = remote_receivers[0].take().unwrap();
         let pinned_receiver = pinned_receivers[0].take().unwrap();
+        let stealable_worker = stealable_workers[0].take().unwrap();
 
         let worker_0_prep = WorkerPrep {
             shared,
@@ -252,6 +270,7 @@ impl RuntimeBuilder {
             pinned_receiver,
             ingress,
             egress,
+            stealable_worker,
             pool_constructor: pool_constructor.clone(),
             config: self.config.clone(),
             barrier: barrier.clone(), // Pass barrier to Worker 0
@@ -341,6 +360,7 @@ impl Runtime {
             .with_shared(prep.shared) // Inject shared state
             .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
             .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
+            .with_worker(prep.stealable_worker) // Inject stealable worker
             .build(|registrar| {
                 // Bind Buffer Pool via constructor
                 (prep.pool_constructor)(0, registrar)

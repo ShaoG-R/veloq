@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use crossbeam_deque::Worker;
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 
@@ -15,6 +16,7 @@ use crate::runtime::context::RuntimeContext;
 pub(crate) use crate::runtime::executor::spawner::ExecutorShared;
 use crate::runtime::join::LocalJoinHandle;
 use crate::runtime::mesh::{self, Consumer, Producer};
+use crate::runtime::task::harness::Runnable;
 use crate::runtime::task::{SpawnedTask, Task};
 
 // Re-export common types from spawner which acts as the definition source for these
@@ -29,6 +31,9 @@ pub struct LocalExecutorBuilder {
     shared: Option<Arc<ExecutorShared>>,
     remote_receiver: Option<mpsc::Receiver<Task>>,
     pinned_receiver: Option<mpsc::Receiver<SpawnedTask>>,
+    // Worker provided externally (e.g. by RuntimeBuilder) or created internally
+    stealable: Option<Worker<Runnable>>,
+    stealer: Option<crossbeam_deque::Stealer<Runnable>>,
 }
 
 impl LocalExecutorBuilder {
@@ -38,6 +43,8 @@ impl LocalExecutorBuilder {
             shared: None,
             remote_receiver: None,
             pinned_receiver: None,
+            stealable: None,
+            stealer: None,
         }
     }
 
@@ -53,6 +60,12 @@ impl LocalExecutorBuilder {
 
     pub(crate) fn with_pinned_receiver(mut self, receiver: mpsc::Receiver<SpawnedTask>) -> Self {
         self.pinned_receiver = Some(receiver);
+        self
+    }
+
+    pub(crate) fn with_worker(mut self, worker: Worker<Runnable>) -> Self {
+        self.stealer = Some(worker.stealer());
+        self.stealable = Some(worker);
         self
     }
 
@@ -77,6 +90,15 @@ impl LocalExecutorBuilder {
         // Borrow driver to create waker
         let waker = driver.borrow().create_waker();
 
+        // Prepare Worker/Stealer
+        let (stealable, stealer) = if let Some(w) = self.stealable {
+            (w, self.stealer.expect("Stealer missing"))
+        } else {
+            let w = Worker::new_fifo();
+            let s = w.stealer();
+            (w, s)
+        };
+
         let (shared, remote_receiver, pinned_receiver) = if let Some(shared) = self.shared {
             let remote_rec = self
                 .remote_receiver
@@ -95,6 +117,8 @@ impl LocalExecutorBuilder {
                 injector: SegQueue::new(),
                 pinned: pinned_tx,
                 remote_queue: remote_tx,
+                future_injector: SegQueue::new(),
+                stealer,
                 waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
                 local_load: CachePadded::new(AtomicUsize::new(0)),
@@ -120,6 +144,7 @@ impl LocalExecutorBuilder {
             shared,
             remote_receiver,
             pinned_receiver,
+            stealable: Rc::new(stealable),
             registry: None,
             mesh: None,
             id: usize::MAX,
@@ -136,6 +161,9 @@ pub struct LocalExecutor {
     shared: Arc<ExecutorShared>,
     remote_receiver: mpsc::Receiver<Task>,
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
+
+    // Local Stealable Queue (Send Tasks)
+    stealable: Rc<Worker<Runnable>>,
 
     // Optional connection to the global registry
     registry: Option<Arc<ExecutorRegistry>>,
@@ -237,6 +265,8 @@ impl LocalExecutor {
     }
 
     fn enqueue_job(&self, task: Job) {
+        // Enqueue Job (SpawnedTask) to local queue.
+        // This is local work.
         self.shared.local_load.fetch_add(1, Ordering::Relaxed);
         let task = unsafe {
             task.bind(
@@ -295,11 +325,33 @@ impl LocalExecutor {
                         continue;
                     }
 
-                    // Steal from injector
+                    // Steal from injector (Job)
                     if let Some(job) = target.shared.injector.pop() {
                         target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
                         self.enqueue_job(job);
                         return true;
+                    }
+
+                    // Steal from future_injector (Runnable)
+                    if let Some(task) = target.shared.future_injector.pop() {
+                        target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                        task.run();
+                        return true;
+                    }
+
+                    // Steal from Stealer (Runnable)
+                    use crossbeam_deque::Steal;
+                    match target.shared.stealer.steal() {
+                        Steal::Success(task) => {
+                            // We assume if we stole it, it was part of the load.
+                            target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                            task.run();
+                            return true;
+                        }
+                        Steal::Retry => {
+                            // We could retry, but let's continue for now to avoid hanging
+                        }
+                        Steal::Empty => {}
                     }
                 }
             }
@@ -337,6 +389,8 @@ impl LocalExecutor {
                 if !self.pinned_receiver.try_recv().is_err()
                     || !self.remote_receiver.try_recv().is_err()
                     || !self.shared.injector.is_empty()
+                    || !self.shared.future_injector.is_empty()
+                    || !self.stealable.is_empty()
                 {
                     state.store(mesh::RUNNING, Ordering::Relaxed);
                     can_park = false;
@@ -346,15 +400,6 @@ impl LocalExecutor {
             if can_park {
                 // 3. Commit PARKED
                 state.store(mesh::PARKED, Ordering::Release);
-
-                // Final check (race condition barrier) needed?
-                // In IOCP/Uring, if a wake happens after PARKED is set but before wait(), it posts to the port/fd.
-                // The wait() will picking it up immediately.
-                // The only race uses remote queues:
-                // A: Set PARKED.
-                // B: Push task. See PARKED. Wake().
-                // A: Wait(). Wakeup consumed.
-                // Correct.
 
                 driver.wait().unwrap();
             }
@@ -379,6 +424,7 @@ impl LocalExecutor {
             mesh_weak,
             self.handle(),
             self.buf_pool.clone(),
+            self.stealable.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -411,9 +457,20 @@ impl LocalExecutor {
                     did_work = true;
                 }
 
-                // 1. Poll Main Future (Skipped for worker)
+                // 1. Poll Stealable (Send Tasks - LIFO)
+                if let Some(task) = self.stealable.pop() {
+                    // We count stealable tasks in injected_load or local_load?
+                    // Spawner: future_injector -> injected_load.
+                    // Context: stealable -> injected_load (we decided this).
+                    self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                    task.run();
+                    executed += 1;
+                    continue;
+                }
+                // 2. Poll Main Future (Normally 0 for worker, but blocked for block_on)
+                // (Worker loop doesn't have main future, this is generic run loop)
 
-                // 2. Poll Local Queue
+                // 3. Poll Local Queue
                 let task = self.queue.borrow_mut().pop_front();
                 if let Some(task) = task {
                     self.shared.local_load.fetch_sub(1, Ordering::Relaxed);
@@ -458,6 +515,7 @@ impl LocalExecutor {
             mesh_weak,
             self.handle(),
             self.buf_pool.clone(),
+            self.stealable.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -539,6 +597,14 @@ impl Drop for LocalExecutor {
         // This explicitly drops tasks (and their buffers/sockets) before the driver is dropped.
         if let Ok(mut queue) = self.queue.try_borrow_mut() {
             queue.clear();
+        }
+
+        // Clear stealable queue
+        // We have Rc<Worker>, so we can try to unwrap or just loop pop?
+        // Rc is shared with context, but loop ends, context guard drops context.
+        // It should be safe to just pop.
+        while let Some(task) = self.stealable.pop() {
+            drop(task);
         }
 
         // Pump the driver to process cancellations and completions.

@@ -962,6 +962,7 @@ name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "crossbeam-deque",
  "crossbeam-queue",
  "crossbeam-utils",
  "futures-core",
