@@ -1,0 +1,23 @@
+[package]
+name = "veloq-sync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-utils = { workspace = true }
+intrusive-collections = { workspace = true }
+atomic-waker = { workspace = true }
+futures-core = { workspace = true }
+crossbeam-queue = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[dependencies.loom]
+version = "0.7"
+features = ["futures"]
+optional = true
+
+[features]
+default = []
+loom = ["dep:loom"]

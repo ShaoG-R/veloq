@@ -5,7 +5,9 @@ pub mod local;
 pub mod macros;
 pub mod net;
 pub mod runtime;
-pub mod sync;
+pub mod sync {
+    pub use veloq_sync::*;
+}
 
 // Re-export key functions for convenient access
 pub use runtime::{JoinHandle, LocalJoinHandle};

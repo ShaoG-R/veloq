@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-atomic-waker = "1.1.2"
-futures-core = "0.3"
-crossbeam-queue = "0.3"
-crossbeam-utils = { version = "0.8", default-features = false }
-num_cpus = "1.17.0"
 veloq-bitset = { path = "../veloq-bitset" }
-intrusive-collections = "0.10"
+veloq-sync = { path = "../veloq-sync" }
+
+num_cpus = "1.17.0"
+crossbeam-utils = { workspace = true }
+intrusive-collections = { workspace = true }
+futures-core = { workspace = true }
+crossbeam-queue = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"

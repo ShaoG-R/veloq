@@ -1,11 +1,15 @@
+use crate::{
+    SendError, TryRecvError,
+    shim::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        queue::SegQueue,
+    },
+};
 use atomic_waker::AtomicWaker;
-use crossbeam_queue::SegQueue;
 use futures_core::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{SendError, TryRecvError};
 use std::task::{Context, Poll};
 
 /// A multi-producer, single-consumer channel for sending values across threads
@@ -355,6 +359,7 @@ impl<T, S: ChannelStrategy> Stream for GenericReceiver<T, S> {
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
     use std::sync::Arc;
