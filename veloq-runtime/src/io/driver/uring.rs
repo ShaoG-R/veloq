@@ -14,6 +14,8 @@ pub mod submit;
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IntoPlatformOp;
 
+pub type PreInit = IoUring;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UringOpState {
     pub submitted: bool,
@@ -77,7 +79,7 @@ pub struct UringDriver {
 }
 
 impl UringDriver {
-    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
+    pub fn create_pre_init(config: &crate::config::Config) -> io::Result<PreInit> {
         let entries = config.uring.entries;
         let mut builder = IoUring::builder();
 
@@ -90,7 +92,7 @@ impl UringDriver {
             builder.setup_sqpoll(config.uring.sqpoll_idle_ms); // Kernel 5.1+
         }
 
-        let ring = builder.build(entries).or_else(|e| {
+        builder.build(entries).or_else(|e| {
             // Fallback for older kernels if flags are unsupported (EINVAL)
             if e.raw_os_error() == Some(libc::EINVAL) {
                 // If the optimized build failed, try a basic one.
@@ -98,8 +100,21 @@ impl UringDriver {
             } else {
                 Err(e)
             }
-        })?;
+        })
+    }
 
+    pub fn pre_init_handle(pre: &PreInit) -> crate::io::op::RawHandle {
+        use std::os::unix::io::AsRawFd;
+        pre.as_raw_fd()
+    }
+
+    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
+        let pre = Self::create_pre_init(config)?;
+        Self::new_from_pre_init(config, pre)
+    }
+
+    pub fn new_from_pre_init(config: &crate::config::Config, ring: PreInit) -> io::Result<Self> {
+        let entries = config.uring.entries;
         let ops = OpRegistry::with_capacity(entries as usize);
 
         let waker_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };

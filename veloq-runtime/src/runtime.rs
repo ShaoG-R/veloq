@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 
 use crate::io::buffer::{AnyBufPool, BufferRegistrar, RegisteredPool};
+use crate::io::driver::{PlatformDriver, PlatformPreInit};
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::mesh::{Consumer, Producer};
@@ -89,6 +90,7 @@ struct WorkerPrep {
     egress: Vec<Producer<crate::runtime::executor::Job>>,
     pool_constructor: PoolConstructor,
     config: crate::config::Config,
+    pre_init: PlatformPreInit,
 }
 
 pub struct RuntimeBuilder {
@@ -145,9 +147,17 @@ impl RuntimeBuilder {
 
         let mut mesh_matrix = MeshMatrix::new(worker_count, &states);
 
+        // Pre-allocate IO Drivers to determine handles early
+        let mut pre_inits: Vec<Option<PlatformPreInit>> = Vec::with_capacity(worker_count);
         let mut peer_handles_storage = Vec::with_capacity(worker_count);
+
         for _ in 0..worker_count {
-            peer_handles_storage.push(AtomicUsize::new(0));
+            let pre = PlatformDriver::create_pre_init(&self.config)
+                .expect("Failed to create pre-init driver");
+            let handle = PlatformDriver::pre_init_handle(&pre);
+            pre_inits.push(Some(pre));
+            // Initialize peer_handles immediately with valid handles!
+            peer_handles_storage.push(AtomicUsize::new(handle as usize));
         }
         let peer_handles = Arc::new(peer_handles_storage);
 
@@ -201,6 +211,7 @@ impl RuntimeBuilder {
                 .take()
                 .expect("Pinned receiver already taken");
 
+            let pre_init = pre_inits[worker_id].take().unwrap();
             let builder = std::thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
             let barrier = barrier.clone();
 
@@ -210,6 +221,7 @@ impl RuntimeBuilder {
                     .with_shared(shared) // Inject shared state
                     .with_remote_receiver(remote_receiver) // Inject remote receiver
                     .with_pinned_receiver(pinned_receiver) // Inject pinned receiver
+                    .with_pre_init(pre_init)
                     .build(|registrar| {
                         let pool = pool_constructor(worker_id, registrar);
                         crate::io::buffer::AnyBufPool::new(pool)
@@ -230,6 +242,10 @@ impl RuntimeBuilder {
             thread_handles.push(handle);
         }
 
+        // Wait for all workers to be ready.
+        // This ensures that when build() returns, all background workers are initialized and running.
+        barrier.wait();
+
         // Prepare Worker 0
         let (ingress, egress) = mesh_matrix.take_worker_channels(0);
         let shared = shared_states[0].clone();
@@ -244,6 +260,7 @@ impl RuntimeBuilder {
             egress,
             pool_constructor: pool_constructor.clone(),
             config: self.config.clone(),
+            pre_init: pre_inits[0].take().unwrap(),
         };
 
         Ok(Runtime {
@@ -251,7 +268,6 @@ impl RuntimeBuilder {
             registry,
             peer_handles,
             worker_count,
-            barrier,
             worker_0_prep: Some(worker_0_prep),
         })
     }
@@ -265,8 +281,6 @@ pub struct Runtime {
     peer_handles: Arc<Vec<AtomicUsize>>,
     #[allow(dead_code)]
     worker_count: usize,
-    barrier: Arc<std::sync::Barrier>,
-    // Data needed to initialize Worker 0 on the main thread
     worker_0_prep: Option<WorkerPrep>,
 }
 
@@ -314,6 +328,7 @@ impl Runtime {
             .with_shared(prep.shared) // Inject shared state
             .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
             .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
+            .with_pre_init(prep.pre_init)
             .build(|registrar| {
                 // Bind Buffer Pool via constructor
                 (prep.pool_constructor)(0, registrar)
@@ -327,7 +342,8 @@ impl Runtime {
         // Buffer Pool is now bound during build() via closure
 
         // Sync with other workers
-        self.barrier.wait();
+        // Barrier wait moved to build() to ensure workers 1..N-1 are ready before Runtime is returned.
+        // self.barrier.wait();
 
         // Run Future
         // block_on in LocalExecutor runs the loop until future completes.

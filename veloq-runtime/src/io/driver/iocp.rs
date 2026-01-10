@@ -37,6 +37,8 @@ pub enum PlatformData {
     None,
 }
 
+pub type PreInit = usize;
+
 pub struct IocpDriver {
     pub(crate) port: HANDLE,
     pub(crate) ops: OpRegistry<IocpOp, PlatformData>,
@@ -76,15 +78,32 @@ impl Drop for IocpWaker {
 }
 
 impl IocpDriver {
-    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
+    pub fn create_pre_init(_config: &crate::config::Config) -> io::Result<PreInit> {
         // Create a new completion port.
         let port =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
 
         if port.is_null() {
-            return Err(io::Error::last_os_error());
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(port as usize)
         }
+    }
 
+    pub fn pre_init_handle(pre: &PreInit) -> crate::io::op::RawHandle {
+        *pre as crate::io::op::RawHandle
+    }
+
+    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
+        let pre = Self::create_pre_init(config)?;
+        Self::new_from_pre_init(config, pre)
+    }
+
+    pub fn new_from_pre_init(
+        config: &crate::config::Config,
+        port_val: PreInit,
+    ) -> io::Result<Self> {
+        let port = port_val as HANDLE;
         // Load extensions
         let extensions = Extensions::new()?;
         let entries = config.iocp.entries;
