@@ -3,12 +3,12 @@ use rand::prelude::*;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::time::Instant;
-use veloq_runtime::fs::{BufferingMode, File};
-use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool, RegisteredPool};
+use std::time::{Duration, Instant};
+use veloq_runtime::fs::{BufferingMode, File, OpenOptions};
+use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool, FixedBuf, RegisteredPool};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
+use veloq_runtime::sync::mpsc;
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum WriteMode {
@@ -16,7 +16,68 @@ enum WriteMode {
     Rand,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum BlockSize {
+    K4,
+    K8,
+    K16,
+    K32,
+    K64,
+    K128,
+    K256,
+    K512,
+    M1,
+    M2,
+    M4,
+    M8,
+    M16,
+}
+
+impl BlockSize {
+    fn as_bytes(&self) -> usize {
+        match self {
+            BlockSize::K4 => 4 * 1024,
+            BlockSize::K8 => 8 * 1024,
+            BlockSize::K16 => 16 * 1024,
+            BlockSize::K32 => 32 * 1024,
+            BlockSize::K64 => 64 * 1024,
+            BlockSize::K128 => 128 * 1024,
+            BlockSize::K256 => 256 * 1024,
+            BlockSize::K512 => 512 * 1024,
+            BlockSize::M1 => 1024 * 1024,
+            BlockSize::M2 => 2 * 1024 * 1024,
+            BlockSize::M4 => 4 * 1024 * 1024,
+            BlockSize::M8 => 8 * 1024 * 1024,
+            BlockSize::M16 => 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                BlockSize::K4 => "4KB",
+                BlockSize::K8 => "8KB",
+                BlockSize::K16 => "16KB",
+                BlockSize::K32 => "32KB",
+                BlockSize::K64 => "64KB",
+                BlockSize::K128 => "128KB",
+                BlockSize::K256 => "256KB",
+                BlockSize::K512 => "512KB",
+                BlockSize::M1 => "1MB",
+                BlockSize::M2 => "2MB",
+                BlockSize::M4 => "4MB",
+                BlockSize::M8 => "8MB",
+                BlockSize::M16 => "16MB",
+            }
+        )
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Write mode: sequential or random
@@ -30,117 +91,344 @@ struct Args {
     /// Queue depth (concurrent tasks per thread)
     #[arg(long, default_value_t = 32)]
     qdepth: usize,
+
+    /// Duration in seconds to run the benchmark
+    #[arg(long, default_value_t = 10)]
+    duration: u64,
+
+    /// Minimum number of iterations
+    #[arg(long, default_value_t = 3)]
+    iterations: usize,
+
+    /// Block size (chunk size) for I/O operations
+    #[arg(long, value_enum, default_value_t = BlockSize::M1)]
+    block_size: BlockSize,
+
+    /// Number of files per thread
+    #[arg(long, default_value_t = 1)]
+    files_per_thread: usize,
 }
 
-// 1GB per thread for benchmarking
+// 1GB data per thread for benchmarking
 const FILE_SIZE_PER_THREAD: u64 = 1 * 1024 * 1024 * 1024;
-const BLOCK_SIZE: usize = 1024 * 1024;
 
-async fn run_worker(worker_id: usize, mode: WriteMode, qdepth: usize) -> std::io::Result<u64> {
+struct IterationResult {
+    bytes: u64,
+    duration: Duration,
+}
+
+/// Single write operation definition
+#[derive(Clone, Debug, Copy)]
+struct WriteOp {
+    file_index: usize,
+    offset: u64,
+}
+
+/// Workload configuration for a thread
+struct ThreadConfig {
+    thread_index: usize,
+    file_paths: Vec<PathBuf>,
+    ops: Vec<WriteOp>,
+    block_size: usize,
+    #[allow(dead_code)]
+    file_size_per_file: u64,
+}
+
+/// Helper to generate filenames
+fn get_file_path(t_idx: usize, f_idx: usize) -> PathBuf {
+    PathBuf::from(format!("bench_test_{}_{}.data", t_idx, f_idx))
+}
+
+/// Prepare files Phase: Create and fallocate files
+/// This runs effectively in parallel per thread, but outside the measurement loop.
+async fn prepare_files_for_thread(files_per_thread: usize, file_size_per_file: u64, t_idx: usize) {
+    for f_idx in 0..files_per_thread {
+        let path = get_file_path(t_idx, f_idx);
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .buffering(BufferingMode::DirectSync)
+            .open(&path)
+            .await
+            .expect("Failed to create file during preparation");
+
+        // Fallocate is slow, so we do it here.
+        file.fallocate(0, file_size_per_file)
+            .await
+            .expect("Fallocate failed");
+
+        // We close the file after preparation
+    }
+}
+
+/// Cleanup Phase
+fn cleanup_files(threads: usize, files_per_thread: usize) {
+    for t_idx in 0..threads {
+        for f_idx in 0..files_per_thread {
+            let path = get_file_path(t_idx, f_idx);
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+async fn run_iteration_measured(
+    qdepth: usize,
+    files: &[Rc<File>],
+    ops: &[WriteOp],
+    block_size: usize,
+    initial_buffers: &mut Vec<FixedBuf>, // Take buffers to reuse
+) -> (IterationResult, Vec<FixedBuf>) {
     let pool =
         veloq_runtime::runtime::context::current_pool().expect("Worker should have bound pool");
 
-    let path_str = format!("bench_test_{}.tmp", worker_id);
-    let path = PathBuf::from(&path_str);
+    // We need ownership of buffers to submit them.
+    // We will collect them back as tasks finish.
 
-    // Clean up previous run if exists
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
+    // Safety check
+    if files.is_empty() || ops.is_empty() {
+        return (
+            IterationResult {
+                bytes: 0,
+                duration: Duration::ZERO,
+            },
+            initial_buffers.drain(..).collect(),
+        );
     }
 
-    let file = File::options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .buffering(BufferingMode::DirectSync)
-        .open(&path)
-        .await
-        .expect("Failed to create file");
+    let start_time = Instant::now();
 
-    let file = Rc::new(file);
+    // Use a VecDeque for pending tasks
+    // Task returns: (io::Result<usize>, Buf)
+    let mut pending_tasks = VecDeque::with_capacity(qdepth);
+    let mut recycled_buffers = Vec::with_capacity(qdepth);
 
-    // Pre-allocate
-    file.fallocate(0, FILE_SIZE_PER_THREAD)
-        .await
-        .expect("Fallocate failed");
+    // Move initial buffers to a local available list
+    // efficiently swap out
+    let mut available_buffers = std::mem::take(initial_buffers);
 
-    // Pre-allocate tasks (offsets)
-    let num_blocks = FILE_SIZE_PER_THREAD / BLOCK_SIZE as u64;
-    let mut offsets: Vec<u64> = (0..num_blocks).map(|i| i * BLOCK_SIZE as u64).collect();
-
-    if let WriteMode::Rand = mode {
-        let mut rng = rand::thread_rng();
-        offsets.shuffle(&mut rng);
-    }
-
-    let mut pending_tasks = VecDeque::new();
-    let mut current_idx = 0;
-    let total_tasks = offsets.len();
+    let total_ops = ops.len();
+    let mut current_op_idx = 0;
     let mut written_bytes = 0u64;
 
-    while current_idx < total_tasks {
-        // Fill the queue up to qdepth
-        while pending_tasks.len() < qdepth && current_idx < total_tasks {
-            if let Some(buf) = pool.alloc(BLOCK_SIZE) {
-                let offset = offsets[current_idx];
-                let file_clone = file.clone();
-
-                let fut = async move { file_clone.write_at(buf, offset).await };
-
-                pending_tasks.push_back(spawn_local(fut));
-                current_idx += 1;
+    loop {
+        // 1. Submit tasks up to qdepth if we have buffers and ops
+        while pending_tasks.len() < qdepth && current_op_idx < total_ops {
+            let buf = if let Some(b) = available_buffers.pop() {
+                b
+            } else if let Some(b) = pool.alloc(block_size) {
+                // Fallback if initial set wasn't enough (shouldn't happen if properly sized)
+                b
             } else {
-                // Buffer pool exhausted, must wait for tasks to finish
+                // No buffers available, stop submitting and wait for completions
                 break;
+            };
+
+            let op = ops[current_op_idx];
+            let file = files[op.file_index].clone();
+
+            // Spawn task
+            let fut = async move { file.write_at(buf, op.offset).await };
+            pending_tasks.push_back(spawn_local(fut));
+
+            current_op_idx += 1;
+        }
+
+        // 2. Check for completion or exit
+        if pending_tasks.is_empty() {
+            if current_op_idx >= total_ops {
+                break; // DONE
+            } else {
+                // Deadlock check: We have ops left, but no pending tasks and no buffers?
+                // This means we failed to alloc and have no tasks to return buffers.
+                panic!("Stall: No buffers available and no pending tasks.");
             }
         }
 
-        // Wait for at least one task to finish to make progress
-        if let Some(handle) = pending_tasks.pop_front() {
-            let (res, _buf) = handle.await;
-            let written = res?;
-            written_bytes += written as u64;
+        // 3. Wait for ONE task (Work Stealing runtime might complete out of order,
+        // but pop_front forces order for *checking*, any is fine for progress)
+        // Ideally `FuturesUnordered` would be better, but we are in a simple loop.
+        // For simple queue depth maintenance, popping the oldest is a reasonable approximation
+        // or just `await` the front.
+        // Optimization: In a real high-perf bench we might want to poll all, here we await head.
+        let handle = pending_tasks.pop_front().unwrap();
+        let (res, buf) = handle.await;
+
+        match res {
+            Ok(n) => written_bytes += n as u64,
+            Err(e) => panic!("IO Error at index {}: {}", current_op_idx, e),
+        }
+
+        // Recycle buffer
+        available_buffers.push(buf);
+    }
+
+    let duration = start_time.elapsed();
+
+    // Return recycled buffers for next iteration
+    // We might have extra buffers if we alloc'd more from pool fallback
+    recycled_buffers.extend(available_buffers);
+
+    (
+        IterationResult {
+            bytes: written_bytes,
+            duration,
+        },
+        recycled_buffers,
+    )
+}
+
+async fn run_worker(
+    qdepth: usize,
+    min_duration: Duration,
+    min_iters: usize,
+    config: ThreadConfig,
+) -> std::io::Result<Vec<IterationResult>> {
+    let pool = veloq_runtime::runtime::context::current_pool().expect("No pool");
+
+    // 1. Open Files (Persistent handles for benchmarking)
+    let mut files = Vec::with_capacity(config.file_paths.len());
+    for path in &config.file_paths {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(false) // already created
+            .buffering(BufferingMode::DirectSync)
+            .open(path)
+            .await
+            .expect("Failed to open file in worker");
+        files.push(Rc::new(file));
+    }
+
+    // 2. Pre-allocate Buffers
+    // We allocate QDEPTH buffers once and reuse them across ALL iterations.
+    // This mimics static buffer pools in standard benchmarks.
+    let mut reuse_buffers = Vec::with_capacity(qdepth);
+    for _ in 0..qdepth {
+        if let Some(buf) = pool.alloc(config.block_size) {
+            reuse_buffers.push(buf);
         } else {
-            // This case should be rare/impossible unless qdepth=0 or pool is empty initially
-            if current_idx < total_tasks {
-                panic!("Deadlock: No pending tasks but cannot allocate buffer.");
-            }
+            panic!("Failed to allocate initial buffers for queue depth coverage");
         }
     }
 
-    // Wait for remaining tasks
-    while let Some(handle) = pending_tasks.pop_front() {
-        let (res, _buf) = handle.await;
-        let written = res?;
-        written_bytes += written as u64;
+    let mut results = Vec::new();
+    let start_total = Instant::now();
+    let mut iter_count = 0;
+
+    // 3. Benchmark Loop
+    loop {
+        if iter_count >= min_iters && start_total.elapsed() >= min_duration {
+            break;
+        }
+
+        let (res, buffers) = run_iteration_measured(
+            qdepth,
+            &files,
+            &config.ops,
+            config.block_size,
+            &mut reuse_buffers,
+        )
+        .await;
+
+        results.push(res);
+        reuse_buffers = buffers; // reclaiming ownership
+        iter_count += 1;
     }
 
-    // Sync
-    file.sync_range(0, FILE_SIZE_PER_THREAD)
-        .wait_before(false)
-        .write(true)
-        .wait_after(true)
-        .await
-        .expect("Sync failed");
+    Ok(results)
+}
 
-    drop(file); // explicit drop before remove, though variable goes out of scope anyway
-    let _ = std::fs::remove_file(path);
-
-    Ok(written_bytes)
+fn filter_outliers(mut data: Vec<f64>) -> Vec<f64> {
+    if data.len() < 4 {
+        return data;
+    }
+    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q1 = data[data.len() / 4];
+    let q3 = data[data.len() * 3 / 4];
+    let iqr = q3 - q1;
+    let lower_bound = q1 - 1.5 * iqr;
+    let upper_bound = q3 + 1.5 * iqr;
+    data.into_iter()
+        .filter(|&x| x >= lower_bound && x <= upper_bound)
+        .collect()
 }
 
 fn main() {
     let args = Args::parse();
-    println!("Starting Disk Benchmark");
+    let block_size_bytes = args.block_size.as_bytes();
+
+    println!("Starting Disk Benchmark (Standardized Mode)");
     println!(
-        "Mode: {:?}, Threads: {}, Queue Depth: {}",
+        "Mode: {:?}, Threads: {}, QD: {}",
         args.mode, args.threads, args.qdepth
     );
     println!(
-        "Block Size: {} Bytes, File Size per Thread: {} Bytes",
-        BLOCK_SIZE, FILE_SIZE_PER_THREAD
+        "Block Size: {} ({} Bytes)",
+        args.block_size, block_size_bytes
     );
+    println!("Pre-allocating files...");
 
+    // Setup filenames and configs
+    let files_per_thread = args.files_per_thread;
+    let file_size_per_file = if files_per_thread > 0 {
+        FILE_SIZE_PER_THREAD / files_per_thread as u64
+    } else {
+        0
+    };
+
+    // Calculate Workloads (Offsets) BEFORE starting runtime to keep main clean
+    // But we need to do it.
+    let mut configs = Vec::with_capacity(args.threads);
+    for t_idx in 0..args.threads {
+        let mut file_paths = Vec::new();
+        for f_idx in 0..files_per_thread {
+            file_paths.push(get_file_path(t_idx, f_idx));
+        }
+
+        // Generate Ops
+        let mut ops = Vec::new();
+        if files_per_thread > 0 {
+            let num_blocks_per_file = file_size_per_file / block_size_bytes as u64;
+            let mut rng = rand::thread_rng();
+            let mut file_offsets: Vec<Vec<u64>> = Vec::with_capacity(files_per_thread);
+
+            for _ in 0..files_per_thread {
+                let mut offsets: Vec<u64> = (0..num_blocks_per_file)
+                    .map(|i| i * block_size_bytes as u64)
+                    .collect();
+                if let WriteMode::Rand = args.mode {
+                    offsets.shuffle(&mut rng);
+                }
+                file_offsets.push(offsets);
+            }
+
+            // Interleave
+            for i in 0..num_blocks_per_file as usize {
+                for f in 0..files_per_thread {
+                    ops.push(WriteOp {
+                        file_index: f,
+                        offset: file_offsets[f][i],
+                    });
+                }
+            }
+        }
+
+        configs.push(ThreadConfig {
+            thread_index: t_idx,
+            file_paths,
+            ops,
+            block_size: block_size_bytes,
+            file_size_per_file,
+        });
+    }
+
+    // Initialize Runtime
     let runtime = Runtime::builder()
         .config(veloq_runtime::config::Config {
             worker_threads: Some(args.threads),
@@ -154,41 +442,98 @@ fn main() {
         .build()
         .expect("Failed to build Runtime");
 
-    let start_time = Instant::now();
-
+    // Execute
     runtime.block_on(async {
-        let (tx, rx) = mpsc::channel();
+        // 1. Preparation Phase (Create & Fallocate)
+        println!("Initializing disk files (creating & fallocating)... This may take a while.");
+        let mut handles = Vec::new();
+        for t_idx in 0..args.threads {
+            let fpt = files_per_thread;
+            let fsz = file_size_per_file;
+            // Spawn to workers to do it in parallel
+            handles.push(spawn_local(async move {
+                prepare_files_for_thread(fpt, fsz, t_idx).await;
+            }));
+        }
+        for h in handles {
+            h.await;
+        }
+        println!("Files prepared. Starting Benchmark Measurement...");
 
-        for i in 0..args.threads {
+        // 2. Measurement Phase
+        let (tx, mut rx) = mpsc::unbounded();
+        let duration_limit = Duration::from_secs(args.duration);
+        let min_iters = args.iterations;
+
+        for config in configs {
             let tx = tx.clone();
-            let mode = args.mode;
             let qdepth = args.qdepth;
+            let t_idx = config.thread_index; // needed for placement
 
-            // Spawn worker task to specific thread
-            // Note: spawn_to logic ensures it runs on worker `i` if configured that way,
-            // but `spawn_to` API in veloq_runtime takes closure + ID.
-            veloq_runtime::runtime::context::spawn_to(i, async move || {
-                let bytes = run_worker(i, mode, qdepth)
+            veloq_runtime::runtime::context::spawn_to(t_idx, async move || {
+                let res = run_worker(qdepth, duration_limit, min_iters, config)
                     .await
-                    .expect("Worker execution failed");
-                tx.send(bytes).unwrap();
+                    .expect("Worker Failed");
+                tx.send(res).unwrap();
             });
         }
+        drop(tx);
 
-        // Aggregate results
-        let mut total_bytes = 0;
+        // 3. Aggregate
+        let mut all_throughputs = Vec::new();
+        let mut total_bytes_all = 0;
+        let bench_start = Instant::now(); // Approx wall time for throughput calc if we want system-wide
+
+        // Collecting results
+        // Note: The "System Throughput" calculation here is a bit tricky if threads start/end at different times.
+        // But assuming they run for roughly same duration, we can sum bytes and divide by max duration or similar.
+        // A better approach for "System Throughput" is sum(avg_thread_throughput).
+
         for _ in 0..args.threads {
-            total_bytes += rx.recv().unwrap();
+            let worker_results = rx.recv().await.expect("Failed to receive");
+
+            // Calculate thread average
+            let mut thread_bytes = 0;
+            let mut thread_time = Duration::ZERO;
+
+            for r in worker_results {
+                thread_bytes += r.bytes;
+                thread_time += r.duration;
+
+                let secs = r.duration.as_secs_f64();
+                if secs > 0.0 {
+                    let mb = r.bytes as f64 / 1024.0 / 1024.0;
+                    all_throughputs.push(mb / secs);
+                }
+            }
+            total_bytes_all += thread_bytes;
         }
 
-        let elapsed = start_time.elapsed();
-        let secs = elapsed.as_secs_f64();
-        let mb = total_bytes as f64 / 1024.0 / 1024.0;
-        let throughput = mb / secs;
+        let elapsed = bench_start.elapsed();
+        let total_mb = total_bytes_all as f64 / 1024.0 / 1024.0;
 
-        println!("Done.");
-        println!("Total Write: {:.2} MB", mb);
-        println!("Elapsed: {:.4} s", secs);
-        println!("Throughput: {:.2} MB/s", throughput);
+        println!("--------------------------------------------------");
+        println!("Benchmark Completed.");
+        println!("Total Data Measured: {:.2} MB", total_mb);
+        println!("Wall Time (Approx):  {:.2} s", elapsed.as_secs_f64());
+        println!("--------------------------------------------------");
+
+        if !all_throughputs.is_empty() {
+            let avg_raw: f64 = all_throughputs.iter().sum::<f64>() / all_throughputs.len() as f64;
+            println!("Average Iteration Throughput: {:.2} MB/s", avg_raw);
+
+            let filtered = filter_outliers(all_throughputs);
+            if !filtered.is_empty() {
+                let avg_filt: f64 = filtered.iter().sum::<f64>() / filtered.len() as f64;
+                println!("Filtered Avg Throughput (IQR): {:.2} MB/s", avg_filt);
+            }
+        } else {
+            println!("No data collected.");
+        }
     });
+
+    // 4. Cleanup Phase
+    println!("Cleaning up files...");
+    cleanup_files(args.threads, files_per_thread);
+    println!("Done.");
 }

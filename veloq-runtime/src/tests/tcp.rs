@@ -22,7 +22,12 @@ fn alloc_buf(pool: &impl BufPool, size: usize) -> FixedBuf {
 /// Test basic TCP connection using global spawn and current_driver
 #[test]
 fn test_tcp_connect_with_global_api() {
-    let mut exec = LocalExecutor::default();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
 
     exec.block_on(async move {
         // Create listener inside block_on to access context
@@ -57,10 +62,13 @@ fn test_tcp_connect_with_global_api() {
 fn test_tcp_send_recv() {
     let backing_pool = HybridPool::new().unwrap();
     // Move binding inside the loop/executor since we need a registrar
-    let mut exec = LocalExecutor::default();
-    let registrar = exec.registrar();
-    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
-    crate::runtime::context::bind_pool(pool.clone());
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(backing_pool.clone(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
+    let pool = exec.pool();
 
     for size in [8192, 16384, 65536] {
         println!("Testing with BufferSize: {:?}", size);
@@ -150,7 +158,12 @@ fn test_tcp_send_recv() {
 /// Test multiple concurrent connections on single thread
 #[test]
 fn test_tcp_multiple_connections() {
-    let mut exec = LocalExecutor::default();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
 
     exec.block_on(async move {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
@@ -189,10 +202,13 @@ fn test_tcp_multiple_connections() {
 #[test]
 fn test_tcp_large_data_transfer() {
     let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::default();
-    let registrar = exec.registrar();
-    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
-    crate::runtime::context::bind_pool(pool.clone());
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(backing_pool.clone(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
+    let pool = exec.pool();
 
     for size in [8192, 16384, 65536] {
         let pool_clone = pool.clone();
@@ -265,7 +281,12 @@ fn test_tcp_large_data_transfer() {
 /// Test listener local_addr
 #[test]
 fn test_listener_local_addr() {
-    let mut exec = LocalExecutor::default();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
 
     exec.block_on(async move {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
@@ -282,7 +303,12 @@ fn test_listener_local_addr() {
 /// Test connection refused
 #[test]
 fn test_tcp_connect_refused() {
-    let mut exec = LocalExecutor::default();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
 
     exec.block_on(async move {
         let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
@@ -298,11 +324,13 @@ fn test_tcp_connect_refused() {
 #[test]
 fn test_tcp_recv_zero_bytes() {
     let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::default();
-
-    let registrar = exec.registrar();
-    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
-    crate::runtime::context::bind_pool(pool.clone());
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(backing_pool.clone(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
+    let pool = exec.pool();
 
     for size in [8192, 16384, 65536] {
         let pool_clone = pool.clone();
@@ -342,7 +370,12 @@ fn test_tcp_recv_zero_bytes() {
 /// Test IPv6 connection
 #[test]
 fn test_tcp_ipv6() {
-    let mut exec = LocalExecutor::default();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
 
     exec.block_on(async move {
         let listener_result = TcpListener::bind("::1:0");
@@ -399,7 +432,7 @@ fn test_multithread_tcp_connections() {
         .build()
         .unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, mut rx) = crate::sync::mpsc::unbounded();
 
     let connection_count_for_block = connection_count.clone();
 
@@ -440,7 +473,7 @@ fn test_multithread_tcp_connections() {
 
         // Wait for all 3
         for _ in 0..NUM_WORKERS {
-            rx.recv().unwrap();
+            rx.recv().await.unwrap();
         }
     });
 
@@ -451,11 +484,8 @@ fn test_multithread_tcp_connections() {
 /// Test TCP echo server on one worker, clients on another
 #[test]
 fn test_multithread_tcp_echo() {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
     for size in [8192, 16384, 65536] {
-        let (addr_tx, addr_rx) = mpsc::channel();
+        let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
         // 2 Workers
         let runtime = Runtime::builder()
             .config(crate::config::Config {
@@ -470,11 +500,10 @@ fn test_multithread_tcp_echo() {
             .build()
             .unwrap();
 
-        let (done_tx, done_rx) = mpsc::channel();
+        let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
         runtime.block_on(async move {
             let addr_tx = addr_tx.clone(); // Move into task
-            let addr_rx = Arc::new(Mutex::new(addr_rx)); // Share receiver attempt? 
 
             // Worker 0: Echo server
             crate::runtime::context::spawn_to(0, async move || {
@@ -505,16 +534,9 @@ fn test_multithread_tcp_echo() {
 
             // Worker 1: Client
             let done_tx = done_tx.clone();
-            let addr_rx = addr_rx.clone();
             crate::runtime::context::spawn_to(1, async move || {
                 // Wait for server address
-                let listen_addr = {
-                    addr_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(5))
-                        .unwrap()
-                };
+                let listen_addr = addr_rx.recv().await.expect("Channel closed");
 
                 let stream = TcpStream::connect(listen_addr)
                     .await
@@ -542,7 +564,7 @@ fn test_multithread_tcp_echo() {
             });
 
             // Wait for client to finish
-            done_rx.recv().unwrap();
+            done_rx.recv().await.unwrap();
         });
 
         println!("Multi-thread echo test completed");
@@ -575,7 +597,7 @@ fn test_multithread_concurrent_clients() {
         .build()
         .unwrap();
 
-    let (done_tx, done_rx) = mpsc::channel();
+    let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
     let connection_count_clone = connection_count.clone();
     runtime.block_on(async move {
@@ -629,7 +651,7 @@ fn test_multithread_concurrent_clients() {
 
         // Wait for all clients
         for _ in 0..NUM_CLIENTS {
-            done_rx.recv().unwrap();
+            done_rx.recv().await.unwrap();
         }
     });
 

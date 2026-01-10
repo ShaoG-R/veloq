@@ -29,12 +29,7 @@ pub struct LocalExecutorBuilder {
     shared: Option<Arc<ExecutorShared>>,
     remote_receiver: Option<mpsc::Receiver<Task>>,
     pinned_receiver: Option<mpsc::Receiver<SpawnedTask>>,
-}
-
-impl Default for LocalExecutorBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    // Duplicates removed
 }
 
 impl LocalExecutorBuilder {
@@ -44,6 +39,7 @@ impl LocalExecutorBuilder {
             shared: None,
             remote_receiver: None,
             pinned_receiver: None,
+            // buf_pool removed
         }
     }
 
@@ -68,13 +64,20 @@ impl LocalExecutorBuilder {
     }
 
     /// Build the LocalExecutor.
-    /// Buffer pool management is now external to the executor.
-    pub fn build(self) -> LocalExecutor {
-        #[allow(unused_mut)]
-        let mut driver = PlatformDriver::new(&self.config).expect("Failed to create driver");
+    ///
+    /// Requires a `pool_constructor` closure that creates an `AnyBufPool` using the provided `BufferRegistrar`.
+    pub fn build<F>(self, pool_constructor: F) -> LocalExecutor
+    where
+        F: FnOnce(Box<dyn BufferRegistrar>) -> crate::io::buffer::AnyBufPool,
+    {
+        let driver_val = PlatformDriver::new(&self.config).expect("Failed to create driver");
+        // Wrap driver early to create registrar
+        let driver = Rc::new(RefCell::new(driver_val));
 
         let queue = Rc::new(RefCell::new(VecDeque::new()));
-        let waker = driver.create_waker();
+
+        // Borrow driver to create waker
+        let waker = driver.borrow().create_waker();
 
         let (shared, remote_receiver, pinned_receiver) = if let Some(shared) = self.shared {
             let remote_rec = self
@@ -105,14 +108,23 @@ impl LocalExecutorBuilder {
         // Bind the driver's waker to the shared state (Late Binding)
         shared.waker.set(waker);
 
+        // Construct Registrar and Pool
+        let registrar = Box::new(ExecutorRegistrar {
+            driver: Rc::downgrade(&driver),
+        });
+
+        let buf_pool = pool_constructor(registrar);
+
         LocalExecutor {
-            driver: Rc::new(RefCell::new(driver)),
+            driver,
             queue,
             shared,
             remote_receiver,
             pinned_receiver,
             registry: None,
             mesh: None,
+            id: usize::MAX,
+            buf_pool,
         }
     }
 }
@@ -131,6 +143,10 @@ pub struct LocalExecutor {
 
     // Mesh Networking
     mesh: Option<Rc<RefCell<MeshContext>>>,
+    // Cached ID (usize::MAX if not in mesh)
+    id: usize,
+    // Buffer Pool
+    buf_pool: crate::io::buffer::AnyBufPool,
 }
 
 impl LocalExecutor {
@@ -143,18 +159,6 @@ impl LocalExecutor {
         LocalExecutorBuilder::new()
     }
 
-    /// Create a new standalone LocalExecutor.
-    /// Note: This will NOT register any buffer pool with the driver on Linux.
-    pub fn new() -> Self {
-        Self::builder().build()
-    }
-
-    /// Create a new standalone LocalExecutor with config.
-    /// Note: This will NOT register any buffer pool with the driver on Linux.
-    pub fn new_with_config(config: crate::config::Config) -> Self {
-        Self::builder().config(config).build()
-    }
-
     /// Attach this executor to a registry.
     /// This enables the executor to steal tasks from others in the registry.
     pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
@@ -163,13 +167,8 @@ impl LocalExecutor {
     }
 
     pub fn handle(&self) -> ExecutorHandle {
-        let id = self
-            .mesh
-            .as_ref()
-            .map(|m| m.borrow().id)
-            .unwrap_or(usize::MAX);
         ExecutorHandle {
-            id,
+            id: self.id,
             shared: self.shared.clone(),
         }
     }
@@ -178,6 +177,10 @@ impl LocalExecutor {
         Box::new(ExecutorRegistrar {
             driver: Rc::downgrade(&self.driver),
         })
+    }
+
+    pub fn pool(&self) -> crate::io::buffer::AnyBufPool {
+        self.buf_pool.clone()
     }
 
     pub fn spawn_local<F, T>(&self, future: F) -> LocalJoinHandle<T>
@@ -225,6 +228,7 @@ impl LocalExecutor {
             peer_handles,
         };
         self.mesh = Some(Rc::new(RefCell::new(mesh)));
+        self.id = id;
     }
 
     fn enqueue_job(&self, task: Job) {
@@ -369,6 +373,7 @@ impl LocalExecutor {
             spawner,
             mesh_weak,
             self.handle(),
+            self.buf_pool.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -443,6 +448,7 @@ impl LocalExecutor {
             spawner,
             mesh_weak,
             self.handle(),
+            self.buf_pool.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -536,11 +542,7 @@ impl Drop for LocalExecutor {
     }
 }
 
-impl Default for LocalExecutor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Default implementation removed as LocalExecutor now requires explicit buffer pool.
 
 // ============ Thread-Safe Main Task Waker Implementation ============
 

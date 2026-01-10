@@ -1,5 +1,5 @@
 use crate::fs::File;
-use crate::io::buffer::{BufPool, HybridPool, RegisteredPool};
+use crate::io::buffer::{BufPool, RegisteredPool};
 use crate::runtime::executor::LocalExecutor;
 use std::fs;
 use std::path::Path;
@@ -9,14 +9,13 @@ fn test_file_integrity() {
     for size in [8192, 16384, 65536] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
-            let mut exec = LocalExecutor::default();
-            let pool = HybridPool::new().unwrap();
-
-            let registrar = exec.registrar();
-            let pool = RegisteredPool::new(pool, registrar).unwrap();
-
-            crate::runtime::context::bind_pool(pool.clone());
-            let pool_clone = pool.clone();
+            let mut exec = LocalExecutor::builder().build(|registrar| {
+                crate::io::buffer::AnyBufPool::new(
+                    RegisteredPool::new(crate::io::buffer::HybridPool::new().unwrap(), registrar)
+                        .expect("Failed to register buffer pool"),
+                )
+            });
+            let pool_clone = exec.pool();
 
             exec.block_on(async move {
                 let pool = pool_clone.clone();

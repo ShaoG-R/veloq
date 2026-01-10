@@ -15,9 +15,6 @@ fn benchmark_1gb_write(c: &mut Criterion) {
 
     // 1GB Total Size
     const TOTAL_SIZE: u64 = 1 * 1024 * 1024 * 1024;
-    // Pool setup moved inside bench_function to share executor
-    // let pool = BuddyPool::new().unwrap();
-    // veloq_runtime::runtime::context::bind_pool(pool.clone());
 
     // 设置吞吐量统计单位
     group.throughput(Throughput::Bytes(TOTAL_SIZE));
@@ -25,12 +22,17 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(120));
 
-    let mut exec = LocalExecutor::default();
-    let registrar = exec.registrar();
-    let backing_pool = BuddyPool::new().unwrap();
-    let pool = RegisteredPool::new(backing_pool, registrar).unwrap();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        veloq_runtime::io::buffer::AnyBufPool::new(
+            RegisteredPool::new(
+                veloq_runtime::io::buffer::BuddyPool::new().unwrap(),
+                registrar,
+            )
+            .expect("Failed to register buffer pool"),
+        )
+    });
 
-    veloq_runtime::runtime::context::bind_pool(pool.clone());
+    let pool = exec.pool();
 
     group.bench_function("write_1gb_concurrent", |b| {
         b.iter(|| {
@@ -137,22 +139,23 @@ fn benchmark_32_files_write(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(120));
 
-    // Initialize Runtime with 4 workers and BuddyPool
-    let runtime = Runtime::builder()
-        .config(veloq_runtime::config::Config {
-            worker_threads: Some(WORKER_COUNT),
-            ..Default::default()
-        })
-        .pool_constructor(|_, registrar| {
-            let pool = BuddyPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
-        .build()
-        .unwrap();
-
     group.bench_function("write_32_files_concurrent", |b| {
         b.iter(|| {
+            // Initialize Runtime with 4 workers and BuddyPool
+            // Re-initialized per iteration because block_on consumes the runtime.
+            let runtime = Runtime::builder()
+                .config(veloq_runtime::config::Config {
+                    worker_threads: Some(WORKER_COUNT),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = BuddyPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
+
             // Block on runtime to keep 'b.iter' scope valid until all done
             runtime.block_on(async {
                 let (tx, rx) = mpsc::channel();

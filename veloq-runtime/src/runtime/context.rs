@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::Weak;
 
-use crate::io::buffer::{AnyBufPool, BufPool};
+use crate::io::buffer::AnyBufPool;
 use crate::io::driver::PlatformDriver;
 use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
@@ -16,11 +16,8 @@ use crate::runtime::executor::spawner::pack_job;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::{SpawnedTask, Task};
 
-use std::cell::OnceCell;
-
 thread_local! {
     static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
-    static CURRENT_POOL: OnceCell<AnyBufPool> = const { OnceCell::new() };
 }
 
 /// Sets the thread-local runtime context.
@@ -78,6 +75,7 @@ pub struct RuntimeContext {
     pub(crate) spawner: Option<Spawner>,
     pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
     pub(crate) handle: ExecutorHandle,
+    pub(crate) buf_pool: AnyBufPool,
 }
 
 impl RuntimeContext {
@@ -88,6 +86,7 @@ impl RuntimeContext {
         spawner: Option<Spawner>,
         mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
         handle: ExecutorHandle,
+        buf_pool: AnyBufPool,
     ) -> Self {
         Self {
             driver,
@@ -95,7 +94,13 @@ impl RuntimeContext {
             spawner,
             mesh,
             handle,
+            buf_pool,
         }
+    }
+
+    /// Get the current thread's buffer pool.
+    pub fn buf_pool(&self) -> AnyBufPool {
+        self.buf_pool.clone()
     }
 
     /// Spawn a new task on the current executor using a balanced strategy (P2C).
@@ -273,42 +278,9 @@ impl Future for YieldNow {
     }
 }
 
-/// Bind a buffer pool to the current thread.
-/// This should be called once per thread, usually during executor initialization.
-///
-/// # Panics
-/// Panics if a pool is already bound to this thread.
-pub fn bind_pool<P: BufPool + Clone + 'static>(pool: P) {
-    try_bind_pool(pool).expect("Buffer pool already bound for this thread");
-}
-
-/// Error returned when trying to bind a pool to a thread that already has one.
-#[derive(Debug, Clone, Copy)]
-pub struct PoolAlreadyBound;
-
-impl std::fmt::Display for PoolAlreadyBound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Buffer pool already bound for this thread")
-    }
-}
-
-impl std::error::Error for PoolAlreadyBound {}
-
-/// Try to bind a buffer pool to the current thread.
-/// Returns error if already bound.
-pub fn try_bind_pool<P: BufPool + Clone + 'static>(pool: P) -> Result<(), PoolAlreadyBound> {
-    let any_pool = AnyBufPool::new(pool);
-    // 1. Set TLS
-    CURRENT_POOL.with(|cell| cell.set(any_pool).map_err(|_| PoolAlreadyBound))?;
-
-    // Auto-Register removed (Scheme 1). Pool must be registered before binding.
-
-    Ok(())
-}
-
 /// Get the current thread's buffer pool.
 pub fn current_pool() -> Option<AnyBufPool> {
-    CURRENT_POOL.with(|cell| cell.get().cloned())
+    try_current().map(|ctx| ctx.buf_pool())
 }
 
 /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.

@@ -81,6 +81,16 @@ impl<T: Send> MeshMatrix<T> {
 
 pub type PoolConstructor = Arc<dyn Fn(usize, Box<dyn BufferRegistrar>) -> AnyBufPool + Send + Sync>;
 
+struct WorkerPrep {
+    shared: Arc<ExecutorShared>,
+    remote_receiver: std::sync::mpsc::Receiver<crate::runtime::task::Task>,
+    pinned_receiver: std::sync::mpsc::Receiver<crate::runtime::task::SpawnedTask>,
+    ingress: Vec<Consumer<crate::runtime::executor::Job>>,
+    egress: Vec<Producer<crate::runtime::executor::Job>>,
+    pool_constructor: PoolConstructor,
+    config: crate::config::Config,
+}
+
 pub struct RuntimeBuilder {
     config: crate::config::Config,
     pool_constructor: Option<PoolConstructor>,
@@ -109,6 +119,12 @@ impl RuntimeBuilder {
 
     pub fn build(self) -> std::io::Result<Runtime> {
         let worker_count = self.config.worker_threads.unwrap_or_else(num_cpus::get);
+        if worker_count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Worker count must be > 0",
+            ));
+        }
 
         // Default Pool Constructor
         let pool_constructor = self.pool_constructor.unwrap_or_else(|| {
@@ -162,10 +178,13 @@ impl RuntimeBuilder {
 
         let registry = Arc::new(ExecutorRegistry::new(handles));
         let mut thread_handles = Vec::with_capacity(worker_count);
-        let barrier = Arc::new(std::sync::Barrier::new(worker_count + 1));
+        // Barrier for N workers.
+        // Worker 0 calls wait() in block_on.
+        // Workers 1..N-1 call wait() in thread closure.
+        let barrier = Arc::new(std::sync::Barrier::new(worker_count));
 
-        // Spawn Workers
-        for worker_id in 0..worker_count {
+        // Spawn Workers 1 to N-1 (Skip 0)
+        for worker_id in 1..worker_count {
             let registry = registry.clone();
             let peer_handles_clone = peer_handles.clone();
             let config_clone = self.config.clone();
@@ -191,18 +210,15 @@ impl RuntimeBuilder {
                     .with_shared(shared) // Inject shared state
                     .with_remote_receiver(remote_receiver) // Inject remote receiver
                     .with_pinned_receiver(pinned_receiver) // Inject pinned receiver
-                    .build();
+                    .build(|registrar| {
+                        let pool = pool_constructor(worker_id, registrar);
+                        crate::io::buffer::AnyBufPool::new(pool)
+                    });
 
                 executor = executor.with_registry(registry.clone()); // Inject registry
 
                 // Attach Mesh
                 executor.attach_mesh(worker_id, ingress, egress, peer_handles_clone);
-
-                // Bind Buffer Pool
-                let registrar = executor.registrar();
-                let pool = pool_constructor(worker_id, registrar);
-                // This binds to TLS and since run() enters context, it will register buffers.
-                crate::runtime::context::bind_pool(pool);
 
                 // Wait for all workers to be ready
                 barrier.wait();
@@ -214,29 +230,44 @@ impl RuntimeBuilder {
             thread_handles.push(handle);
         }
 
-        // Wait for all workers to come online
-        barrier.wait();
+        // Prepare Worker 0
+        let (ingress, egress) = mesh_matrix.take_worker_channels(0);
+        let shared = shared_states[0].clone();
+        let remote_receiver = remote_receivers[0].take().unwrap();
+        let pinned_receiver = pinned_receivers[0].take().unwrap();
+
+        let worker_0_prep = WorkerPrep {
+            shared,
+            remote_receiver,
+            pinned_receiver,
+            ingress,
+            egress,
+            pool_constructor: pool_constructor.clone(),
+            config: self.config.clone(),
+        };
 
         Ok(Runtime {
             handles: thread_handles,
             registry,
             peer_handles,
             worker_count,
-            next_worker_id: AtomicUsize::new(worker_count), // All IDs assigned
+            barrier,
+            worker_0_prep: Some(worker_0_prep),
         })
     }
 }
 
 pub struct Runtime {
+    #[allow(dead_code)]
     handles: Vec<std::thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
-
     #[allow(dead_code)]
     peer_handles: Arc<Vec<AtomicUsize>>,
     #[allow(dead_code)]
     worker_count: usize,
-    #[allow(dead_code)]
-    next_worker_id: AtomicUsize,
+    barrier: Arc<std::sync::Barrier>,
+    // Data needed to initialize Worker 0 on the main thread
+    worker_0_prep: Option<WorkerPrep>,
 }
 
 impl Runtime {
@@ -265,19 +296,41 @@ impl Runtime {
     }
 
     /// Block on a future using a local executor on the current thread,
-    /// participating in the runtime as an external (non-mesh) node.
-    pub fn block_on<F>(&self, future: F) -> F::Output
+    /// participating in the runtime as Worker 0 (an internal mesh node).
+    ///
+    /// This method consumes the Runtime, setting up the current thread as the first worker.
+    /// It waits for all other pre-spawned workers to be ready before starting execution.
+    pub fn block_on<F>(mut self, future: F) -> F::Output
     where
         F: std::future::Future,
     {
-        let mut executor = LocalExecutor::new();
-        executor = executor.with_registry(self.registry.clone());
-        executor.block_on(future)
-    }
+        let prep = self
+            .worker_0_prep
+            .take()
+            .expect("Runtime already started or invalid state");
 
-    pub fn block_on_all(self) {
-        for handle in self.handles {
-            let _ = handle.join();
-        }
+        let mut executor = LocalExecutor::builder()
+            .config(prep.config)
+            .with_shared(prep.shared) // Inject shared state
+            .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
+            .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
+            .build(|registrar| {
+                // Bind Buffer Pool via constructor
+                (prep.pool_constructor)(0, registrar)
+            });
+
+        executor = executor.with_registry(self.registry.clone());
+
+        // Attach Mesh
+        executor.attach_mesh(0, prep.ingress, prep.egress, self.peer_handles.clone());
+
+        // Buffer Pool is now bound during build() via closure
+
+        // Sync with other workers
+        self.barrier.wait();
+
+        // Run Future
+        // block_on in LocalExecutor runs the loop until future completes.
+        executor.block_on(future)
     }
 }

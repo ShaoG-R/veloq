@@ -22,7 +22,12 @@ fn alloc_buf(pool: &impl BufPool, size: usize) -> FixedBuf {
 /// Test basic UDP socket binding and local_addr
 #[test]
 fn test_udp_bind() {
-    let mut exec = LocalExecutor::default();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
 
     exec.block_on(async move {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
@@ -39,11 +44,14 @@ fn test_udp_bind() {
 /// Test UDP send and receive
 #[test]
 fn test_udp_send_receive() {
-    let mut exec = LocalExecutor::default();
-    let registrar = exec.registrar();
     let backing_pool = HybridPool::new().unwrap();
-    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
-    crate::runtime::context::bind_pool(pool.clone());
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(backing_pool.clone(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
+    let pool = exec.pool();
 
     for size in [8192, 16384] {
         println!("Testing with BufferSize: {:?}", size);
@@ -92,11 +100,14 @@ fn test_udp_send_receive() {
 /// Test UDP echo (send and receive response)
 #[test]
 fn test_udp_echo() {
-    let mut exec = LocalExecutor::default();
-    let registrar = exec.registrar();
     let backing_pool = HybridPool::new().unwrap();
-    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
-    crate::runtime::context::bind_pool(pool.clone());
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(backing_pool.clone(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
+    let pool = exec.pool();
 
     for size in [8192, 16384] {
         println!("Testing with BufferSize: {:?}", size);
@@ -168,11 +179,14 @@ fn test_udp_echo() {
 /// Test multiple UDP messages
 #[test]
 fn test_udp_multiple_messages() {
-    let mut exec = LocalExecutor::default();
-    let registrar = exec.registrar();
     let backing_pool = HybridPool::new().unwrap();
-    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
-    crate::runtime::context::bind_pool(pool.clone());
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(backing_pool.clone(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
+    let pool = exec.pool();
 
     for size in [8192, 16384] {
         let pool_clone = pool.clone();
@@ -224,11 +238,14 @@ fn test_udp_multiple_messages() {
 /// Test UDP with large data
 #[test]
 fn test_udp_large_data() {
-    let mut exec = LocalExecutor::default();
-    let registrar = exec.registrar();
     let backing_pool = HybridPool::new().unwrap();
-    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
-    crate::runtime::context::bind_pool(pool.clone());
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(backing_pool.clone(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
+    let pool = exec.pool();
 
     for size in [8192, 16384] {
         let pool_clone = pool.clone();
@@ -281,7 +298,12 @@ fn test_udp_large_data() {
 /// Test IPv6 UDP
 #[test]
 fn test_udp_ipv6() {
-    let mut exec = LocalExecutor::default();
+    let mut exec = LocalExecutor::builder().build(|registrar| {
+        AnyBufPool::new(
+            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
+                .expect("Failed to register buffer pool"),
+        )
+    });
 
     exec.block_on(async move {
         let socket_result = UdpSocket::bind("::1:0");
@@ -323,7 +345,7 @@ fn test_multithread_udp() {
             .build()
             .unwrap();
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, mut rx) = crate::sync::mpsc::unbounded();
 
         let message_count_clone = message_count.clone();
         runtime.block_on(async move {
@@ -369,7 +391,7 @@ fn test_multithread_udp() {
             }
 
             for _ in 0..NUM_WORKERS {
-                rx.recv().unwrap();
+                rx.recv().await.unwrap();
             }
         });
 
@@ -384,13 +406,8 @@ fn test_multithread_udp() {
 /// Test UDP echo server on one worker, clients on another
 #[test]
 fn test_multithread_udp_echo() {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
     for size in [8192, 16384] {
-        let (addr_tx, addr_rx) = mpsc::channel();
-        // Wrap receiver in Arc<Mutex> so it can be shared across threads
-        let addr_rx = Arc::new(Mutex::new(addr_rx));
+        let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
         let runtime = Runtime::builder()
             .config(crate::config::Config::default().worker_threads(2)) // 2 workers (0 and 1)
             .pool_constructor(|_, registrar| {
@@ -401,7 +418,7 @@ fn test_multithread_udp_echo() {
             .build()
             .unwrap();
 
-        let (done_tx, done_rx) = mpsc::channel();
+        let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
         // Worker 0: Echo server
         runtime.block_on(async move {
@@ -435,18 +452,13 @@ fn test_multithread_udp_echo() {
             });
 
             // Worker 1: Client
-            let addr_rx = addr_rx.clone();
+            // let addr_rx = addr_rx.clone();
             let done_tx = done_tx.clone();
 
             crate::runtime::context::spawn_to(1, async move || {
                 // Wait for server address
-                let server_addr = {
-                    addr_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("Timeout waiting for server address")
-                };
+                let server_addr = addr_rx.recv().await.expect("Channel closed");
+
                 println!("Client connecting to {}", server_addr);
 
                 let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
@@ -474,7 +486,7 @@ fn test_multithread_udp_echo() {
             });
 
             // Wait for completion
-            done_rx.recv().unwrap();
+            done_rx.recv().await.unwrap();
         });
 
         println!("Multi-thread UDP echo test completed");
@@ -508,7 +520,7 @@ fn test_multithread_concurrent_udp_clients() {
             .build()
             .unwrap();
 
-        let (done_tx, done_rx) = mpsc::channel();
+        let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
         let message_count_clone = message_count.clone();
         runtime.block_on(async move {
@@ -573,7 +585,7 @@ fn test_multithread_concurrent_udp_clients() {
 
             // Wait for clients
             for _ in 0..NUM_CLIENTS {
-                done_rx.recv().unwrap();
+                done_rx.recv().await.unwrap();
             }
         });
 
