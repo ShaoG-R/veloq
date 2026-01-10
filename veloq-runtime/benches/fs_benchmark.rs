@@ -2,7 +2,6 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::fs::{BufferingMode, File};
@@ -158,7 +157,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
             // Block on runtime to keep 'b.iter' scope valid until all done
             runtime.block_on(async {
-                let (tx, rx) = mpsc::channel();
+                let (tx, mut rx) = veloq_runtime::sync::mpsc::unbounded();
 
                 for i in 0..WORKER_COUNT {
                     let tx = tx.clone();
@@ -283,7 +282,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
                 // Wait for all workers to finish
                 for _ in 0..WORKER_COUNT {
-                    rx.recv().unwrap();
+                    rx.recv().await.unwrap();
                 }
             })
         })
