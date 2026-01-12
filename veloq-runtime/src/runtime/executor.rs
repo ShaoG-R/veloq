@@ -180,7 +180,7 @@ impl LocalExecutor {
     /// Get the raw handle (fd) of the underlying driver.
     /// Used for Mesh initialization.
     pub fn raw_driver_handle(&self) -> usize {
-        self.driver.borrow().inner_handle() as usize
+        self.driver.borrow().inner_handle().into()
     }
 
     pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver>> {
@@ -435,7 +435,7 @@ impl LocalExecutor {
         if let Some(mesh_rc) = &self.mesh {
             let mesh = mesh_rc.borrow();
             let handle = self.driver.borrow().inner_handle();
-            mesh.peer_handles[mesh.id].store(handle as usize, Ordering::Release);
+            mesh.peer_handles[mesh.id].store(handle.into(), Ordering::Release);
         }
 
         let main_woken = Arc::new(AtomicBool::new(false));
@@ -526,7 +526,7 @@ impl LocalExecutor {
         if let Some(mesh_rc) = &self.mesh {
             let mesh = mesh_rc.borrow();
             let handle = self.driver.borrow().inner_handle();
-            mesh.peer_handles[mesh.id].store(handle as usize, Ordering::Release);
+            mesh.peer_handles[mesh.id].store(handle.into(), Ordering::Release);
         }
 
         let mut pinned_future = Box::pin(future);

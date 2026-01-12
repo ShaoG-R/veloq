@@ -2,7 +2,7 @@ use super::*;
 use crate::io::buffer::{BackingPool, HybridPool};
 
 use crate::io::driver::Driver;
-use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, RawHandle, Recv, Timeout};
+use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, Recv, Timeout};
 use crate::io::socket::Socket;
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
@@ -39,15 +39,15 @@ fn test_iocp_accept() {
     // Listener (Bind to random port)
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = std_listener.local_addr().unwrap();
-    let listener_handle = std_listener.into_raw_socket() as RawHandle;
+    let listener_handle = std_listener.into_raw_socket();
 
     // Acceptor - pre-create the socket for AcceptEx
     let acceptor = Socket::new_tcp_v4().expect("Acceptor socket creation failed");
-    let acceptor_handle = acceptor.into_raw() as RawHandle;
+    let acceptor_handle = acceptor.into_raw();
 
     // Prepare Accept Op using OpLifecycle
-    let mut accept_op = Accept::into_op(listener_handle, acceptor_handle);
-    accept_op.accept_socket = acceptor_handle;
+    let mut accept_op = Accept::into_op(listener_handle.into(), acceptor_handle.into());
+    accept_op.accept_socket = acceptor_handle.into();
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op);
 
@@ -81,10 +81,10 @@ fn test_iocp_accept() {
                 assert!(op.remote_addr.is_some(), "Remote addr should be populated");
                 unsafe {
                     if let Some(fd) = op.fd.raw() {
-                        windows_sys::Win32::Foundation::CloseHandle(fd as _);
+                        windows_sys::Win32::Foundation::CloseHandle(fd.into());
                     }
                     let s = op.accept_socket;
-                    windows_sys::Win32::Foundation::CloseHandle(s as _);
+                    windows_sys::Win32::Foundation::CloseHandle(s.into());
                 }
                 break;
             }
@@ -105,7 +105,7 @@ fn test_iocp_connect() {
 
     // Client Socket
     let client = Socket::new_tcp_v4().unwrap();
-    let client_handle = client.into_raw() as RawHandle;
+    let client_handle = client.into_raw().into();
 
     // Create Connect Op manually as it doesn't have into_op
     use crate::io::socket::socket_addr_to_storage;
@@ -134,7 +134,7 @@ fn test_iocp_connect() {
         match driver.poll_op(user_data, &mut cx) {
             Poll::Ready((res, _)) => {
                 assert!(res.is_ok(), "Connect failed: {:?}", res.err());
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle as _) };
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
                 break;
             }
             Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
@@ -200,7 +200,7 @@ fn test_iocp_recv_with_buffer_pool() {
     });
 
     let (stream, _) = listener.accept().unwrap();
-    let stream_handle = stream.into_raw_socket() as RawHandle;
+    let stream_handle = stream.into_raw_socket().into();
 
     // Register buffers
     driver
@@ -245,7 +245,7 @@ fn test_iocp_recv_with_buffer_pool() {
                 op.buf.set_len(bytes_read);
                 assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle as _) };
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle.into()) };
                 break;
             }
             Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),

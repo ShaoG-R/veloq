@@ -241,6 +241,11 @@ pub struct FixedBuf {
     context: usize,
 }
 
+// Safety: FixedBuf 拥有其底层内存的所有权。
+// 使用者需要确保底层的 BufPool 是线程安全的（支持跨线程 Dealloc），
+// 或者只在单线程 Runtime 环境下使用。
+unsafe impl Send for FixedBuf {}
+
 // Safety: This buffer is generally not Send because it refers to thread-local pool logic
 // but in Thread-per-Core it stays on thread.
 

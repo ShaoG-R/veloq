@@ -366,3 +366,11 @@ where
 {
     current().spawn_to(worker_id, async_fn)
 }
+
+pub fn spawn_future<F, Output>(future: F) -> JoinHandle<Output>
+where
+    F: Future<Output = Output> + Send + 'static,
+    Output: Send + 'static,
+{
+    current().spawn_future(future)
+}

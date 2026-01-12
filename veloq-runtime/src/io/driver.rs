@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 /// Platform-specific operation trait
 pub trait PlatformOp: 'static {}
 
-pub trait Driver {
+pub trait Driver: 'static {
     /// Platform-specific operation type
     type Op: PlatformOp;
 
@@ -20,6 +20,13 @@ pub trait Driver {
     /// Returns `Err((Error, Op))` if submission failed and the Op was NOT consumed/stored.
     fn submit(&mut self, user_data: usize, op: Self::Op)
     -> Result<Poll<()>, (io::Error, Self::Op)>;
+
+    /// Attach a remote completer to an operation.
+    fn attach_remote_completer(
+        &mut self,
+        user_data: usize,
+        completer: Box<dyn RemoteCompleter<Self::Op>>,
+    );
 
     /// Poll operation status.
     fn poll_op(
@@ -52,7 +59,7 @@ pub trait Driver {
     /// Returns a list of `IoFd` that can be used in subsequent operations.
     fn register_files(
         &mut self,
-        files: &[crate::io::op::RawHandle],
+        files: &[crate::io::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>>;
 
     /// Unregister a set of file descriptors/handles.
@@ -63,21 +70,39 @@ pub trait Driver {
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
 
     /// Notify another driver instance (Mesh Wakeup).
-    fn notify_mesh(&mut self, handle: crate::io::op::RawHandle) -> io::Result<()>;
+    fn notify_mesh(&mut self, handle: crate::io::RawHandle) -> io::Result<()>;
 
     /// Wake up the driver from blocking wait.
     fn wake(&mut self) -> io::Result<()>;
 
     /// Get the low-level driver handle (RawFd on Linux, HANDLE on Windows).
     /// Used for direct mesh communication (e.g. MSG_RING).
-    fn inner_handle(&self) -> crate::io::op::RawHandle;
+    fn inner_handle(&self) -> crate::io::RawHandle;
 
     /// Create a thread-safe waker.
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
+
+    /// Typed injector for this driver
+    type RemoteInjector: Injector<Self>;
+
+    /// Get the injector for this driver
+    fn injector(&self) -> std::sync::Arc<Self::RemoteInjector>;
 }
 
 pub trait RemoteWaker: Send + Sync {
     fn wake(&self) -> io::Result<()>;
+}
+
+/// A trait for processing remote completion logic.
+/// This allows the driver to pass ownership of the platform specific op back to the submitter.
+pub trait RemoteCompleter<Op>: Send {
+    fn complete(self: Box<Self>, res: io::Result<usize>, op: Op);
+}
+
+/// A trait for injecting efficient closures into the driver's thread.
+pub trait Injector<D: Driver + ?Sized>: Send + Sync {
+    /// Injects a closure to be executed in the driver's event loop.
+    fn inject(&self, f: Box<dyn FnOnce(&mut D) + Send>) -> io::Result<()>;
 }
 
 // Platform-specific driver implementations

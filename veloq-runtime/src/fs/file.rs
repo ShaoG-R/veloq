@@ -97,9 +97,9 @@ impl<'a> IntoFuture for SyncRangeBuilder<'a> {
             nbytes: self.nbytes,
             flags: self.flags,
         };
-        let driver = self.file.driver.clone();
+
         Box::pin(async move {
-            let (res, _) = Op::new(op).submit_local(driver).await;
+            let (res, _) = Op::new(op).submit_local().await;
             res.map(|_| ())
         })
     }
@@ -137,8 +137,8 @@ impl File {
             buf,
             offset,
         };
-        let driver = self.driver.clone();
-        let (res, op) = Op::new(op).submit_local(driver).await;
+
+        let (res, op) = Op::new(op).submit_local().await;
         (res, op.buf)
     }
 
@@ -148,8 +148,8 @@ impl File {
             buf,
             offset,
         };
-        let driver = self.driver.clone();
-        let (res, op) = Op::new(op).submit_local(driver).await;
+
+        let (res, op) = Op::new(op).submit_local().await;
         (res, op.buf)
     }
 
@@ -158,8 +158,8 @@ impl File {
             fd: self.fd,
             datasync: false,
         };
-        let driver = self.driver.clone();
-        let (res, _) = Op::new(op).submit_local(driver).await;
+
+        let (res, _) = Op::new(op).submit_local().await;
         res.map(|_| ())
     }
 
@@ -168,8 +168,8 @@ impl File {
             fd: self.fd,
             datasync: true,
         };
-        let driver = self.driver.clone();
-        let (res, _) = Op::new(op).submit_local(driver).await;
+
+        let (res, _) = Op::new(op).submit_local().await;
         res.map(|_| ())
     }
 
@@ -190,8 +190,8 @@ impl File {
             offset,
             len,
         };
-        let driver = self.driver.clone();
-        let (res, _) = Op::new(op).submit_local(driver).await;
+
+        let (res, _) = Op::new(op).submit_local().await;
         res.map(|_| ())
     }
 }
@@ -258,7 +258,7 @@ impl Drop for File {
                 }
                 #[cfg(windows)]
                 unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(fd as _);
+                    windows_sys::Win32::Foundation::CloseHandle(fd.handle as _);
                 }
             }
         }

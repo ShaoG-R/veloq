@@ -3,10 +3,12 @@ use veloq_bitset::BitSet;
 use super::{
     AlignedMemory, AllocError, AllocResult, BackingPool, DeallocParams, FixedBuf, PoolVTable,
 };
+use crossbeam_queue::SegQueue;
 use std::alloc::{Layout, alloc, dealloc};
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::thread;
 
 // Alignment requirement for Direct I/O.
 // We use 4096 (Page Size) to ensure compatibility with strict Direct I/O requirements.
@@ -271,9 +273,19 @@ impl HybridAllocator {
     }
 }
 
+struct SharedHybridState {
+    allocator: UnsafeCell<HybridAllocator>,
+    return_queue: SegQueue<DeallocParams>,
+    owner_id: thread::ThreadId,
+}
+
+// SAFETY: Synchronization via owner_id and SegQueue
+unsafe impl Send for SharedHybridState {}
+unsafe impl Sync for SharedHybridState {}
+
 #[derive(Clone)]
 pub struct HybridPool {
-    inner: Rc<RefCell<HybridAllocator>>,
+    inner: Arc<SharedHybridState>,
 }
 
 impl std::fmt::Debug for HybridPool {
@@ -289,19 +301,18 @@ static HYBRID_POOL_VTABLE: PoolVTable = PoolVTable {
 };
 
 unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    let pool_rc = unsafe { Rc::from_raw(pool_data.as_ptr() as *const RefCell<HybridAllocator>) };
+    let pool_arc = unsafe { Arc::from_raw(pool_data.as_ptr() as *const SharedHybridState) };
 
-    // Calculate block start and total capacity
-    let block_ptr = params.ptr.as_ptr();
-    let total_cap = params.cap;
-
-    let mut inner = pool_rc.borrow_mut();
-    unsafe {
-        if let Err(_e) = inner.dealloc(NonNull::new_unchecked(block_ptr), total_cap, params.context)
-        {
-            #[cfg(debug_assertions)]
-            eprintln!("HybridPool dealloc error: {}", _e);
+    if thread::current().id() == pool_arc.owner_id {
+        let inner = unsafe { &mut *pool_arc.allocator.get() };
+        unsafe {
+            if let Err(_e) = inner.dealloc(params.ptr, params.cap, params.context) {
+                #[cfg(debug_assertions)]
+                eprintln!("HybridPool dealloc error: {}", _e);
+            }
         }
+    } else {
+        pool_arc.return_queue.push(params);
     }
 }
 
@@ -309,10 +320,10 @@ unsafe fn hybrid_resolve_region_info_shim(
     pool_data: NonNull<()>,
     buf: &FixedBuf,
 ) -> (usize, usize) {
-    let raw = pool_data.as_ptr() as *const RefCell<HybridAllocator>;
-    let rc = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
+    let raw = pool_data.as_ptr() as *const SharedHybridState;
+    let arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(raw) });
 
-    let inner = rc.borrow();
+    let inner = unsafe { &*arc.allocator.get() };
 
     // For slab allocations, they are all in region 0 (memory).
     let base = inner.memory.as_ptr() as usize;
@@ -328,17 +339,34 @@ unsafe fn hybrid_resolve_region_info_shim(
 impl HybridPool {
     pub fn new() -> Result<Self, AllocError> {
         Ok(Self {
-            inner: Rc::new(RefCell::new(HybridAllocator::new()?)),
+            inner: Arc::new(SharedHybridState {
+                allocator: UnsafeCell::new(HybridAllocator::new()?),
+                return_queue: SegQueue::new(),
+                owner_id: thread::current().id(),
+            }),
         })
     }
 
     // Helper to return proper types for FixedBuf or AllocResult
     fn alloc_mem_inner(&self, size: usize) -> Option<(NonNull<u8>, usize, u16, usize)> {
-        let mut inner = self.inner.borrow_mut();
+        if thread::current().id() != self.inner.owner_id {
+            panic!("HybridPool::alloc_mem called from non-owner thread");
+        }
+        let allocator = unsafe { &mut *self.inner.allocator.get() };
+
+        // Drain return queue
+        while let Some(params) = self.inner.return_queue.pop() {
+            unsafe {
+                if let Err(_e) = allocator.dealloc(params.ptr, params.cap, params.context) {
+                    #[cfg(debug_assertions)]
+                    eprintln!("HybridPool deferred dealloc error: {}", _e);
+                }
+            }
+        }
 
         let needed_total = size; // No offset needed
 
-        if let Some(raw) = inner.alloc(needed_total) {
+        if let Some(raw) = allocator.alloc(needed_total) {
             let block_ptr = raw.ptr.as_ptr();
             unsafe {
                 Some((
@@ -369,7 +397,7 @@ impl BackingPool for HybridPool {
     }
 
     fn get_memory_regions(&self) -> Vec<crate::io::buffer::BufferRegion> {
-        let inner = self.inner.borrow();
+        let inner = unsafe { &*self.inner.allocator.get() };
         vec![crate::io::buffer::BufferRegion {
             ptr: unsafe { NonNull::new_unchecked(inner.memory.as_ptr() as *mut _) },
             len: inner.total_size,
@@ -382,7 +410,7 @@ impl BackingPool for HybridPool {
 
     fn pool_data(&self) -> NonNull<()> {
         unsafe {
-            let raw = Rc::into_raw(self.inner.clone());
+            let raw = Arc::into_raw(self.inner.clone());
             NonNull::new_unchecked(raw as *mut ())
         }
     }

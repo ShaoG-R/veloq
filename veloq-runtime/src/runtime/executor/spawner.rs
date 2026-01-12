@@ -127,7 +127,7 @@ impl MeshContext {
         if state == mesh::PARKED || state == mesh::PARKING {
             let handle = self.peer_handles[peer_id].load(Ordering::Acquire);
             if handle != 0 {
-                let _ = driver.notify_mesh(handle as _);
+                let _ = driver.notify_mesh(handle.into());
             }
         }
         Ok(())

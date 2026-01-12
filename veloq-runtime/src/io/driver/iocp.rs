@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use submit::SubmissionResult;
 
 const WAKEUP_USER_DATA: usize = usize::MAX;
+const RUN_CLOSURE_KEY: usize = usize::MAX - 2;
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
 use windows_sys::Win32::Foundation::{
@@ -31,9 +32,34 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
+use super::{Injector, RemoteCompleter};
+use std::sync::Arc;
+
+pub struct IocpInjector {
+    port: HANDLE,
+}
+
+unsafe impl Send for IocpInjector {}
+unsafe impl Sync for IocpInjector {}
+
+impl Injector<IocpDriver> for IocpInjector {
+    fn inject(&self, f: Box<dyn FnOnce(&mut IocpDriver) + Send>) -> std::io::Result<()> {
+        let ptr = Box::into_raw(Box::new(f));
+        let res =
+            unsafe { PostQueuedCompletionStatus(self.port, 0, RUN_CLOSURE_KEY, ptr as *mut _) };
+        if res == 0 {
+            // Restore box to drop it
+            let _ = unsafe { Box::from_raw(ptr) };
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 pub enum PlatformData {
     Timer(TaskId),
     Background,
+    Remote(Box<dyn RemoteCompleter<IocpOp>>),
     None,
 }
 
@@ -47,6 +73,7 @@ pub struct IocpDriver {
     pub(crate) registered_files: Vec<Option<HANDLE>>,
     pub(crate) free_slots: Vec<usize>,
     pub(crate) pool: ThreadPool,
+    pub(crate) injector: Arc<IocpInjector>,
 
     // RIO Support (Decoupled)
     pub(crate) rio_state: Option<RioState>,
@@ -90,8 +117,8 @@ impl IocpDriver {
         }
     }
 
-    pub fn pre_init_handle(pre: &PreInit) -> crate::io::op::RawHandle {
-        *pre as crate::io::op::RawHandle
+    pub fn pre_init_handle(pre: &PreInit) -> crate::io::RawHandle {
+        crate::io::RawHandle { handle: *pre as _ }
     }
 
     pub fn new(config: &crate::config::Config) -> io::Result<Self> {
@@ -128,6 +155,7 @@ impl IocpDriver {
             registered_files: Vec::new(),
             free_slots: Vec::new(),
             pool: ThreadPool::new(16, 128, 1024, Duration::from_secs(30)),
+            injector: Arc::new(IocpInjector { port }),
             rio_state,
         })
     }
@@ -185,6 +213,15 @@ impl IocpDriver {
                 }
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
+            if completion_key == RUN_CLOSURE_KEY {
+                // Execute closure
+                let f = unsafe {
+                    Box::from_raw(overlapped as *mut Box<dyn FnOnce(&mut IocpDriver) + Send>)
+                };
+                f(self);
+                return Ok(());
+            }
+
             if completion_key == RIO_EVENT_KEY {
                 // RIO event is triggered. Process RIO CQ.
                 if let Some(rio) = &mut self.rio_state {
@@ -204,11 +241,44 @@ impl IocpDriver {
                 return Ok(());
             }
 
-            // Check if background
-            if let PlatformData::Background = self.ops[user_data].platform_data {
-                // Background op finished. Just remove it.
-                self.ops.remove(user_data);
-                return Ok(());
+            let op_entry = &mut self.ops[user_data];
+
+            // Check if background or remote
+            match &mut op_entry.platform_data {
+                PlatformData::Background => {
+                    self.ops.remove(user_data);
+                    return Ok(());
+                }
+                PlatformData::Remote(_) => {
+                    // We need to move the completer out
+                    let data = std::mem::replace(&mut op_entry.platform_data, PlatformData::None);
+                    if let PlatformData::Remote(completer) = data {
+                        // We must take the resources (op) out
+                        let resources = op_entry.resources.take();
+                        if let Some(iocp_op) = resources {
+                            // Extract result
+                            let result = if bytes_transferred == 0 && unsafe { GetLastError() } != 0
+                            {
+                                Err(io::Error::last_os_error())
+                            } else {
+                                Ok(bytes_transferred as usize)
+                            };
+
+                            // The result in op.result might be set if we used blocking offload?
+                            // But usually Remote op is just pure IO submit.
+                            // However, we should respect if result was already present?
+                            // For IOCP, standard completion path just gives us bytes_transferred.
+
+                            completer.complete(result, iocp_op);
+                            self.ops.remove(user_data);
+                        } else {
+                            // Should not happen?
+                            self.ops.remove(user_data);
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {}
             }
 
             let op = &mut self.ops[user_data];
@@ -278,6 +348,16 @@ impl Driver for IocpDriver {
             }
         }
         user_data
+    }
+
+    fn attach_remote_completer(
+        &mut self,
+        user_data: usize,
+        completer: Box<dyn RemoteCompleter<Self::Op>>,
+    ) {
+        if let Some(op) = self.ops.get_mut(user_data) {
+            op.platform_data = PlatformData::Remote(completer);
+        }
     }
 
     fn submit(
@@ -416,7 +496,7 @@ impl Driver for IocpDriver {
                 PlatformData::Background => {
                     // Should not happen for cancel_op usually, but same logic
                 }
-                PlatformData::None => {
+                PlatformData::None | PlatformData::Remote(_) => {
                     // Try to CancelIoEx if resources exist
                     if let Some(res) = &mut op.resources
                         && let Some(fd) = res.get_fd()
@@ -459,18 +539,18 @@ impl Driver for IocpDriver {
 
     fn register_files(
         &mut self,
-        files: &[crate::io::op::RawHandle],
+        files: &[crate::io::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
             let idx = if let Some(idx) = self.free_slots.pop() {
-                self.registered_files[idx] = Some(handle as HANDLE);
+                self.registered_files[idx] = Some(handle.handle);
                 if let Some(rio) = &mut self.rio_state {
                     rio.clear_registered_rq(idx);
                 }
                 idx
             } else {
-                self.registered_files.push(Some(handle as HANDLE));
+                self.registered_files.push(Some(handle.handle));
                 if let Some(rio) = &mut self.rio_state {
                     rio.resize_registered_rqs(self.registered_files.len());
                 }
@@ -507,12 +587,12 @@ impl Driver for IocpDriver {
         Ok(())
     }
 
-    fn inner_handle(&self) -> crate::io::op::RawHandle {
-        self.port
+    fn inner_handle(&self) -> crate::io::RawHandle {
+        self.port.into()
     }
 
-    fn notify_mesh(&mut self, handle: crate::io::op::RawHandle) -> io::Result<()> {
-        let port = handle as HANDLE;
+    fn notify_mesh(&mut self, handle: crate::io::RawHandle) -> io::Result<()> {
+        let port = handle.handle;
         let res =
             unsafe { PostQueuedCompletionStatus(port, 0, WAKEUP_USER_DATA, std::ptr::null_mut()) };
         if res == 0 {
@@ -539,6 +619,12 @@ impl Driver for IocpDriver {
             panic!("Failed to dup handle");
         }
         std::sync::Arc::new(IocpWaker(new_handle))
+    }
+
+    type RemoteInjector = IocpInjector;
+
+    fn injector(&self) -> std::sync::Arc<Self::RemoteInjector> {
+        self.injector.clone()
     }
 }
 

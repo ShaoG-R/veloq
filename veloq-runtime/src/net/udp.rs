@@ -1,23 +1,20 @@
+use crate::io::RawHandle;
 use crate::io::buffer::FixedBuf;
-use crate::io::driver::PlatformDriver;
-use crate::io::op::{Connect, IoFd, Op, RawHandle, ReadFixed, RecvFrom, SendTo, WriteFixed};
+use crate::io::op::{Connect, IoFd, Op, ReadFixed, RecvFrom, SendTo, WriteFixed};
 use crate::io::socket::Socket;
-use std::cell::RefCell;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::rc::Weak;
 
 pub struct UdpSocket {
     fd: RawHandle,
-    driver: Weak<RefCell<PlatformDriver>>,
 }
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = unsafe { Socket::from_raw(self.fd) };
+        let _ = unsafe { Socket::from_raw(*self.fd) };
         #[cfg(windows)]
-        let _ = unsafe { Socket::from_raw(self.fd) };
+        let _ = unsafe { Socket::from_raw(*self.fd) };
     }
 }
 
@@ -36,11 +33,8 @@ impl UdpSocket {
 
         socket.bind(addr)?;
 
-        let driver = crate::runtime::context::current().driver();
-
         Ok(Self {
-            fd: socket.into_raw() as RawHandle,
-            driver,
+            fd: socket.into_raw().into(),
         })
     }
 
@@ -54,7 +48,7 @@ impl UdpSocket {
             buf,
             addr: target,
         };
-        let future = Op::new(op).submit_local(self.driver.clone());
+        let future = Op::new(op).submit_local();
         let (res, op_back): (io::Result<usize>, SendTo) = future.await;
         (res, op_back.buf)
     }
@@ -65,7 +59,7 @@ impl UdpSocket {
             buf,
             addr: None,
         };
-        let future = Op::new(op).submit_local(self.driver.clone());
+        let future = Op::new(op).submit_local();
         let (res, op_back): (io::Result<usize>, RecvFrom) = future.await;
 
         match res {
@@ -81,9 +75,9 @@ impl UdpSocket {
         use std::mem::ManuallyDrop;
 
         #[cfg(unix)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(*self.fd)) };
         #[cfg(windows)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(*self.fd)) };
         socket.local_addr()
     }
 
@@ -95,8 +89,8 @@ impl UdpSocket {
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
-        let driver = self.driver.clone();
-        let (res, _) = Op::new(op).submit_local(driver).await;
+
+        let (res, _) = Op::new(op).submit_local().await;
         res.map(|_| ())
     }
 
@@ -106,7 +100,7 @@ impl UdpSocket {
             buf,
             offset: 0,
         };
-        let future = Op::new(op).submit_local(self.driver.clone());
+        let future = Op::new(op).submit_local();
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }
@@ -117,7 +111,7 @@ impl UdpSocket {
             buf,
             offset: 0,
         };
-        let future = Op::new(op).submit_local(self.driver.clone());
+        let future = Op::new(op).submit_local();
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }

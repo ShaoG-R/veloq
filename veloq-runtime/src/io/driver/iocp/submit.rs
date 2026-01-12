@@ -105,7 +105,7 @@ pub enum SubmissionResult {
 
 pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::Result<HANDLE> {
     match fd {
-        IoFd::Raw(h) => Ok(h as HANDLE),
+        IoFd::Raw(h) => Ok(h.into()),
         IoFd::Fixed(idx) => {
             if let Some(Some(h)) = registered_files.get(idx as usize) {
                 Ok(*h)
@@ -373,7 +373,7 @@ pub(crate) unsafe fn on_complete_connect(
     if let Some(fd) = connect_op.fd.raw() {
         let ret = unsafe {
             setsockopt(
-                fd as SOCKET,
+                fd.into(),
                 SOL_SOCKET,
                 SO_UPDATE_CONNECT_CONTEXT,
                 std::ptr::null(),
@@ -399,7 +399,7 @@ pub(crate) unsafe fn submit_accept(
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &mut *op.payload.accept };
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
-    let accept_socket = payload.op.accept_socket as HANDLE;
+    let accept_socket = payload.op.accept_socket;
 
     unsafe {
         CreateIoCompletionPort(handle, ctx.port, 0, 0);
@@ -412,7 +412,7 @@ pub(crate) unsafe fn submit_accept(
     let ret = unsafe {
         (ctx.ext.accept_ex)(
             handle as SOCKET,
-            accept_socket as SOCKET,
+            accept_socket.into(),
             payload.accept_buffer.as_mut_ptr() as *mut _,
             0,
             split as u32,
@@ -437,12 +437,12 @@ pub(crate) unsafe fn on_complete_accept(
     ext: &Extensions,
 ) -> io::Result<usize> {
     let payload = unsafe { &mut *op.payload.accept };
-    let accept_socket = payload.op.accept_socket as SOCKET;
-    let listen_handle = payload.op.fd.raw().ok_or(io::Error::from_raw_os_error(0))? as SOCKET;
+    let accept_socket = payload.op.accept_socket;
+    let listen_handle = payload.op.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
 
     let ret = unsafe {
         setsockopt(
-            accept_socket,
+            accept_socket.into(),
             SOL_SOCKET,
             SO_UPDATE_ACCEPT_CONTEXT,
             &listen_handle as *const _ as *const _,

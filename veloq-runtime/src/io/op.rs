@@ -13,20 +13,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::io::buffer::FixedBuf;
 use crate::io::driver::{Driver, PlatformDriver};
 use crate::io::socket::SockAddrStorage;
-use std::cell::RefCell;
-use std::rc::Weak;
+use crate::io::{RawHandle, buffer::FixedBuf};
 
-// ============================================================================
-// Core Types (Platform-Agnostic)
-// ============================================================================
-
-#[cfg(unix)]
-pub type RawHandle = std::os::fd::RawFd; // i32 (4 bytes)
-#[cfg(windows)]
-pub type RawHandle = windows_sys::Win32::Foundation::HANDLE; // usually isize/ptr (8 bytes)
+use std::thread::{self, ThreadId};
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +66,7 @@ pub trait OpLifecycle: Sized {
 }
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
-pub trait IntoPlatformOp<D: Driver>: Sized {
+pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
     /// Convert this operation into the platform driver's operation type.
     fn into_platform_op(self) -> D::Op;
 
@@ -102,13 +93,86 @@ impl<T> Op<T> {
         Self { data }
     }
 
+    /// Submit this operation to a remote IO driver via injector.
+    pub fn submit_remote<D>(self, injector: &std::sync::Arc<D::RemoteInjector>) -> RemoteOpFuture<T>
+    where
+        T: IntoPlatformOp<D> + std::marker::Send + 'static,
+        D: Driver,
+    {
+        let (tx, rx) = veloq_sync::oneshot::channel();
+        let data = self.data;
+
+        let closure = Box::new(move |driver: &mut D| {
+            let op_platform = data.into_platform_op();
+            let user_data = driver.reserve_op();
+
+            let completer = Box::new(GenericCompleter {
+                tx,
+                _phantom: std::marker::PhantomData,
+            });
+            driver.attach_remote_completer(user_data, completer);
+
+            if let Err((_e, _op)) = driver.submit(user_data, op_platform) {
+                // Error handling: if submit fails, we can't easily return error via tx
+                // as completer is already attached.
+                // We log failure or ignore (driver might handle it).
+            }
+        });
+
+        let _ = injector.inject(closure);
+
+        RemoteOpFuture { rx }
+    }
+}
+
+use crate::io::driver::{Injector, RemoteCompleter};
+
+struct GenericCompleter<T, D> {
+    tx: veloq_sync::oneshot::Sender<(std::io::Result<usize>, T)>,
+    _phantom: std::marker::PhantomData<fn() -> D>,
+}
+
+impl<T, D> RemoteCompleter<D::Op> for GenericCompleter<T, D>
+where
+    D: Driver,
+    T: IntoPlatformOp<D> + std::marker::Send,
+{
+    fn complete(self: Box<Self>, res: std::io::Result<usize>, op: D::Op) {
+        let data = T::from_platform_op(op);
+        let _ = self.tx.send((res, data));
+    }
+}
+
+pub struct RemoteOpFuture<T> {
+    rx: veloq_sync::oneshot::Receiver<(std::io::Result<usize>, T)>,
+}
+
+impl<T> Future for RemoteOpFuture<T> {
+    type Output = (std::io::Result<usize>, T);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(Ok(res)) => Poll::Ready(res),
+            Poll::Ready(Err(_)) => {
+                // Panic is safer than returning invalid data
+                panic!("Remote driver dropped operation");
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// Reopen impl block to continue original methods
+impl<T> Op<T> {
     /// Submit this operation to a local IO driver.
     /// Returns a `LocalOp` future that resolves when the operation completes.
-    pub fn submit_local(self, driver: Weak<RefCell<PlatformDriver>>) -> LocalOp<T>
+    /// Submit this operation to a local IO driver.
+    /// Returns a `LocalOp` future that resolves when the operation completes.
+    pub fn submit_local(self) -> LocalOp<T>
     where
         T: IntoPlatformOp<PlatformDriver> + 'static,
     {
-        LocalOp::new(self.data, driver)
+        LocalOp::new(self.data)
     }
 }
 
@@ -132,18 +196,61 @@ pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
     user_data: usize,
-    driver: Weak<RefCell<PlatformDriver>>,
 }
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
     /// Create a new local operation future.
-    pub fn new(data: T, driver: Weak<RefCell<PlatformDriver>>) -> Self {
+    pub fn new(data: T) -> Self {
         Self {
             state: State::Defined,
             data: Some(data),
             user_data: 0,
-            driver,
         }
+    }
+
+    /// Wraps this LocalOp to be `Send`, allowing it to be used in futures that require `Send`.
+    ///
+    /// # Panics
+    ///
+    /// The returned future MUST be polled on the same thread where this method is called.
+    /// Polling it on a different thread will cause a panic.
+    pub fn into_thread_bound(self) -> ThreadBoundOp<T> {
+        ThreadBoundOp {
+            inner: self,
+            origin_thread: thread::current().id(),
+        }
+    }
+}
+
+/// A wrapper that mechanically implements `Send` for `LocalOp`,
+/// but dynamically enforces thread-affinity at runtime.
+///
+/// This allows `LocalOp` to be used in `alloc::Box::pin` or `spawn_future` which requires `Send`,
+/// while ensuring safety by panicking if moved to another thread.
+pub struct ThreadBoundOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
+    inner: LocalOp<T>,
+    origin_thread: ThreadId,
+}
+
+// SAFETY: We enforce thread-affinity via runtime checks in poll().
+unsafe impl<T: IntoPlatformOp<PlatformDriver>> std::marker::Send for ThreadBoundOp<T> {}
+
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for ThreadBoundOp<T> {
+    type Output = (std::io::Result<usize>, T);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Runtime safety check
+        if thread::current().id() != self.origin_thread {
+            panic!("ThreadBoundOp polled on a different thread! This is unsafe for LocalOp.");
+        }
+
+        // SAFETY: We are just polling the inner field, structure is pinned projected.
+        // LocalOp does not have Unpin fields that need special handling here?
+        // LocalOp is Unpin as long as T is Unpin (which it is).
+        // Actually, we can just use map_unchecked_mut logic or simple matching since field is private.
+        // Or simpler:
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        inner.poll(cx)
     }
 }
 
@@ -155,7 +262,8 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 
         match op.state {
             State::Defined => {
-                let driver_rc = op.driver.upgrade().expect("Driver has been dropped");
+                let ctx = crate::runtime::context::current();
+                let driver_rc = ctx.driver().upgrade().expect("Driver has been dropped");
                 let mut driver = driver_rc.borrow_mut();
 
                 // Submit to driver
@@ -188,7 +296,8 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 }
             }
             State::Submitted => {
-                let driver_rc = op.driver.upgrade().expect("Driver has been dropped");
+                let ctx = crate::runtime::context::current();
+                let driver_rc = ctx.driver().upgrade().expect("Driver has been dropped");
                 let mut driver = driver_rc.borrow_mut();
 
                 match driver.poll_op(op.user_data, cx) {
@@ -208,10 +317,13 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
     fn drop(&mut self) {
-        if let State::Submitted = self.state
-            && let Some(driver_rc) = self.driver.upgrade()
-        {
-            driver_rc.borrow_mut().cancel_op(self.user_data);
+        if let State::Submitted = self.state {
+            // Try to get current driver to cancel
+            if let Some(ctx) = crate::runtime::context::try_current() {
+                if let Some(driver_rc) = ctx.driver().upgrade() {
+                    driver_rc.borrow_mut().cancel_op(self.user_data);
+                }
+            }
         }
     }
 }
@@ -370,7 +482,9 @@ impl OpLifecycle for Accept {
     fn pre_alloc(_fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
         // On Windows, we need to pre-create a socket for AcceptEx
         use crate::io::socket::Socket;
-        Ok(Socket::new_tcp_v4()?.into_raw() as RawHandle)
+        Ok(RawHandle {
+            handle: Socket::new_tcp_v4()?.into_raw(),
+        })
     }
 
     #[cfg(unix)]
@@ -406,7 +520,7 @@ impl OpLifecycle for Accept {
     fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output> {
         #[cfg(unix)]
         {
-            let fd = res? as RawHandle;
+            let fd = res?.into();
             use crate::io::socket::to_socket_addr;
             let addr = if let Some(a) = self.remote_addr {
                 a

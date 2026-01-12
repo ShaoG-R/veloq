@@ -104,13 +104,12 @@ impl OpenOptions {
         let op = self.build_op(path.as_ref(), &pool).await?;
 
         // 2. 提交给 runtime (隐式获取 driver)
-        let context = crate::runtime::context::current();
-        let driver = context.driver();
-        let (res, _) = Op::new(op).submit_local(driver.clone()).await;
+        let (res, _) = Op::new(op).submit_local().await;
 
         // 3. 转换结果
-        let fd = res? as crate::io::op::RawHandle;
+        let fd = crate::io::RawHandle { handle: res? as _ };
         use crate::io::op::IoFd;
+        let driver = crate::runtime::context::current().driver();
         Ok(super::file::File {
             fd: IoFd::Raw(fd),
             driver,

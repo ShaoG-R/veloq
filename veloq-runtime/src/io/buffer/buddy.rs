@@ -1,9 +1,11 @@
 use super::{
     AlignedMemory, AllocError, AllocResult, BackingPool, DeallocParams, FixedBuf, PoolVTable,
 };
-use std::cell::RefCell;
+use crossbeam_queue::SegQueue;
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::thread;
 
 // Buddy System Constants
 const ARENA_SIZE: usize = 32 * 1024 * 1024; // 32MB Total to support higher concurrency with overhead
@@ -416,10 +418,21 @@ impl BuddyAllocator {
     }
 }
 
+/// Shared state for thread-safe access and deferred deallocation
+struct SharedBuddyState {
+    allocator: UnsafeCell<BuddyAllocator>,
+    return_queue: SegQueue<DeallocParams>,
+    owner_id: thread::ThreadId,
+}
+
+// SAFETY: Synchronization is handled via owner_id checks and SegQueue
+unsafe impl Send for SharedBuddyState {}
+unsafe impl Sync for SharedBuddyState {}
+
 /// 各种 BufferPool 实现的包装器
 #[derive(Clone)]
 pub struct BuddyPool {
-    inner: Rc<RefCell<BuddyAllocator>>,
+    inner: Arc<SharedBuddyState>,
 }
 
 impl std::fmt::Debug for BuddyPool {
@@ -435,26 +448,28 @@ static BUDDY_POOL_VTABLE: PoolVTable = PoolVTable {
 };
 
 unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    // 1. Recover the Pool Rc
-    let pool_rc = unsafe { Rc::from_raw(pool_data.as_ptr() as *const RefCell<BuddyAllocator>) };
-    // Rc is now alive again (and will drop at end of scope, decrementing validity)
+    // 1. Recover the Pool Arc
+    let pool_arc = unsafe { Arc::from_raw(pool_data.as_ptr() as *const SharedBuddyState) };
 
     // 2. Adjust params to find original block start
-    let block_start_ptr = params.ptr.as_ptr();
-    let block_start_non_null = unsafe { NonNull::new_unchecked(block_start_ptr) };
-
-    // 3. Recover size from context (Buddy uses Order in context)
+    let block_start_ptr = params.ptr; // params.ptr is already NonNull<u8>
     let order = params.context;
 
-    // 4. Perform dealloc
-    let mut inner = pool_rc.borrow_mut();
-    unsafe { inner.dealloc(block_start_non_null, order) };
+    // 3. Check thread ownership
+    if thread::current().id() == pool_arc.owner_id {
+        // Local dealloc
+        let allocator = unsafe { &mut *pool_arc.allocator.get() };
+        unsafe { allocator.dealloc(block_start_ptr, order) };
+    } else {
+        // Remote dealloc: push to queue
+        pool_arc.return_queue.push(params);
+    }
 }
 
 unsafe fn buddy_resolve_region_info_shim(pool_data: NonNull<()>, buf: &FixedBuf) -> (usize, usize) {
-    let raw = pool_data.as_ptr() as *const RefCell<BuddyAllocator>;
-    let rc = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
-    let inner = rc.borrow();
+    let raw = pool_data.as_ptr() as *const SharedBuddyState;
+    let arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(raw) });
+    let inner = unsafe { &*arc.allocator.get() };
     (
         0,
         (buf.as_ptr() as usize).saturating_sub(inner.base_ptr() as usize),
@@ -464,16 +479,30 @@ unsafe fn buddy_resolve_region_info_shim(pool_data: NonNull<()>, buf: &FixedBuf)
 impl BuddyPool {
     pub fn new() -> Result<Self, AllocError> {
         Ok(Self {
-            inner: Rc::new(RefCell::new(BuddyAllocator::new()?)),
+            inner: Arc::new(SharedBuddyState {
+                allocator: UnsafeCell::new(BuddyAllocator::new()?),
+                return_queue: SegQueue::new(),
+                owner_id: thread::current().id(),
+            }),
         })
     }
 }
 
 impl BackingPool for BuddyPool {
     fn alloc_mem(&self, size: usize) -> AllocResult {
-        let mut inner = self.inner.borrow_mut();
+        // Enforce thread locality for allocation
+        if thread::current().id() != self.inner.owner_id {
+            panic!("BuddyPool::alloc_mem called from non-owner thread");
+        }
 
-        match inner.alloc(size) {
+        let allocator = unsafe { &mut *self.inner.allocator.get() };
+
+        // Drain return queue
+        while let Some(params) = self.inner.return_queue.pop() {
+            unsafe { allocator.dealloc(params.ptr, params.context) };
+        }
+
+        match allocator.alloc(size) {
             Some((block_ptr, order)) => {
                 let capacity = MIN_BLOCK_SIZE << order;
                 // No header writing needed
@@ -491,9 +520,12 @@ impl BackingPool for BuddyPool {
     }
 
     fn get_memory_regions(&self) -> Vec<crate::io::buffer::BufferRegion> {
-        let inner = self.inner.borrow();
+        // This is theoretically unsafe if called concurrently with alloc/dealloc that reorganizes internal structures?
+        // But for BuddyAllocator, base_ptr is constant and the Arena is fixed.
+        // We only access base_ptr here.
+        let allocator = unsafe { &*self.inner.allocator.get() };
         vec![crate::io::buffer::BufferRegion {
-            ptr: unsafe { NonNull::new_unchecked(inner.base_ptr() as *mut _) },
+            ptr: unsafe { NonNull::new_unchecked(allocator.base_ptr() as *mut _) },
             len: ARENA_SIZE,
         }]
     }
@@ -504,7 +536,7 @@ impl BackingPool for BuddyPool {
 
     fn pool_data(&self) -> NonNull<()> {
         unsafe {
-            let raw = Rc::into_raw(self.inner.clone());
+            let raw = Arc::into_raw(self.inner.clone());
             NonNull::new_unchecked(raw as *mut ())
         }
     }

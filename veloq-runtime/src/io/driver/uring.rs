@@ -5,7 +5,8 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::task::{Context, Poll};
 
-use crate::io::driver::RemoteWaker;
+use crate::io::driver::{Injector, RemoteCompleter, RemoteWaker};
+use crossbeam::queue::SegQueue;
 use std::sync::Arc;
 
 pub mod op;
@@ -14,10 +15,11 @@ pub mod submit;
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IntoPlatformOp;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Default)]
 pub struct UringOpState {
     pub submitted: bool,
     pub next: Option<usize>,
+    pub remote_completer: Option<Box<dyn RemoteCompleter<UringOp>>>,
 }
 
 impl UringOpState {
@@ -51,6 +53,31 @@ impl Drop for UringWaker {
     }
 }
 
+pub struct UringInjector {
+    queue: Arc<SegQueue<Box<dyn FnOnce(&mut UringDriver) + Send>>>,
+    waker_fd: RawFd,
+}
+
+impl Injector<UringDriver> for UringInjector {
+    fn inject(&self, f: Box<dyn FnOnce(&mut UringDriver) + Send>) -> io::Result<()> {
+        self.queue.push(f);
+        // Wake up driver
+        let buf = 1u64.to_ne_bytes();
+        let ret = unsafe { libc::write(self.waker_fd, buf.as_ptr() as *const _, 8) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            // EAGAIN is fine, driver is already awake or buffer full (unlikely for eventfd)
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(());
+            }
+            // If it fails, we still pushed to queue, worst case driver picks it up later?
+            // But we should report error.
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
 /// Special user_data value for cancel operations.
 /// We use u64::MAX - 1 because u64::MAX is already reserved.
 /// CQEs with this user_data are ignored (they're just confirmations that cancel was submitted).
@@ -74,6 +101,9 @@ pub struct UringDriver {
     waker_fd: RawFd,
     waker_token: Option<usize>,
     buffers_registered: bool,
+
+    // Injector support
+    queue: Arc<SegQueue<Box<dyn FnOnce(&mut UringDriver) + Send>>>,
 }
 
 impl UringDriver {
@@ -116,6 +146,7 @@ impl UringDriver {
             waker_fd,
             waker_token: None,
             buffers_registered: false,
+            queue: Arc::new(SegQueue::new()),
         };
 
         driver.submit_waker();
@@ -237,9 +268,19 @@ impl UringDriver {
                     if op.cancelled {
                         self.ops.remove(user_data);
                     } else {
-                        op.result = Some(res);
-                        if let Some(waker) = op.waker.take() {
-                            waker.wake();
+                        // Check if it has a remote completer
+                        if let Some(completer) = op.platform_data.remote_completer.take() {
+                            // Must take resources
+                            if let Some(res_op) = op.resources.take() {
+                                completer.complete(res, res_op);
+                            }
+                            // Remove op
+                            self.ops.remove(user_data);
+                        } else {
+                            op.result = Some(res);
+                            if let Some(waker) = op.waker.take() {
+                                waker.wake();
+                            }
                         }
                     }
                 }
@@ -459,15 +500,38 @@ impl UringDriver {
         // Remove from backlog if present? O(N).
         // We let flush_backlog handle it (it checks cancelled).
     }
+    fn process_injected(&mut self) {
+        while let Some(f) = self.queue.pop() {
+            f(self);
+        }
+    }
 }
 
 use crate::io::driver::Driver;
 
 impl Driver for UringDriver {
     type Op = UringOp;
+    type RemoteInjector = UringInjector;
+
+    fn injector(&self) -> Arc<Self::RemoteInjector> {
+        Arc::new(UringInjector {
+            queue: self.queue.clone(),
+            waker_fd: self.waker_fd,
+        })
+    }
 
     fn reserve_op(&mut self) -> usize {
         self.ops.insert(OpEntry::new(None, UringOpState::new()))
+    }
+
+    fn attach_remote_completer(
+        &mut self,
+        user_data: usize,
+        completer: Box<dyn RemoteCompleter<Self::Op>>,
+    ) {
+        if let Some(entry) = self.ops.get_mut(user_data) {
+            entry.platform_data.remote_completer = Some(completer);
+        }
     }
 
     fn submit(
@@ -552,11 +616,14 @@ impl Driver for UringDriver {
     }
 
     fn wait(&mut self) -> io::Result<()> {
-        self.wait()
+        self.wait()?;
+        self.process_injected();
+        Ok(())
     }
 
     fn process_completions(&mut self) {
         self.process_completions_internal();
+        self.process_injected();
         self.flush_cancellations();
         self.flush_backlog();
     }
@@ -574,7 +641,7 @@ impl Driver for UringDriver {
 
     fn register_files(
         &mut self,
-        files: &[crate::io::op::RawHandle],
+        files: &[crate::io::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
         let fds: Vec<i32> = files.to_vec();
         self.ring.submitter().register_files(&fds)?;
@@ -603,12 +670,12 @@ impl Driver for UringDriver {
         Ok(())
     }
 
-    fn inner_handle(&self) -> crate::io::op::RawHandle {
+    fn inner_handle(&self) -> crate::io::RawHandle {
         use std::os::unix::io::AsRawFd;
         self.ring.as_raw_fd()
     }
 
-    fn notify_mesh(&mut self, handle: crate::io::op::RawHandle) -> io::Result<()> {
+    fn notify_mesh(&mut self, handle: crate::io::RawHandle) -> io::Result<()> {
         let fd = handle as i32;
         // Send a MsgRing to the target ring. (Kernel 5.18+)
         // We set data to BACKGROUND_USER_DATA so the target treats it as a wake-up (and ignores the CQE).
