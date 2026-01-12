@@ -2,34 +2,39 @@
 
 use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool, RegisteredPool};
 use crate::net::udp::UdpSocket;
-use crate::runtime::{LocalExecutor, Runtime};
-use crate::spawn_local;
+use crate::runtime::Runtime;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
 
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &impl BufPool, size: usize) -> FixedBuf {
+fn alloc_buf(size: usize) -> FixedBuf {
+    let pool = crate::runtime::context::current_pool().unwrap();
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
 
-// ============ Single-Thread UDP Tests ============
+// ============ Single-Thread UDP Tests (using Runtime/spawn) ============
 
 /// Test basic UDP socket binding and local_addr
 #[test]
 fn test_udp_bind() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(1),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
 
-    exec.block_on(async move {
+    runtime.block_on(async move {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
 
         let addr = socket.local_addr().expect("Failed to get local address");
@@ -44,268 +49,288 @@ fn test_udp_bind() {
 /// Test UDP send and receive
 #[test]
 fn test_udp_send_receive() {
-    let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(backing_pool.clone(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
-    let pool = exec.pool();
-
     for size in [8192, 16384] {
-        println!("Testing with BufferSize: {:?}", size);
-        let pool_clone = pool.clone();
+        std::thread::spawn(move || {
+            println!("Testing with BufferSize: {:?}", size);
 
-        exec.block_on(async move {
-            let pool = pool_clone.clone();
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(1),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
-            let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
+            runtime.block_on(async move {
+                let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+                let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
-            let addr1 = socket1.local_addr().expect("Failed to get addr1");
-            let addr2 = socket2.local_addr().expect("Failed to get addr2");
-            println!("Socket 1 bound to: {}", addr1);
-            println!("Socket 2 bound to: {}", addr2);
+                let addr1 = socket1.local_addr().expect("Failed to get addr1");
+                let addr2 = socket2.local_addr().expect("Failed to get addr2");
+                println!("Socket 1 bound to: {}", addr1);
+                println!("Socket 2 bound to: {}", addr2);
 
-            let socket1_rc = Rc::new(socket1);
-            let socket2_rc = Rc::new(socket2);
-            let socket1_clone = socket1_rc.clone();
-            let pool_clone = pool.clone();
+                let socket1_arc = Arc::new(socket1);
+                let socket2_arc = Arc::new(socket2);
+                let socket1_clone = socket1_arc.clone();
 
-            // Receiver task: socket1 waits for data
-            let handler = spawn_local(async move {
-                let buf = alloc_buf(&pool_clone, size);
-                // buf.set_len(buf.capacity());
-                let (result, _buf) = socket1_clone.recv_from(buf).await;
-                let (bytes_read, from_addr) = result.expect("recv_from failed");
-                println!("Socket 1 received {} bytes from {}", bytes_read, from_addr);
-                assert_eq!(from_addr, addr2);
+                // Receiver task: socket1 waits for data
+                let handler = crate::runtime::context::spawn(async move {
+                    let buf = alloc_buf(size);
+                    // buf.set_len(buf.capacity());
+                    let (result, _buf) = socket1_clone.recv_from(buf).await;
+                    let (bytes_read, from_addr) = result.expect("recv_from failed");
+                    println!("Socket 1 received {} bytes from {}", bytes_read, from_addr);
+                    assert_eq!(from_addr, addr2);
+                });
+
+                // Sender: socket2 sends data to socket1
+                let mut send_buf = alloc_buf(size);
+                let test_data = b"Hello, UDP!";
+                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+
+                let (result, _) = socket2_arc.send_to(send_buf, addr1).await;
+                let bytes_sent = result.expect("send_to failed");
+                println!("Socket 2 sent {} bytes to {}", bytes_sent, addr1);
+
+                handler.await;
             });
-
-            // Sender: socket2 sends data to socket1
-            let mut send_buf = alloc_buf(&pool, size);
-            let test_data = b"Hello, UDP!";
-            send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-
-            let (result, _) = socket2_rc.send_to(send_buf, addr1).await;
-            let bytes_sent = result.expect("send_to failed");
-            println!("Socket 2 sent {} bytes to {}", bytes_sent, addr1);
-
-            handler.await;
-        });
+        })
+        .join()
+        .unwrap();
     }
 }
 
 /// Test UDP echo (send and receive response)
 #[test]
 fn test_udp_echo() {
-    let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(backing_pool.clone(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
-    let pool = exec.pool();
-
     for size in [8192, 16384] {
-        println!("Testing with BufferSize: {:?}", size);
-        let pool_clone = pool.clone();
+        std::thread::spawn(move || {
+            println!("Testing with BufferSize: {:?}", size);
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(1),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-        exec.block_on(async move {
-            let pool = pool_clone.clone();
-            // Create server and client sockets
-            let server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
-            let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
+            runtime.block_on(async move {
+                // Create server and client sockets
+                let server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
+                let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
 
-            let server_addr = server.local_addr().expect("Failed to get server address");
-            let client_addr = client.local_addr().expect("Failed to get client address");
-            println!("Server bound to: {}", server_addr);
-            println!("Client bound to: {}", client_addr);
+                let server_addr = server.local_addr().expect("Failed to get server address");
+                let client_addr = client.local_addr().expect("Failed to get client address");
+                println!("Server bound to: {}", server_addr);
+                println!("Client bound to: {}", client_addr);
 
-            let server_rc = Rc::new(server);
-            let client_rc = Rc::new(client);
-            let server_clone = server_rc.clone();
-            let pool_server = pool.clone();
+                let server_arc = Arc::new(server);
+                let client_arc = Arc::new(client);
+                let server_clone = server_arc.clone();
 
-            // Server task: receive and echo back
-            let server_h = spawn_local(async move {
-                // Receive data
-                let buf = pool_server.alloc(size).unwrap();
-                let (result, buf) = server_clone.recv_from(buf).await;
-                let (bytes_read, from_addr) = result.expect("Server recv_from failed");
-                println!("Server received {} bytes from {}", bytes_read, from_addr);
+                // Server task: receive and echo back
+                let server_h = crate::runtime::context::spawn(async move {
+                    // Receive data
+                    let buf = alloc_buf(size);
+                    let (result, buf) = server_clone.recv_from(buf).await;
+                    let (bytes_read, from_addr) = result.expect("Server recv_from failed");
+                    println!("Server received {} bytes from {}", bytes_read, from_addr);
 
-                // Echo back
-                let mut echo_buf = pool_server.alloc(size).unwrap();
-                echo_buf.spare_capacity_mut()[..bytes_read as usize]
-                    .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                    // Echo back
+                    let mut echo_buf = alloc_buf(size);
+                    echo_buf.spare_capacity_mut()[..bytes_read as usize]
+                        .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
 
-                let (result, _) = server_clone.send_to(echo_buf, from_addr).await;
-                result.expect("Server send_to failed");
-                println!("Server echoed data back to {}", from_addr);
+                    let (result, _) = server_clone.send_to(echo_buf, from_addr).await;
+                    result.expect("Server send_to failed");
+                    println!("Server echoed data back to {}", from_addr);
+                });
+
+                // Client: send data to server
+                let mut send_buf = alloc_buf(size);
+                let test_data = b"Echo this message!";
+                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+
+                let (result, _) = client_arc.send_to(send_buf, server_addr).await;
+                let bytes_sent = result.expect("Client send_to failed");
+                println!("Client sent {} bytes", bytes_sent);
+
+                // Receive echo response
+                let recv_buf = alloc_buf(size);
+                let (result, recv_buf) = client_arc.recv_from(recv_buf).await;
+                let (bytes_received, from_addr) = result.expect("Client recv_from failed");
+
+                println!(
+                    "Client received {} bytes from {}",
+                    bytes_received, from_addr
+                );
+
+                // Verify
+                assert_eq!(from_addr, server_addr);
+                assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
+                println!("UDP echo test successful!");
+
+                server_h.await;
             });
-
-            // Client: send data to server
-            let mut send_buf = pool.alloc(size).unwrap();
-            let test_data = b"Echo this message!";
-            send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-
-            let (result, _) = client_rc.send_to(send_buf, server_addr).await;
-            let bytes_sent = result.expect("Client send_to failed");
-            println!("Client sent {} bytes", bytes_sent);
-
-            // Receive echo response
-            let recv_buf = pool.alloc(size).unwrap();
-            let (result, recv_buf) = client_rc.recv_from(recv_buf).await;
-            let (bytes_received, from_addr) = result.expect("Client recv_from failed");
-
-            println!(
-                "Client received {} bytes from {}",
-                bytes_received, from_addr
-            );
-
-            // Verify
-            assert_eq!(from_addr, server_addr);
-            assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
-            println!("UDP echo test successful!");
-
-            server_h.await;
-        });
+        })
+        .join()
+        .unwrap();
     }
 }
 
 /// Test multiple UDP messages
 #[test]
 fn test_udp_multiple_messages() {
-    let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(backing_pool.clone(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
-    let pool = exec.pool();
-
     for size in [8192, 16384] {
-        let pool_clone = pool.clone();
+        std::thread::spawn(move || {
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(1),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-        exec.block_on(async move {
-            let pool = pool_clone.clone();
+            runtime.block_on(async move {
+                let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+                let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
-            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
-            let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
+                let addr1 = socket1.local_addr().expect("Failed to get addr1");
+                let _addr2 = socket2.local_addr().expect("Failed to get addr2");
 
-            let addr1 = socket1.local_addr().expect("Failed to get addr1");
-            let _addr2 = socket2.local_addr().expect("Failed to get addr2");
+                const NUM_MESSAGES: usize = 5;
 
-            const NUM_MESSAGES: usize = 5;
+                let socket1_arc = Arc::new(socket1);
+                let socket2_arc = Arc::new(socket2);
+                let socket1_clone = socket1_arc.clone();
 
-            let socket1_rc = Rc::new(socket1);
-            let socket2_rc = Rc::new(socket2);
-            let socket1_clone = socket1_rc.clone();
-            let pool_clone = pool.clone();
+                // Receiver task
+                let h_recv = crate::runtime::context::spawn(async move {
+                    for i in 0..NUM_MESSAGES {
+                        let buf = alloc_buf(size);
+                        let (result, _buf) = socket1_clone.recv_from(buf).await;
+                        let (bytes, from) = result.expect("recv_from failed");
+                        println!("Received message {} ({} bytes) from {}", i, bytes, from);
+                    }
+                    println!("Received all {} messages", NUM_MESSAGES);
+                });
 
-            // Receiver task
-            let h_recv = spawn_local(async move {
+                // Sender
                 for i in 0..NUM_MESSAGES {
-                    let buf = alloc_buf(&pool_clone, size);
-                    let (result, _buf) = socket1_clone.recv_from(buf).await;
-                    let (bytes, from) = result.expect("recv_from failed");
-                    println!("Received message {} ({} bytes) from {}", i, bytes, from);
+                    let mut buf = alloc_buf(size);
+                    let msg = format!("Message {}", i);
+                    buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+
+                    let (result, _) = socket2_arc.send_to(buf, addr1).await;
+                    result.expect("send_to failed");
+                    println!("Sent message {}", i);
                 }
-                println!("Received all {} messages", NUM_MESSAGES);
+                println!("Sent all {} messages", NUM_MESSAGES);
+
+                h_recv.await;
             });
-
-            // Sender
-            for i in 0..NUM_MESSAGES {
-                let mut buf = alloc_buf(&pool, size);
-                let msg = format!("Message {}", i);
-                buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
-
-                let (result, _) = socket2_rc.send_to(buf, addr1).await;
-                result.expect("send_to failed");
-                println!("Sent message {}", i);
-            }
-            println!("Sent all {} messages", NUM_MESSAGES);
-
-            h_recv.await;
-        });
+        })
+        .join()
+        .unwrap();
     }
 }
 
 /// Test UDP with large data
 #[test]
 fn test_udp_large_data() {
-    let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(backing_pool.clone(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
-    let pool = exec.pool();
-
     for size in [8192, 16384] {
-        let pool_clone = pool.clone();
+        std::thread::spawn(move || {
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(1),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-        exec.block_on(async move {
-            let pool = pool_clone.clone();
+            runtime.block_on(async move {
+                let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+                let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
-            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
-            let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
+                let addr1 = socket1.local_addr().expect("Failed to get addr1");
 
-            let addr1 = socket1.local_addr().expect("Failed to get addr1");
+                // UDP datagrams are limited, use a reasonable size (less than MTU)
+                const DATA_SIZE: usize = 1024;
 
-            // UDP datagrams are limited, use a reasonable size (less than MTU)
-            const DATA_SIZE: usize = 1024;
+                let socket1_arc = Arc::new(socket1);
+                let socket2_arc = Arc::new(socket2);
+                let socket1_clone = socket1_arc.clone();
 
-            let socket1_rc = Rc::new(socket1);
-            let socket2_rc = Rc::new(socket2);
-            let socket1_clone = socket1_rc.clone();
-            let pool_clone = pool.clone();
+                // Receiver task
+                let h_recv = crate::runtime::context::spawn(async move {
+                    let buf = alloc_buf(size);
+                    let (result, buf) = socket1_clone.recv_from(buf).await;
+                    let (bytes, _from) = result.expect("recv_from failed");
+                    println!("Received {} bytes", bytes);
 
-            // Receiver task
-            let h_recv = spawn_local(async move {
-                let buf = alloc_buf(&pool_clone, size);
-                let (result, buf) = socket1_clone.recv_from(buf).await;
-                let (bytes, _from) = result.expect("recv_from failed");
-                println!("Received {} bytes", bytes);
+                    // Verify data pattern
+                    for i in 0..DATA_SIZE {
+                        assert_eq!(buf.as_slice()[i], (i % 256) as u8);
+                    }
+                    println!("Data verification successful!");
+                });
 
-                // Verify data pattern
+                // Sender
+                let mut buf = alloc_buf(size);
                 for i in 0..DATA_SIZE {
-                    assert_eq!(buf.as_slice()[i], (i % 256) as u8);
+                    buf.spare_capacity_mut()[i] = (i % 256) as u8;
                 }
-                println!("Data verification successful!");
+
+                let (result, _) = socket2_arc.send_to(buf, addr1).await;
+                let bytes = result.expect("send_to failed") as usize;
+                println!("Sent {} bytes", bytes);
+
+                h_recv.await;
             });
-
-            // Sender
-            let mut buf = alloc_buf(&pool, size);
-            for i in 0..DATA_SIZE {
-                buf.spare_capacity_mut()[i] = (i % 256) as u8;
-            }
-
-            let (result, _) = socket2_rc.send_to(buf, addr1).await;
-            let bytes = result.expect("send_to failed") as usize;
-            println!("Sent {} bytes", bytes);
-
-            h_recv.await;
-        });
+        })
+        .join()
+        .unwrap();
     }
 }
 
 /// Test IPv6 UDP
 #[test]
 fn test_udp_ipv6() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(1),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
 
-    exec.block_on(async move {
+    runtime.block_on(async move {
         let socket_result = UdpSocket::bind("::1:0");
 
         if socket_result.is_err() {
@@ -329,77 +354,82 @@ fn test_udp_ipv6() {
 #[test]
 fn test_multithread_udp() {
     for size in [8192, 16384] {
-        let message_count = Arc::new(AtomicUsize::new(0));
-        const NUM_WORKERS: usize = 3;
+        std::thread::spawn(move || {
+            let message_count = Arc::new(AtomicUsize::new(0));
+            const NUM_WORKERS: usize = 3;
 
-        let runtime = Runtime::builder()
-            .config(crate::config::Config {
-                worker_threads: Some(NUM_WORKERS),
-                ..Default::default()
-            })
-            .pool_constructor(|_, registrar| {
-                let pool = HybridPool::new().unwrap();
-                let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                AnyBufPool::new(reg_pool)
-            })
-            .build()
-            .unwrap();
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(NUM_WORKERS),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-        let (tx, mut rx) = crate::sync::mpsc::unbounded();
+            let (tx, mut rx) = crate::sync::mpsc::unbounded();
 
-        let message_count_clone = message_count.clone();
-        runtime.block_on(async move {
-            for worker_id in 0..NUM_WORKERS {
-                let counter = message_count_clone.clone();
-                let tx_done = tx.clone();
+            let message_count_clone = message_count.clone();
+            runtime.block_on(async move {
+                for worker_id in 0..NUM_WORKERS {
+                    let counter = message_count_clone.clone();
+                    let tx_done = tx.clone();
 
-                crate::runtime::context::spawn_to(worker_id, async move || {
-                    // Each worker creates its own UDP sockets and tests send/recv
-                    let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
-                    let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
+                    crate::runtime::context::spawn_to(worker_id, async move || {
+                        // Each worker creates its own UDP sockets and tests send/recv
+                        let socket1 =
+                            UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+                        let socket2 =
+                            UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
-                    let addr1 = socket1.local_addr().expect("Failed to get addr1");
-                    println!("Worker {} socket 1 bound to: {}", worker_id, addr1);
+                        let addr1 = socket1.local_addr().expect("Failed to get addr1");
+                        println!("Worker {} socket 1 bound to: {}", worker_id, addr1);
 
-                    let socket1_rc = Rc::new(socket1);
-                    let socket2_rc = Rc::new(socket2);
-                    let socket1_clone = socket1_rc.clone();
-                    let pool = crate::runtime::context::current_pool().unwrap(); // Get thread pool
-                    let pool_clone = pool.clone();
+                        let socket1_arc = Arc::new(socket1);
+                        let socket2_arc = Arc::new(socket2);
+                        let socket1_clone = socket1_arc.clone();
+                        // let pool = crate::runtime::context::current_pool().unwrap(); // Use global helper instead
 
-                    // Receiver task via crate::spawn_local (uses current context)
-                    let h_recv = crate::spawn_local(async move {
-                        let buf = pool_clone.alloc(size).unwrap();
-                        let (result, _buf) = socket1_clone.recv_from(buf).await;
-                        result.expect("recv_from failed");
-                        println!("Worker {} received message", worker_id);
+                        // Receiver task via crate::context::spawn
+                        let h_recv = crate::runtime::context::spawn(async move {
+                            let buf = alloc_buf(size);
+                            let (result, _buf) = socket1_clone.recv_from(buf).await;
+                            result.expect("recv_from failed");
+                            println!("Worker {} received message", worker_id);
+                        });
+
+                        // Sender
+                        let mut buf = alloc_buf(size);
+                        let msg = format!("Hello from worker {}", worker_id);
+                        buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+
+                        let (result, _) = socket2_arc.send_to(buf, addr1).await;
+                        result.expect("send_to failed");
+                        println!("Worker {} sent message", worker_id);
+
+                        h_recv.await;
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        tx_done.send(()).unwrap();
                     });
+                }
 
-                    // Sender
-                    let mut buf = pool.alloc(size).unwrap();
-                    let msg = format!("Hello from worker {}", worker_id);
-                    buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+                for _ in 0..NUM_WORKERS {
+                    rx.recv().await.unwrap();
+                }
+            });
 
-                    let (result, _) = socket2_rc.send_to(buf, addr1).await;
-                    result.expect("send_to failed");
-                    println!("Worker {} sent message", worker_id);
-
-                    h_recv.await;
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    tx_done.send(()).unwrap();
-                });
-            }
-
-            for _ in 0..NUM_WORKERS {
-                rx.recv().await.unwrap();
-            }
-        });
-
-        assert_eq!(message_count.load(Ordering::SeqCst), NUM_WORKERS);
-        println!(
-            "All {} workers completed UDP self-communication",
-            NUM_WORKERS
-        );
+            assert_eq!(message_count.load(Ordering::SeqCst), NUM_WORKERS);
+            println!(
+                "All {} workers completed UDP self-communication",
+                NUM_WORKERS
+            );
+        })
+        .join()
+        .unwrap();
     }
 }
 
@@ -407,89 +437,95 @@ fn test_multithread_udp() {
 #[test]
 fn test_multithread_udp_echo() {
     for size in [8192, 16384] {
-        let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
-        let runtime = Runtime::builder()
-            .config(crate::config::Config::default().worker_threads(2)) // 2 workers (0 and 1)
-            .pool_constructor(|_, registrar| {
-                let pool = HybridPool::new().unwrap();
-                let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                AnyBufPool::new(reg_pool)
-            })
-            .build()
-            .unwrap();
+        std::thread::spawn(move || {
+            let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
+            let runtime = Runtime::builder()
+                .config(crate::config::Config::default().worker_threads(2)) // 2 workers (0 and 1)
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-        let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
+            let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
-        // Worker 0: Echo server
-        runtime.block_on(async move {
-            let addr_tx = addr_tx.clone();
+            // Worker 0: Echo server
+            runtime.block_on(async move {
+                let addr_tx = addr_tx.clone();
 
-            crate::runtime::context::spawn_to(0, async move || {
-                let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
-                let server_addr = socket.local_addr().expect("Failed to get server address");
-                println!("UDP echo server listening on {}", server_addr);
+                crate::runtime::context::spawn_to(0, async move || {
+                    let socket =
+                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
+                    let server_addr = socket.local_addr().expect("Failed to get server address");
+                    println!("UDP echo server listening on {}", server_addr);
 
-                // Send address to client worker
-                addr_tx.send(server_addr).unwrap();
+                    // Send address to client worker
+                    addr_tx.send(server_addr).unwrap();
 
-                let pool = crate::runtime::context::current_pool().unwrap();
+                    // let pool = crate::runtime::context::current_pool().unwrap();
 
-                // Receive and echo
-                let buf = pool.alloc(size).unwrap();
+                    // Receive and echo
+                    let buf = alloc_buf(size);
 
-                let (result, buf) = socket.recv_from(buf).await;
-                let (bytes, from_addr) = result.expect("Server recv_from failed");
-                println!("Server received {} bytes from {}", bytes, from_addr);
+                    let (result, buf) = socket.recv_from(buf).await;
+                    let (bytes, from_addr) = result.expect("Server recv_from failed");
+                    println!("Server received {} bytes from {}", bytes, from_addr);
 
-                // Echo back
-                let mut echo_buf = pool.alloc(size).unwrap();
-                echo_buf.spare_capacity_mut()[..bytes as usize]
-                    .copy_from_slice(&buf.as_slice()[..bytes as usize]);
+                    // Echo back
+                    let mut echo_buf = alloc_buf(size);
+                    echo_buf.spare_capacity_mut()[..bytes as usize]
+                        .copy_from_slice(&buf.as_slice()[..bytes as usize]);
 
-                let (result, _) = socket.send_to(echo_buf, from_addr).await;
-                result.expect("Server send_to failed");
-                println!("Server echoed response");
+                    let (result, _) = socket.send_to(echo_buf, from_addr).await;
+                    result.expect("Server send_to failed");
+                    println!("Server echoed response");
+                });
+
+                // Worker 1: Client
+                // let addr_rx = addr_rx.clone();
+                let done_tx = done_tx.clone();
+
+                crate::runtime::context::spawn_to(1, async move || {
+                    // Wait for server address
+                    let server_addr = addr_rx.recv().await.expect("Channel closed");
+
+                    println!("Client connecting to {}", server_addr);
+
+                    let client =
+                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
+                    // let pool = crate::runtime::context::current_pool().unwrap();
+
+                    // Send data
+                    let mut send_buf = alloc_buf(size);
+                    let data = b"Hello from worker 2!";
+                    send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+
+                    let (result, _) = client.send_to(send_buf, server_addr).await;
+                    let sent = result.expect("Client send_to failed");
+                    println!("Client sent {} bytes", sent);
+
+                    // Receive echo
+                    let recv_buf = alloc_buf(size);
+                    let (result, recv_buf) = client.recv_from(recv_buf).await;
+                    let (_received, from) = result.expect("Client recv_from failed");
+
+                    assert_eq!(from, server_addr);
+                    assert_eq!(&recv_buf.as_slice()[..data.len()], data);
+                    println!("Client received correct echo");
+
+                    done_tx.send(()).unwrap();
+                });
+
+                // Wait for completion
+                done_rx.recv().await.unwrap();
             });
 
-            // Worker 1: Client
-            // let addr_rx = addr_rx.clone();
-            let done_tx = done_tx.clone();
-
-            crate::runtime::context::spawn_to(1, async move || {
-                // Wait for server address
-                let server_addr = addr_rx.recv().await.expect("Channel closed");
-
-                println!("Client connecting to {}", server_addr);
-
-                let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
-                let pool = crate::runtime::context::current_pool().unwrap();
-
-                // Send data
-                let mut send_buf = pool.alloc(size).unwrap();
-                let data = b"Hello from worker 2!";
-                send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
-
-                let (result, _) = client.send_to(send_buf, server_addr).await;
-                let sent = result.expect("Client send_to failed");
-                println!("Client sent {} bytes", sent);
-
-                // Receive echo
-                let recv_buf = pool.alloc(size).unwrap();
-                let (result, recv_buf) = client.recv_from(recv_buf).await;
-                let (_received, from) = result.expect("Client recv_from failed");
-
-                assert_eq!(from, server_addr);
-                assert_eq!(&recv_buf.as_slice()[..data.len()], data);
-                println!("Client received correct echo");
-
-                done_tx.send(()).unwrap();
-            });
-
-            // Wait for completion
-            done_rx.recv().await.unwrap();
-        });
-
-        println!("Multi-thread UDP echo test completed");
+            println!("Multi-thread UDP echo test completed");
+        })
+        .join()
+        .unwrap();
     }
 }
 
@@ -500,96 +536,101 @@ fn test_multithread_concurrent_udp_clients() {
     use std::time::Duration;
 
     for size in [8192, 16384] {
-        let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
-        let addr_rx = Arc::new(Mutex::new(addr_rx));
-        let message_count = Arc::new(AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+            let addr_rx = Arc::new(Mutex::new(addr_rx));
+            let message_count = Arc::new(AtomicUsize::new(0));
 
-        const NUM_CLIENTS: usize = 3;
-        const NUM_WORKERS: usize = 4; // 0=Server, 1,2,3=Clients
+            const NUM_CLIENTS: usize = 3;
+            const NUM_WORKERS: usize = 4; // 0=Server, 1,2,3=Clients
 
-        let runtime = Runtime::builder()
-            .config(crate::config::Config {
-                worker_threads: Some(NUM_WORKERS),
-                ..Default::default()
-            })
-            .pool_constructor(|_, registrar| {
-                let pool = HybridPool::new().unwrap();
-                let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                AnyBufPool::new(reg_pool)
-            })
-            .build()
-            .unwrap();
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(NUM_WORKERS),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-        let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
+            let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
-        let message_count_clone = message_count.clone();
-        runtime.block_on(async move {
-            // Server worker (0)
-            let addr_tx = addr_tx.clone();
-            crate::runtime::context::spawn_to(0, async move || {
-                let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
-                let server_addr = socket.local_addr().expect("Failed to get server address");
-                println!("Server listening on {}", server_addr);
+            let message_count_clone = message_count.clone();
+            runtime.block_on(async move {
+                // Server worker (0)
+                let addr_tx = addr_tx.clone();
+                crate::runtime::context::spawn_to(0, async move || {
+                    let socket =
+                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
+                    let server_addr = socket.local_addr().expect("Failed to get server address");
+                    println!("Server listening on {}", server_addr);
 
-                // Broadcast address to all clients
+                    // Broadcast address to all clients
+                    for _ in 0..NUM_CLIENTS {
+                        addr_tx.send(server_addr).unwrap();
+                    }
+
+                    // let pool = crate::runtime::context::current_pool().unwrap();
+
+                    // Receive messages from all clients
+                    for i in 0..NUM_CLIENTS {
+                        let buf = alloc_buf(size);
+                        let (result, _buf) = socket.recv_from(buf).await;
+                        let (bytes, from) = result.expect("Server recv_from failed");
+                        println!(
+                            "Server received message {} ({} bytes) from {}",
+                            i, bytes, from
+                        );
+                    }
+                    println!("Server received all {} messages", NUM_CLIENTS);
+                });
+
+                let counter_clone = message_count_clone.clone();
+                // Client workers (1..=3)
+                for client_id in 1..=NUM_CLIENTS {
+                    let rx = addr_rx.clone();
+                    let counter = counter_clone.clone();
+                    let done_tx = done_tx.clone();
+
+                    crate::runtime::context::spawn_to(client_id, async move || {
+                        let server_addr = {
+                            rx.lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .expect("Timeout waiting for server address")
+                        };
+
+                        let client =
+                            UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
+                        // let pool = crate::runtime::context::current_pool().unwrap();
+
+                        let mut buf = alloc_buf(size);
+                        let msg = format!("Hello from client {}", client_id);
+                        buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+
+                        let (result, _) = client.send_to(buf, server_addr).await;
+                        result.expect("Client send_to failed");
+                        println!("Client {} sent message", client_id);
+
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        done_tx.send(()).unwrap();
+                    });
+                }
+
+                // Wait for clients
                 for _ in 0..NUM_CLIENTS {
-                    addr_tx.send(server_addr).unwrap();
+                    done_rx.recv().await.unwrap();
                 }
-
-                let pool = crate::runtime::context::current_pool().unwrap();
-
-                // Receive messages from all clients
-                for i in 0..NUM_CLIENTS {
-                    let buf = pool.alloc(size).unwrap();
-                    let (result, _buf) = socket.recv_from(buf).await;
-                    let (bytes, from) = result.expect("Server recv_from failed");
-                    println!(
-                        "Server received message {} ({} bytes) from {}",
-                        i, bytes, from
-                    );
-                }
-                println!("Server received all {} messages", NUM_CLIENTS);
             });
 
-            let counter_clone = message_count_clone.clone();
-            // Client workers (1..=3)
-            for client_id in 1..=NUM_CLIENTS {
-                let rx = addr_rx.clone();
-                let counter = counter_clone.clone();
-                let done_tx = done_tx.clone();
-
-                crate::runtime::context::spawn_to(client_id, async move || {
-                    let server_addr = {
-                        rx.lock()
-                            .unwrap()
-                            .recv_timeout(Duration::from_secs(5))
-                            .expect("Timeout waiting for server address")
-                    };
-
-                    let client =
-                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
-                    let pool = crate::runtime::context::current_pool().unwrap();
-
-                    let mut buf = pool.alloc(size).unwrap();
-                    let msg = format!("Hello from client {}", client_id);
-                    buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
-
-                    let (result, _) = client.send_to(buf, server_addr).await;
-                    result.expect("Client send_to failed");
-                    println!("Client {} sent message", client_id);
-
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    done_tx.send(()).unwrap();
-                });
-            }
-
-            // Wait for clients
-            for _ in 0..NUM_CLIENTS {
-                done_rx.recv().await.unwrap();
-            }
-        });
-
-        assert_eq!(message_count.load(Ordering::SeqCst), NUM_CLIENTS);
-        println!("All {} clients completed", NUM_CLIENTS);
+            assert_eq!(message_count.load(Ordering::SeqCst), NUM_CLIENTS);
+            println!("All {} clients completed", NUM_CLIENTS);
+        })
+        .join()
+        .unwrap();
     }
 }

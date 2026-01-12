@@ -224,6 +224,7 @@ impl UringDriver {
 
         self.ring.submit_and_wait(1)?;
         self.process_completions_internal();
+        self.process_injected();
 
         // After wait (which implies submit), we might have space
         self.flush_cancellations();

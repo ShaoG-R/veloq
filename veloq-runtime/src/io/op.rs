@@ -18,8 +18,6 @@ use crate::io::driver::{Driver, PlatformDriver};
 use crate::io::socket::SockAddrStorage;
 use crate::io::{RawHandle, buffer::FixedBuf};
 
-use std::thread::{self, ThreadId};
-
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoFd {
@@ -246,7 +244,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
     pub fn into_thread_bound(self) -> ThreadBoundOp<T> {
         ThreadBoundOp {
             inner: self,
-            origin_thread: thread::current().id(),
+            origin_id: crate::runtime::context::current().handle.id(),
         }
     }
 }
@@ -258,7 +256,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
 /// while ensuring safety by panicking if moved to another thread.
 pub struct ThreadBoundOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     inner: LocalOp<T>,
-    origin_thread: ThreadId,
+    origin_id: usize,
 }
 
 // SAFETY: We enforce thread-affinity via runtime checks in poll().
@@ -269,7 +267,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for ThreadBoundOp<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Runtime safety check
-        if thread::current().id() != self.origin_thread {
+        if !crate::runtime::context::is_current_worker(self.origin_id) {
             panic!("ThreadBoundOp polled on a different thread! This is unsafe for LocalOp.");
         }
 

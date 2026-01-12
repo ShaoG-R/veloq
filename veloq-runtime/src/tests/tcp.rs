@@ -2,50 +2,54 @@
 
 use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool, RegisteredPool};
 use crate::net::tcp::{TcpListener, TcpStream};
-use crate::runtime::{LocalExecutor, Runtime};
-use crate::spawn_local;
+use crate::runtime::Runtime;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
 
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &impl BufPool, size: usize) -> FixedBuf {
+fn alloc_buf(size: usize) -> FixedBuf {
+    let pool = crate::runtime::context::current_pool().unwrap();
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
 
-// ============ Single-Thread TCP Tests ============
+// ============ Single-Thread TCP Tests (using Runtime/spawn) ============
 
-/// Test basic TCP connection using global spawn and current_driver
+/// Test basic TCP connection using global spawn
 #[test]
 fn test_tcp_connect_with_global_api() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(1),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
 
-    exec.block_on(async move {
+    runtime.block_on(async move {
         // Create listener inside block_on to access context
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
         println!("Listener bound to: {}", listen_addr);
 
-        let listener_rc = Rc::new(listener);
-        let listener_clone = listener_rc.clone();
+        let listener_arc = Arc::new(listener);
+        let listener_clone = listener_arc.clone();
 
-        // Server task using cx.spawn_local
-        let server_h = spawn_local(async move {
+        // Server task using cx.spawn
+        let server_h = crate::runtime::context::spawn(async move {
             let (stream, peer_addr) = listener_clone.accept().await.expect("Accept failed");
             println!("Accepted connection from: {}", peer_addr);
             drop(stream);
         });
 
-        // Client uses cx.driver()
         // Client uses cx implicitly
         let stream = TcpStream::connect(listen_addr)
             .await
@@ -60,122 +64,131 @@ fn test_tcp_connect_with_global_api() {
 /// Test TCP data send and receive (echo)
 #[test]
 fn test_tcp_send_recv() {
-    let backing_pool = HybridPool::new().unwrap();
-    // Move binding inside the loop/executor since we need a registrar
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(backing_pool.clone(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
-    let pool = exec.pool();
-
     for size in [8192, 16384, 65536] {
-        println!("Testing with BufferSize: {:?}", size);
-        let pool_clone = pool.clone();
+        std::thread::spawn(move || {
+            println!("Testing with BufferSize: {:?}", size);
 
-        exec.block_on(async move {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-            let listen_addr = listener.local_addr().expect("Failed to get local address");
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(1),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-            let listener_rc = Rc::new(listener);
-            let listener_clone = listener_rc.clone();
-            let pool = pool_clone.clone();
+            runtime.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-            let pool_server = pool.clone();
+                let listener_arc = Arc::new(listener);
+                let listener_clone = listener_arc.clone();
 
-            // Server task: Robust Echo Loop
-            let server_h = spawn_local(async move {
-                let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+                // Server task: Robust Echo Loop
+                let server_h = crate::runtime::context::spawn(async move {
+                    let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
-                loop {
-                    let buf = alloc_buf(&pool_server, size);
-                    let (result, mut buf) = stream.recv(buf).await;
-                    let bytes_read = match result {
-                        Ok(n) if n > 0 => n as usize,
-                        _ => break, // EOF or Error
-                    };
+                    loop {
+                        let buf = alloc_buf(size);
+                        let (result, mut buf) = stream.recv(buf).await;
+                        let bytes_read = match result {
+                            Ok(n) if n > 0 => n as usize,
+                            _ => break, // EOF or Error
+                        };
 
-                    // Echo exact bytes received
-                    buf.set_len(bytes_read);
-                    if let Err(e) = stream.send(buf).await.0 {
-                        println!("Server echo failed: {}", e);
-                        break;
+                        // Echo exact bytes received
+                        buf.set_len(bytes_read);
+                        if let Err(e) = stream.send(buf).await.0 {
+                            println!("Server echo failed: {}", e);
+                            break;
+                        }
                     }
+                });
+
+                // Client
+                let stream = TcpStream::connect(listen_addr)
+                    .await
+                    .expect("Failed to connect");
+
+                // Prepare data
+                let mut send_buf = alloc_buf(size);
+                let test_data = b"Hello, TCP!";
+                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+                // Buffer is full length (clamped) by default, containing test_data + zeros
+
+                // Send data
+                let bytes_to_send = send_buf.len();
+                let (result, _) = stream.send(send_buf).await;
+                let bytes_sent = result.expect("Client send failed") as usize;
+                assert_eq!(bytes_sent, bytes_to_send);
+                println!("Client sent {} bytes", bytes_sent);
+
+                // Receive loop verify
+                let mut total_received = 0;
+
+                while total_received < bytes_sent {
+                    let recv_buf = alloc_buf(size);
+                    let (result, recv_buf) = stream.recv(recv_buf).await;
+                    let n = result.expect("Client recv failed") as usize;
+                    if n == 0 {
+                        break;
+                    } // Unexpected EOF?
+
+                    if total_received == 0 {
+                        // Verify first chunk header
+                        assert!(n >= test_data.len(), "First chunk too small");
+                        assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
+                    }
+                    total_received += n;
                 }
+
+                println!("Client received {} bytes", total_received);
+
+                // Verify
+                assert_eq!(bytes_sent, total_received);
+                println!("Data verification successful!");
+
+                // Close client to let server exit loop
+                drop(stream);
+                server_h.await;
             });
-
-            // Client
-            let stream = TcpStream::connect(listen_addr)
-                .await
-                .expect("Failed to connect");
-
-            // Prepare data
-            let mut send_buf = pool.alloc(size).unwrap();
-            let test_data = b"Hello, TCP!";
-            send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-            // Buffer is full length (clamped) by default, containing test_data + zeros
-
-            // Send data
-            let bytes_to_send = send_buf.len();
-            let (result, _) = stream.send(send_buf).await;
-            let bytes_sent = result.expect("Client send failed") as usize;
-            assert_eq!(bytes_sent, bytes_to_send);
-            println!("Client sent {} bytes", bytes_sent);
-
-            // Receive loop verify
-            let mut total_received = 0;
-
-            while total_received < bytes_sent {
-                let recv_buf = alloc_buf(&pool, size);
-                let (result, recv_buf) = stream.recv(recv_buf).await;
-                let n = result.expect("Client recv failed") as usize;
-                if n == 0 {
-                    break;
-                } // Unexpected EOF?
-
-                if total_received == 0 {
-                    // Verify first chunk header
-                    assert!(n >= test_data.len(), "First chunk too small");
-                    assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
-                }
-                total_received += n;
-            }
-
-            println!("Client received {} bytes", total_received);
-
-            // Verify
-            assert_eq!(bytes_sent, total_received);
-            println!("Data verification successful!");
-
-            // Close client to let server exit loop
-            drop(stream);
-            server_h.await;
-        });
+        })
+        .join()
+        .unwrap()
     }
 }
 
 /// Test multiple concurrent connections on single thread
 #[test]
 fn test_tcp_multiple_connections() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(1),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
 
-    exec.block_on(async move {
+    runtime.block_on(async move {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
         const NUM_CONNECTIONS: usize = 5;
 
-        let listener_rc = Rc::new(listener);
-        let listener_clone = listener_rc.clone();
+        let listener_arc = Arc::new(listener);
+        let listener_clone = listener_arc.clone();
 
         // Server task: accept all connections
-        let server_h = spawn_local(async move {
+        let server_h = crate::runtime::context::spawn(async move {
             for i in 0..NUM_CONNECTIONS {
                 let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
                 println!("Accepted connection {} from {}", i, peer);
@@ -201,94 +214,103 @@ fn test_tcp_multiple_connections() {
 /// Test large data transfer
 #[test]
 fn test_tcp_large_data_transfer() {
-    let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(backing_pool.clone(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
-    let pool = exec.pool();
-
     for size in [8192, 16384, 65536] {
-        let pool_clone = pool.clone();
+        std::thread::spawn(move || {
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(1),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        exec.block_on(async move {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-            let listen_addr = listener.local_addr().expect("Failed to get local address");
+                const DATA_SIZE: usize = 8192; // 8KB
+                const CHUNK_SIZE: usize = 4096;
 
-            const DATA_SIZE: usize = 8192; // 8KB
-            const CHUNK_SIZE: usize = 4096;
+                let listener_arc = Arc::new(listener);
+                let listener_clone = listener_arc.clone();
 
-            let listener_rc = Rc::new(listener);
-            let listener_clone = listener_rc.clone();
-            let pool = pool_clone.clone();
-            let pool_server = pool.clone();
+                // Server task
+                let server_h = crate::runtime::context::spawn(async move {
+                    let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
-            // Server task
-            let server_h = spawn_local(async move {
-                let (stream, _) = listener_clone.accept().await.expect("Accept failed");
-
-                let mut total_received = 0;
-                while total_received < DATA_SIZE {
-                    let buf = alloc_buf(&pool_server, size);
-                    // buf.set_len(buf.capacity());
-                    let (result, _buf) = stream.recv(buf).await;
-                    let bytes = result.expect("Recv failed") as usize;
-                    if bytes == 0 {
-                        break;
+                    let mut total_received = 0;
+                    while total_received < DATA_SIZE {
+                        let buf = alloc_buf(size);
+                        // buf.set_len(buf.capacity());
+                        let (result, _buf) = stream.recv(buf).await;
+                        let bytes = result.expect("Recv failed") as usize;
+                        if bytes == 0 {
+                            break;
+                        }
+                        total_received += bytes;
+                        println!(
+                            "Server received {} bytes (total: {})",
+                            bytes, total_received
+                        );
                     }
-                    total_received += bytes;
-                    println!(
-                        "Server received {} bytes (total: {})",
-                        bytes, total_received
-                    );
+
+                    assert!(total_received >= DATA_SIZE);
+                    println!("Server received all {} bytes", DATA_SIZE);
+                });
+
+                // Client
+                let stream = TcpStream::connect(listen_addr)
+                    .await
+                    .expect("Failed to connect");
+
+                let mut total_sent = 0;
+                while total_sent < DATA_SIZE {
+                    let chunk_size = std::cmp::min(CHUNK_SIZE, DATA_SIZE - total_sent);
+
+                    let mut buf = alloc_buf(size);
+
+                    for i in 0..chunk_size {
+                        buf.spare_capacity_mut()[i] = (i % 256) as u8;
+                    }
+
+                    let (result, _buf) = stream.send(buf).await;
+                    let bytes = result.expect("Send failed") as usize;
+                    total_sent += bytes;
+                    println!("Client sent {} bytes (total: {})", bytes, total_sent);
                 }
 
-                assert!(total_received >= DATA_SIZE);
-                println!("Server received all {} bytes", DATA_SIZE);
+                assert!(total_sent >= DATA_SIZE);
+                println!("Client sent all {} bytes", total_sent);
+
+                server_h.await;
             });
-
-            // Client
-            let stream = TcpStream::connect(listen_addr)
-                .await
-                .expect("Failed to connect");
-
-            let mut total_sent = 0;
-            while total_sent < DATA_SIZE {
-                let chunk_size = std::cmp::min(CHUNK_SIZE, DATA_SIZE - total_sent);
-
-                let mut buf = alloc_buf(&pool, size);
-
-                for i in 0..chunk_size {
-                    buf.spare_capacity_mut()[i] = (i % 256) as u8;
-                }
-
-                let (result, _buf) = stream.send(buf).await;
-                let bytes = result.expect("Send failed") as usize;
-                total_sent += bytes;
-                println!("Client sent {} bytes (total: {})", bytes, total_sent);
-            }
-
-            assert!(total_sent >= DATA_SIZE);
-            println!("Client sent all {} bytes", total_sent);
-
-            server_h.await;
-        });
+        })
+        .join()
+        .unwrap()
     }
 }
 
 /// Test listener local_addr
 #[test]
 fn test_listener_local_addr() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(1),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
 
-    exec.block_on(async move {
+    runtime.block_on(async move {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
 
         let addr = listener.local_addr().expect("Failed to get local address");
@@ -303,14 +325,20 @@ fn test_listener_local_addr() {
 /// Test connection refused
 #[test]
 fn test_tcp_connect_refused() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(1),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
 
-    exec.block_on(async move {
+    runtime.block_on(async move {
         let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
 
         let result = TcpStream::connect(addr).await;
@@ -323,61 +351,74 @@ fn test_tcp_connect_refused() {
 /// Test receiving zero bytes (EOF)
 #[test]
 fn test_tcp_recv_zero_bytes() {
-    let backing_pool = HybridPool::new().unwrap();
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(backing_pool.clone(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
-    let pool = exec.pool();
-
     for size in [8192, 16384, 65536] {
-        let pool_clone = pool.clone();
-        exec.block_on(async move {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-            let listen_addr = listener.local_addr().expect("Failed to get local address");
+        std::thread::spawn(move || {
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(1),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-            let listener_rc = Rc::new(listener);
-            let listener_clone = listener_rc.clone();
-            // Server: accept and immediately close
-            let server_h = spawn_local(async move {
-                let (stream, _) = listener_clone.accept().await.expect("Accept failed");
-                println!("Server accepted and closing connection");
-                drop(stream);
+            runtime.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+                let listener_arc = Arc::new(listener);
+                let listener_clone = listener_arc.clone();
+                // Server: accept and immediately close
+                let server_h = crate::runtime::context::spawn(async move {
+                    let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+                    println!("Server accepted and closing connection");
+                    drop(stream);
+                });
+
+                // Client
+                let stream = TcpStream::connect(listen_addr)
+                    .await
+                    .expect("Failed to connect");
+
+                let buf = alloc_buf(size);
+                let (result, _buf) = stream.recv(buf).await;
+
+                if let Ok(bytes) = result {
+                    assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
+                    println!("Correctly received 0 bytes (EOF)");
+                } else {
+                    println!("Received error on closed connection: {:?}", result.err());
+                }
+
+                server_h.await;
             });
-
-            // Client
-            let stream = TcpStream::connect(listen_addr)
-                .await
-                .expect("Failed to connect");
-
-            let buf = alloc_buf(&pool_clone, size);
-            let (result, _buf) = stream.recv(buf).await;
-
-            if let Ok(bytes) = result {
-                assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
-                println!("Correctly received 0 bytes (EOF)");
-            } else {
-                println!("Received error on closed connection: {:?}", result.err());
-            }
-
-            server_h.await;
-        });
+        })
+        .join()
+        .unwrap();
     }
 }
 
 /// Test IPv6 connection
 #[test]
 fn test_tcp_ipv6() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        AnyBufPool::new(
-            RegisteredPool::new(HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(1),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
 
-    exec.block_on(async move {
+    runtime.block_on(async move {
         let listener_result = TcpListener::bind("::1:0");
 
         if listener_result.is_err() {
@@ -391,10 +432,10 @@ fn test_tcp_ipv6() {
         assert!(listen_addr.is_ipv6());
         println!("IPv6 listener bound to: {}", listen_addr);
 
-        let listener_rc = Rc::new(listener);
-        let listener_clone = listener_rc.clone();
+        let listener_arc = Arc::new(listener);
+        let listener_clone = listener_arc.clone();
 
-        let server_h = spawn_local(async move {
+        let server_h = crate::runtime::context::spawn(async move {
             let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
             println!("Accepted IPv6 connection from: {}", peer);
             drop(stream);
@@ -442,22 +483,22 @@ fn test_multithread_tcp_connections() {
             let counter = connection_count_for_block.clone();
             let tx_done = tx.clone();
 
-            crate::runtime::context::spawn_to(worker_id, async move || {
+            crate::runtime::context::spawn(async move {
                 let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
                 let listen_addr = listener.local_addr().expect("Failed to get local address");
                 println!("Worker {} listening on {}", worker_id, listen_addr);
 
                 {
-                    let listener_rc = Rc::new(listener);
-                    let listener_clone = listener_rc.clone();
+                    let listener_arc = Arc::new(listener);
+                    let listener_clone = listener_arc.clone();
 
-                    // Spawn server task inside using spawn_local
-                    crate::spawn_local(async move {
+                    // Spawn server task using spawn instead of spawn_local
+                    crate::runtime::context::spawn(async move {
                         let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
                         println!("Worker {} accepted from {}", worker_id, peer);
                         drop(stream);
                     });
-                } // Rc is dropped here
+                } // Arc is dropped here
 
                 // Client connects to self
                 let stream = TcpStream::connect(listen_addr)
@@ -515,7 +556,7 @@ fn test_multithread_tcp_echo() {
                 addr_tx.send(listen_addr).unwrap();
 
                 // Accept and echo
-                let (stream, _) = Rc::new(listener).accept().await.expect("Accept failed");
+                let (stream, _) = Arc::new(listener).accept().await.expect("Accept failed");
                 let pool = crate::runtime::context::current_pool().unwrap(); // Get thread pool
 
                 let buf = pool.alloc(size).unwrap();
@@ -612,11 +653,11 @@ fn test_multithread_concurrent_clients() {
                 addr_tx.send(listen_addr).unwrap();
             }
 
-            let listener_rc = Rc::new(listener);
+            let listener_arc = Arc::new(listener);
 
             // Accept all connections
             for i in 0..NUM_CLIENTS {
-                let (stream, peer) = listener_rc.accept().await.expect("Accept failed");
+                let (stream, peer) = listener_arc.accept().await.expect("Accept failed");
                 println!("Server accepted connection {} from {}", i, peer);
                 drop(stream);
             }

@@ -302,6 +302,15 @@ impl LocalExecutor {
         false
     }
 
+    fn try_poll_future_injector(&self) -> bool {
+        if let Some(task) = self.shared.future_injector.pop() {
+            self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+            task.run();
+            return true;
+        }
+        false
+    }
+
     fn try_steal(&self, executed: usize) -> bool {
         if let Some(registry) = &self.registry {
             let workers = registry.all();
@@ -470,6 +479,11 @@ impl LocalExecutor {
                     continue;
                 }
 
+                if self.try_poll_future_injector() {
+                    executed += 1;
+                    continue;
+                }
+
                 // 4. Steal from Registry
                 if self.try_steal(executed) {
                     did_work = true;
@@ -566,6 +580,11 @@ impl LocalExecutor {
 
                 // 3. Poll Injector
                 if self.try_poll_injector() {
+                    continue;
+                }
+
+                if self.try_poll_future_injector() {
+                    executed += 1;
                     continue;
                 }
 

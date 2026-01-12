@@ -202,7 +202,24 @@ impl IocpDriver {
         }
 
         // Determine user_data from overlapped or completion_key
-        let user_data = if !overlapped.is_null() {
+        let user_data = if completion_key == RUN_CLOSURE_KEY {
+            // Execute closure
+            if !overlapped.is_null() {
+                let f = unsafe {
+                    Box::from_raw(overlapped as *mut Box<dyn FnOnce(&mut IocpDriver) + Send>)
+                };
+                f(self);
+            }
+            return Ok(());
+        } else if completion_key == RIO_EVENT_KEY {
+            // RIO event is triggered. Process RIO CQ.
+            if let Some(rio) = &mut self.rio_state {
+                return rio.process_completions(&mut self.ops, &self.extensions);
+            } else {
+                // Should not happen if RIO_EVENT_KEY triggered but state disappeared?
+                return Ok(());
+            }
+        } else if !overlapped.is_null() {
             let entry = unsafe { &*(overlapped as *const OverlappedEntry) };
             entry.user_data
         } else {
@@ -212,24 +229,6 @@ impl IocpDriver {
                     return Ok(());
                 }
                 return Err(io::Error::from_raw_os_error(err as i32));
-            }
-            if completion_key == RUN_CLOSURE_KEY {
-                // Execute closure
-                let f = unsafe {
-                    Box::from_raw(overlapped as *mut Box<dyn FnOnce(&mut IocpDriver) + Send>)
-                };
-                f(self);
-                return Ok(());
-            }
-
-            if completion_key == RIO_EVENT_KEY {
-                // RIO event is triggered. Process RIO CQ.
-                if let Some(rio) = &mut self.rio_state {
-                    return rio.process_completions(&mut self.ops, &self.extensions);
-                } else {
-                    // Should not happen if RIO_EVENT_KEY triggered but state disappeared?
-                    return Ok(());
-                }
             }
             completion_key
         };
@@ -257,8 +256,7 @@ impl IocpDriver {
                         let resources = op_entry.resources.take();
                         if let Some(iocp_op) = resources {
                             // Extract result
-                            let result = if bytes_transferred == 0 && unsafe { GetLastError() } != 0
-                            {
+                            let result = if res == 0 {
                                 Err(io::Error::last_os_error())
                             } else {
                                 Ok(bytes_transferred as usize)
@@ -293,12 +291,18 @@ impl IocpDriver {
                     result_is_ready = true;
                 } else {
                     // Normal IO completion
-                    let mut result = Ok(bytes_transferred as usize);
-                    // Use VTable on_complete if available
-                    if let Some(on_comp) = iocp_op.vtable.on_complete {
-                        result = unsafe {
-                            (on_comp)(iocp_op, bytes_transferred as usize, &self.extensions)
-                        };
+                    let mut result = if res == 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(bytes_transferred as usize)
+                    };
+
+                    if result.is_ok() {
+                        // Use VTable on_complete if available
+                        if let Some(on_comp) = iocp_op.vtable.on_complete {
+                            let val = result.unwrap();
+                            result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
+                        }
                     }
                     op.result = Some(result);
                     result_is_ready = true;

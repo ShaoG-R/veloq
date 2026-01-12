@@ -232,25 +232,21 @@ impl TcpStream {
             addr_len: raw_addr_len as u32,
         };
 
-        // Note: Connect is *initially* local to register the socket,
-        // but we need to capture the runtime context for the SharedSubmitter here.
-        let ctx = crate::runtime::context::current();
-        let driver_weak = ctx.driver();
-        let driver_rc = driver_weak
-            .upgrade()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Runtime driver dropped"))?;
-        let injector = driver_rc.borrow().injector();
+        let (owner_id, injector) = {
+            let ctx = crate::runtime::context::current();
+            let driver_weak = ctx.driver();
+            let driver_rc = driver_weak
+                .upgrade()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Runtime driver dropped"))?;
+            (ctx.handle.id, driver_rc.borrow().injector())
+        };
 
-        let future = Op::new(op).submit_local().into_thread_bound();
-        let (res, _op_back) = future.await;
+        let (res, _op_back) = Op::new(op).submit_auto(owner_id, &injector).await;
         res?;
 
         Ok(Self {
             inner,
-            submitter: SharedSubmitter {
-                owner_id: ctx.handle.id,
-                injector,
-            },
+            submitter: SharedSubmitter { owner_id, injector },
         })
     }
 }

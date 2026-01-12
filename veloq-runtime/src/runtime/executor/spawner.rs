@@ -54,6 +54,7 @@ pub(crate) struct ExecutorShared {
 
 impl harness::Schedule for ExecutorShared {
     fn schedule(&self, task: Runnable) {
+        self.injected_load.fetch_add(1, Ordering::Relaxed);
         self.future_injector.push(task);
         self.waker
             .wake()
