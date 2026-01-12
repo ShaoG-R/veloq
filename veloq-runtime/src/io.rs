@@ -44,7 +44,7 @@ pub struct RawHandle {
 
 #[cfg(unix)]
 impl std::ops::Deref for RawHandle {
-    type Target = usize;
+    type Target = std::os::fd::RawFd;
 
     fn deref(&self) -> &Self::Target {
         &self.fd
@@ -59,9 +59,23 @@ impl From<RawHandle> for std::os::fd::RawFd {
 }
 
 #[cfg(unix)]
-impl From<RawHandle> for i32 {
+impl From<i32> for RawHandle {
+    fn from(fd: i32) -> Self {
+        RawHandle { fd }
+    }
+}
+
+#[cfg(unix)]
+impl From<usize> for RawHandle {
+    fn from(handle: usize) -> Self {
+        RawHandle { fd: handle as i32 }
+    }
+}
+
+#[cfg(unix)]
+impl From<RawHandle> for usize {
     fn from(handle: RawHandle) -> Self {
-        handle.fd as i32
+        handle.fd as usize
     }
 }
 

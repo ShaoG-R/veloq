@@ -6,7 +6,7 @@ use std::os::unix::io::RawFd;
 use std::task::{Context, Poll};
 
 use crate::io::driver::{Injector, RemoteCompleter, RemoteWaker};
-use crossbeam::queue::SegQueue;
+use crossbeam_queue::SegQueue;
 use std::sync::Arc;
 
 pub mod op;
@@ -161,7 +161,7 @@ impl UringDriver {
 
         let fd = self.waker_fd;
         let op = crate::io::op::Wakeup {
-            fd: crate::io::op::IoFd::Raw(fd),
+            fd: crate::io::op::IoFd::Raw(crate::io::RawHandle { fd }),
         };
         // Use into_platform_op to convert to UringOp
         let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
@@ -643,7 +643,7 @@ impl Driver for UringDriver {
         &mut self,
         files: &[crate::io::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
-        let fds: Vec<i32> = files.to_vec();
+        let fds: Vec<i32> = files.iter().map(|h| h.fd).collect();
         self.ring.submitter().register_files(&fds)?;
 
         let mut fixed_fds = Vec::with_capacity(files.len());
@@ -672,11 +672,13 @@ impl Driver for UringDriver {
 
     fn inner_handle(&self) -> crate::io::RawHandle {
         use std::os::unix::io::AsRawFd;
-        self.ring.as_raw_fd()
+        crate::io::RawHandle {
+            fd: self.ring.as_raw_fd(),
+        }
     }
 
     fn notify_mesh(&mut self, handle: crate::io::RawHandle) -> io::Result<()> {
-        let fd = handle as i32;
+        let fd = handle.fd;
         // Send a MsgRing to the target ring. (Kernel 5.18+)
         // We set data to BACKGROUND_USER_DATA so the target treats it as a wake-up (and ignores the CQE).
         // We set our user_data to BACKGROUND_USER_DATA so we also ignore the completion of the MsgRing op itself.

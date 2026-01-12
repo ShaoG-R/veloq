@@ -107,7 +107,7 @@ impl OpenOptions {
         let (res, _) = Op::new(op).submit_local().await;
 
         // 3. 转换结果
-        let fd = crate::io::RawHandle { handle: res? as _ };
+        let fd = crate::io::RawHandle::from(res?);
         use crate::io::op::IoFd;
         let driver = crate::runtime::context::current().driver();
         Ok(super::file::File {

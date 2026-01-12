@@ -254,7 +254,7 @@ impl Drop for File {
             if let Some(fd) = self.fd.raw() {
                 #[cfg(unix)]
                 unsafe {
-                    libc::close(fd);
+                    libc::close(fd.fd);
                 }
                 #[cfg(windows)]
                 unsafe {
