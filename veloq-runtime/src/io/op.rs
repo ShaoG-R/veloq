@@ -123,7 +123,9 @@ impl<T> Op<T> {
             }
         });
 
-        let _ = injector.inject(closure);
+        if let Err(e) = injector.inject(closure) {
+            panic!("Remote injection failed: {}", e);
+        }
 
         RemoteOpFuture { rx }
     }

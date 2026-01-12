@@ -12,17 +12,16 @@ pub struct LocalJoinHandle<T> {
     state: Rc<RefCell<LocalJoinState<T>>>,
 }
 
-struct LocalJoinState<T> {
-    value: Option<T>,
-    waker: Option<Waker>,
+enum LocalJoinState<T> {
+    Pending(Option<Waker>),
+    Ready(T),
+    Aborted,
+    Consumed,
 }
 
 impl<T> LocalJoinHandle<T> {
     pub(crate) fn new() -> (Self, LocalJoinProducer<T>) {
-        let state = Rc::new(RefCell::new(LocalJoinState {
-            value: None,
-            waker: None,
-        }));
+        let state = Rc::new(RefCell::new(LocalJoinState::Pending(None)));
         (
             Self {
                 state: state.clone(),
@@ -37,11 +36,22 @@ impl<T> Future for LocalJoinHandle<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.state.borrow_mut();
-        if let Some(val) = state.value.take() {
-            Poll::Ready(val)
-        } else {
-            state.waker = Some(cx.waker().clone());
-            Poll::Pending
+        match &*state {
+            LocalJoinState::Pending(_) => {
+                *state = LocalJoinState::Pending(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+            LocalJoinState::Ready(_) => {
+                if let LocalJoinState::Ready(val) =
+                    std::mem::replace(&mut *state, LocalJoinState::Consumed)
+                {
+                    Poll::Ready(val)
+                } else {
+                    unreachable!()
+                }
+            }
+            LocalJoinState::Aborted => panic!("LocalJoinHandle: task failed"),
+            LocalJoinState::Consumed => panic!("LocalJoinHandle: polled after completion"),
         }
     }
 }
@@ -53,9 +63,25 @@ pub(crate) struct LocalJoinProducer<T> {
 impl<T> LocalJoinProducer<T> {
     pub(crate) fn set(self, value: T) {
         let mut state = self.state.borrow_mut();
-        state.value = Some(value);
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
+        if let LocalJoinState::Pending(waker) =
+            std::mem::replace(&mut *state, LocalJoinState::Ready(value))
+        {
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+    }
+}
+
+impl<T> Drop for LocalJoinProducer<T> {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        if let LocalJoinState::Pending(waker) = &*state {
+            let waker = waker.clone();
+            *state = LocalJoinState::Aborted;
+            if let Some(w) = waker {
+                w.wake();
+            }
         }
     }
 }
