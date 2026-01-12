@@ -176,7 +176,6 @@ impl RuntimeBuilder {
             stealable_workers.push(Some(worker));
 
             let shared = Arc::new(ExecutorShared {
-                injector: SegQueue::new(),
                 pinned: pinned_tx,
                 remote_queue: tx,
                 future_injector: SegQueue::new(),
@@ -333,12 +332,12 @@ impl Runtime {
         Spawner::new(self.registry.clone())
     }
 
-    pub fn spawn<F, Output>(&self, async_fn: F) -> crate::runtime::join::JoinHandle<Output>
+    pub fn spawn<F, Output>(&self, future: F) -> crate::runtime::join::JoinHandle<Output>
     where
-        F: AsyncFnOnce() -> Output + Send + 'static,
+        F: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
     {
-        self.spawner().spawn(async_fn)
+        self.spawner().spawn(future)
     }
 
     /// Block on a future using a local executor on the current thread,

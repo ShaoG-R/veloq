@@ -110,66 +110,6 @@ impl RuntimeContext {
         self.buf_pool.clone()
     }
 
-    /// Spawn a new task on the current executor using a balanced strategy (P2C).
-    ///
-    /// This will try to distribute the task to a less loaded worker using Power of Two Choices
-    /// or Mesh fabric if available.
-    ///
-    /// # Panics
-    /// Panics if the current executor does not have a global spawner.
-    pub fn spawn_balanced<F, Output>(&self, async_fn: F) -> JoinHandle<Output>
-    where
-        F: AsyncFnOnce() -> Output + Send + 'static,
-        Output: Send + 'static,
-    {
-        let spawner = self
-            .spawner
-            .as_ref()
-            .expect("spawn() called on a context without a global spawner");
-
-        let (handle, job) = pack_job(async_fn);
-
-        self.spawn_impl(job, spawner);
-        handle
-    }
-
-    /// Spawn a new task on the current executor.
-    ///
-    /// This method prioritizes putting the task into the current worker's public injector queue,
-    /// allowing it to be picked up by the current worker later or stolen by other workers.
-    ///
-    /// If the current context does not have a local executor handle (unlikely in normal operation),
-    /// it falls back to `spawn_balanced`.
-    pub fn spawn<F, Output>(&self, async_fn: F) -> JoinHandle<Output>
-    where
-        F: AsyncFnOnce() -> Output + Send + 'static,
-        Output: Send + 'static,
-    {
-        let (join_handle, job) = pack_job(async_fn);
-
-        self.handle.shared.injector.push(job);
-        self.handle
-            .shared
-            .injected_load
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // We are running on this thread, so no need to wake.
-        join_handle
-    }
-
-    fn spawn_impl(&self, job: crate::runtime::executor::Job, spawner: &Spawner) {
-        if let Some(mesh_weak) = &self.mesh
-            && let Some(mesh_rc) = mesh_weak.upgrade()
-            && let Some(driver_rc) = self.driver.upgrade()
-        {
-            spawner.spawn_with_mesh(job, &mesh_rc, &driver_rc);
-            return;
-        }
-
-        // Default Fallback
-        spawner.spawn_job(job);
-    }
-
     /// Spawn a new local task on the current executor.
     ///
     /// Local tasks are not Send and are guaranteed to run on the current thread.
@@ -261,7 +201,7 @@ impl RuntimeContext {
     ///
     /// # Panics
     /// Panics if called outside of a runtime context.
-    pub fn spawn_future<F, Output>(&self, future: F) -> JoinHandle<Output>
+    pub fn spawn<F, Output>(&self, future: F) -> JoinHandle<Output>
     where
         F: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
@@ -330,12 +270,12 @@ pub fn current_pool() -> Option<AnyBufPool> {
 ///
 /// Panics if called outside of a runtime context, or if the current runtime does not support
 /// global spawning (missing executor registry).
-pub fn spawn<F, Output>(async_fn: F) -> JoinHandle<Output>
+pub fn spawn<F, Output>(future: F) -> JoinHandle<Output>
 where
-    F: AsyncFnOnce() -> Output + Send + 'static,
+    F: Future<Output = Output> + Send + 'static,
     Output: Send + 'static,
 {
-    current().spawn(async_fn)
+    current().spawn(future)
 }
 
 /// Spawns a `!Send` future on the current thread.
@@ -365,12 +305,4 @@ where
     Output: Send + 'static,
 {
     current().spawn_to(worker_id, async_fn)
-}
-
-pub fn spawn_future<F, Output>(future: F) -> JoinHandle<Output>
-where
-    F: Future<Output = Output> + Send + 'static,
-    Output: Send + 'static,
-{
-    current().spawn_future(future)
 }

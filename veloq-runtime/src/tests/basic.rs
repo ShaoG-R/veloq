@@ -110,7 +110,7 @@ fn test_runtime_global_spawn() {
     // Block on main thread
     runtime.block_on(async move {
         // Spawn a task globally from the main thread
-        let handle = crate::runtime::context::spawn(|| async move { 42 });
+        let handle = crate::runtime::context::spawn(async move { 42 });
         let res = handle.await;
         tx.send(res).unwrap();
     });
@@ -132,7 +132,7 @@ fn test_spawn_from_any_thread() {
 
     runtime.block_on(async move {
         // Current context (Main) -> spawn -> (Worker 0/1)
-        let handle = crate::runtime::context::spawn(|| async move {
+        let handle = crate::runtime::context::spawn(async move {
             // Inside Worker
             "hello from worker"
         });
@@ -162,7 +162,7 @@ fn test_mixed_spawn_in_worker() {
         let local_handle = crate::runtime::context::spawn_local(async move { *rc_clone * 2 });
 
         // 2. spawn (Send) - goes to Worker
-        let global_handle = crate::runtime::context::spawn(|| async move { 20 });
+        let global_handle = crate::runtime::context::spawn(async move { 20 });
 
         let v1 = local_handle.await;
         let v2 = global_handle.await;
@@ -190,7 +190,7 @@ fn test_multi_worker_throughput() {
     // Spawn 50 global tasks
     for _ in 0..50 {
         let c = counter.clone();
-        runtime.spawn(|| async move {
+        runtime.spawn(async move {
             c.fetch_add(1, Ordering::SeqCst);
         });
     }

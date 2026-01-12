@@ -38,7 +38,6 @@ where
 
 // --- Shared State ---
 pub(crate) struct ExecutorShared {
-    pub(crate) injector: SegQueue<Job>,
     pub(crate) pinned: std::sync::mpsc::Sender<Job>,
     pub(crate) remote_queue: std::sync::mpsc::Sender<Task>,
 
@@ -56,10 +55,6 @@ pub(crate) struct ExecutorShared {
 impl harness::Schedule for ExecutorShared {
     fn schedule(&self, task: Runnable) {
         self.future_injector.push(task);
-        // We track load for stealable tasks separately or combined?
-        // For now, let's treat them as injected load for simplicity, or we might need a separate counter.
-        // Using injected_load is fine as it represents "tasks waiting to be run".
-        self.injected_load.fetch_add(1, Ordering::Relaxed);
         self.waker
             .wake()
             .expect("Failed to wake executor via scheduler");
@@ -159,12 +154,6 @@ pub struct ExecutorHandle {
 }
 
 impl ExecutorHandle {
-    pub(crate) fn schedule(&self, job: Job) {
-        self.shared.injector.push(job);
-        self.shared.injected_load.fetch_add(1, Ordering::Relaxed);
-        self.shared.waker.wake().expect("Failed to wake executor");
-    }
-
     pub(crate) fn schedule_pinned(&self, job: Job) {
         // We ignore the error here because if the receiver is dropped,
         // the worker is dead and thus strictly speaking "not available".
@@ -227,16 +216,6 @@ impl Spawner {
         }
     }
 
-    pub fn spawn<F, Output>(&self, async_fn: F) -> crate::runtime::join::JoinHandle<Output>
-    where
-        F: AsyncFnOnce() -> Output + Send + 'static,
-        Output: Send + 'static,
-    {
-        let (handle, job) = pack_job(async_fn);
-        self.spawn_job(job);
-        handle
-    }
-
     fn select_worker(&self) -> ExecutorHandle {
         let workers = self.registry.all();
 
@@ -246,7 +225,7 @@ impl Spawner {
         }
     }
 
-    pub fn spawn_future<F, Output>(&self, future: F) -> crate::runtime::join::JoinHandle<Output>
+    pub fn spawn<F, Output>(&self, future: F) -> crate::runtime::join::JoinHandle<Output>
     where
         F: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
@@ -262,36 +241,6 @@ impl Spawner {
             target.shared.schedule(job);
             handle
         }
-    }
-
-    pub(crate) fn spawn_job(&self, job: Job) {
-        self.select_worker().schedule(job);
-    }
-
-    pub(crate) fn spawn_with_mesh(
-        &self,
-        job: Job,
-        mesh: &RefCell<MeshContext>,
-        driver: &RefCell<crate::io::driver::PlatformDriver>,
-    ) {
-        let target = self.select_worker();
-
-        // Try mesh first if target has ID
-        if target.id() != usize::MAX {
-            let mut mesh = mesh.borrow_mut();
-            let mut driver = driver.borrow_mut();
-
-            if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
-                // Fallback on full/error -> inject
-                drop(mesh);
-                drop(driver);
-                target.schedule(returned_job);
-            }
-            return;
-        }
-
-        // No valid ID (unlikely for registered worker) -> inject
-        target.schedule(job);
     }
 
     fn p2c_select<'a>(&self, workers: &'a [ExecutorHandle]) -> Option<&'a ExecutorHandle> {

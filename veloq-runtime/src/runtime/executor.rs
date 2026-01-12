@@ -114,7 +114,6 @@ impl LocalExecutorBuilder {
             let state = Arc::new(AtomicU8::new(mesh::RUNNING));
 
             let shared = Arc::new(ExecutorShared {
-                injector: SegQueue::new(),
                 pinned: pinned_tx,
                 remote_queue: remote_tx,
                 future_injector: SegQueue::new(),
@@ -300,11 +299,6 @@ impl LocalExecutor {
             return true;
         }
 
-        if let Some(job) = self.shared.injector.pop() {
-            self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-            self.enqueue_job(job);
-            return true;
-        }
         false
     }
 
@@ -323,13 +317,6 @@ impl LocalExecutor {
 
                     if Arc::ptr_eq(&target.shared, &self.shared) {
                         continue;
-                    }
-
-                    // Steal from injector (Job)
-                    if let Some(job) = target.shared.injector.pop() {
-                        target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-                        self.enqueue_job(job);
-                        return true;
                     }
 
                     // Steal from future_injector (Runnable)
@@ -388,7 +375,6 @@ impl LocalExecutor {
             if can_park {
                 if !self.pinned_receiver.try_recv().is_err()
                     || !self.remote_receiver.try_recv().is_err()
-                    || !self.shared.injector.is_empty()
                     || !self.shared.future_injector.is_empty()
                     || !self.stealable.is_empty()
                 {
@@ -551,7 +537,15 @@ impl LocalExecutor {
                     did_work = true;
                 }
 
-                // 1. Poll Main Future
+                // 1. Poll Stealable (Send Tasks - LIFO)
+                if let Some(task) = self.stealable.pop() {
+                    self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                    task.run();
+                    executed += 1;
+                    continue;
+                }
+
+                // 2. Poll Main Future
                 if state.flag.swap(false, Ordering::AcqRel) {
                     did_work = true;
                     executed += 1;
