@@ -1,7 +1,4 @@
-use crate::io::{
-    buffer::BufPool,
-    op::{Op, Open},
-};
+use crate::io::{buffer::BufPool, op::Open};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,17 +104,19 @@ impl OpenOptions {
         let op = self.build_op(path.as_ref(), &pool).await?;
 
         // 2. 提交给 runtime (local)
-        let (res, _) = Op::new(op).submit_local().await;
+        use crate::io::op::{LocalSubmitter, Op, OpSubmitter};
+        let submitter = LocalSubmitter;
+        let (res, _) = submitter.submit(Op::new(op)).await;
 
         // 3. 转换结果
         let fd = crate::io::RawHandle::from(res?);
         use super::file::InnerFile;
-        use crate::io::op::LocalSubmitter;
+        use std::cell::Cell;
 
         Ok(super::file::LocalFile {
             inner: InnerFile(fd),
-            submitter: LocalSubmitter,
-            pos: std::cell::RefCell::new(0),
+            submitter,
+            pos: Cell::new(0),
         })
     }
 
@@ -130,29 +129,22 @@ impl OpenOptions {
         let op = self.build_op(path.as_ref(), &pool).await?;
 
         // 2. 初始 open 必须依然在本地提交 (register handle)
-        // 但返回的文件对象将持有 SharedSubmitter
-        let (res, _) = Op::new(op).submit_local().await;
+        // 但返回的文件对象将持有 RemoteSubmitter
+        use crate::io::op::{LocalSubmitter, Op, OpSubmitter};
+        let (res, _) = LocalSubmitter.submit(Op::new(op)).await;
         let fd = crate::io::RawHandle::from(res?);
 
-        // 3. 构建 SharedSubmitter
-        let ctx = crate::runtime::context::current();
-        let driver_weak = ctx.driver();
-        let driver_rc = driver_weak.upgrade().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Runtime driver dropped")
-        })?;
-        let injector = driver_rc.borrow().injector();
-
+        // 3. 构建 RemoteSubmitter
         use super::file::InnerFile;
-        use crate::io::driver::Driver;
-        use crate::io::op::SharedSubmitter;
+        use crate::io::op::RemoteSubmitter;
+        use std::sync::atomic::AtomicU64;
+
+        let submitter = RemoteSubmitter::new()?;
 
         Ok(super::file::File {
             inner: InnerFile(fd),
-            submitter: SharedSubmitter {
-                owner_id: ctx.handle.id,
-                injector,
-            },
-            pos: std::cell::RefCell::new(0),
+            submitter,
+            pos: AtomicU64::new(0),
         })
     }
 

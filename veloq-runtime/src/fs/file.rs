@@ -1,16 +1,17 @@
-use super::open_options::OpenOptions; // Use generic OpenOptions
+use super::open_options::OpenOptions;
 use crate::io::RawHandle;
 use crate::io::buffer::FixedBuf;
 use crate::io::op::{
-    Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, SharedSubmitter,
+    Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RemoteSubmitter,
     SyncFileRange, WriteFixed,
 };
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -41,27 +42,68 @@ impl Drop for InnerFile {
 }
 
 // ============================================================================
+// File Position Trait
+// ============================================================================
+
+pub trait FilePos: Send + 'static {
+    fn new(v: u64) -> Self;
+    fn get(&self) -> u64;
+    fn set(&self, v: u64);
+    fn add(&self, v: u64);
+}
+
+impl FilePos for Cell<u64> {
+    fn new(v: u64) -> Self {
+        Cell::new(v)
+    }
+    fn get(&self) -> u64 {
+        self.get()
+    }
+    fn set(&self, v: u64) {
+        self.set(v)
+    }
+    fn add(&self, v: u64) {
+        self.set(self.get() + v)
+    }
+}
+
+impl FilePos for AtomicU64 {
+    fn new(v: u64) -> Self {
+        AtomicU64::new(v)
+    }
+    fn get(&self) -> u64 {
+        self.load(Ordering::Relaxed)
+    }
+    fn set(&self, v: u64) {
+        self.store(v, Ordering::Relaxed)
+    }
+    fn add(&self, v: u64) {
+        self.fetch_add(v, Ordering::Relaxed);
+    }
+}
+
+// ============================================================================
 // Generic File Components
 // ============================================================================
 
-pub struct GenericFile<S: OpSubmitter> {
+pub struct GenericFile<S: OpSubmitter, P: FilePos> {
     pub(crate) inner: InnerFile,
     pub(crate) submitter: S,
-    pub(crate) pos: RefCell<u64>,
+    pub(crate) pos: P,
 }
 
-pub type LocalFile = GenericFile<LocalSubmitter>;
-pub type File = GenericFile<SharedSubmitter>;
+pub type LocalFile = GenericFile<LocalSubmitter, Cell<u64>>;
+pub type File = GenericFile<RemoteSubmitter, AtomicU64>;
 
-pub struct SyncRangeBuilder<'a, S: OpSubmitter> {
-    file: &'a GenericFile<S>,
+pub struct SyncRangeBuilder<'a, S: OpSubmitter, P: FilePos> {
+    file: &'a GenericFile<S, P>,
     offset: u64,
     nbytes: u64,
     flags: u32,
 }
 
-impl<'a, S: OpSubmitter> SyncRangeBuilder<'a, S> {
-    fn new(file: &'a GenericFile<S>, offset: u64, nbytes: u64) -> Self {
+impl<'a, S: OpSubmitter, P: FilePos> SyncRangeBuilder<'a, S, P> {
+    fn new(file: &'a GenericFile<S, P>, offset: u64, nbytes: u64) -> Self {
         #[cfg(unix)]
         let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
             | libc::SYNC_FILE_RANGE_WRITE
@@ -114,8 +156,9 @@ impl<'a, S: OpSubmitter> SyncRangeBuilder<'a, S> {
     }
 }
 
-impl<'a, S: OpSubmitter> IntoFuture for SyncRangeBuilder<'a, S> {
+impl<'a, S: OpSubmitter, P: FilePos> IntoFuture for SyncRangeBuilder<'a, S, P> {
     type Output = io::Result<()>;
+    // Note: We don't enforce Send here because LocalFile (using Cell) isn't Sync, so &LocalFile isn't Send.
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -134,17 +177,17 @@ impl<'a, S: OpSubmitter> IntoFuture for SyncRangeBuilder<'a, S> {
     }
 }
 
-impl<S: OpSubmitter> GenericFile<S> {
+impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
 
     pub fn seek(&self, pos: u64) {
-        *self.pos.borrow_mut() = pos;
+        self.pos.set(pos);
     }
 
     pub fn stream_position(&self) -> u64 {
-        *self.pos.borrow()
+        self.pos.get()
     }
 
     pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
@@ -195,7 +238,7 @@ impl<S: OpSubmitter> GenericFile<S> {
     ///
     /// Returns a specific Future (Builder) that allows configuring flags.
     /// Usage: `file.sync_range(0, 100).wait_before(false).write(true).await`
-    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, S> {
+    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, S, P> {
         SyncRangeBuilder::new(self, offset, nbytes)
     }
 
@@ -212,23 +255,23 @@ impl<S: OpSubmitter> GenericFile<S> {
     }
 }
 
-impl<S: OpSubmitter> crate::io::AsyncBufRead for GenericFile<S> {
+impl<S: OpSubmitter, P: FilePos> crate::io::AsyncBufRead for GenericFile<S, P> {
     async fn read(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let offset = *self.pos.borrow();
+        let offset = self.pos.get();
         let (res, buf) = self.read_at(buf, offset).await;
         if let Ok(n) = res {
-            *self.pos.borrow_mut() += n as u64;
+            self.pos.add(n as u64);
         }
         (res, buf)
     }
 }
 
-impl<S: OpSubmitter> crate::io::AsyncBufWrite for GenericFile<S> {
+impl<S: OpSubmitter, P: FilePos> crate::io::AsyncBufWrite for GenericFile<S, P> {
     async fn write(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let offset = *self.pos.borrow();
+        let offset = self.pos.get();
         let (res, buf) = self.write_at(buf, offset).await;
         if let Ok(n) = res {
-            *self.pos.borrow_mut() += n as u64;
+            self.pos.add(n as u64);
         }
         (res, buf)
     }

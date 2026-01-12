@@ -9,7 +9,6 @@
 
 use std::{
     future::Future,
-    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -171,33 +170,11 @@ impl<T> Future for RemoteOpFuture<T> {
 impl<T> Op<T> {
     /// Submit this operation to a local IO driver.
     /// Returns a `LocalOp` future that resolves when the operation completes.
-    pub fn submit_local(self) -> LocalOp<T>
+    pub fn submit_local(self, driver: std::rc::Rc<std::cell::RefCell<PlatformDriver>>) -> LocalOp<T>
     where
         T: IntoPlatformOp<PlatformDriver> + 'static,
     {
-        LocalOp::new(self.data)
-    }
-
-    /// Submit the operation automatically to either the local driver or a remote driver
-    /// based on the current runtime context and the object's owner ID.
-    pub async fn submit_auto(
-        self,
-        owner_id: usize,
-        injector: &std::sync::Arc<<PlatformDriver as Driver>::RemoteInjector>,
-    ) -> (std::io::Result<usize>, T)
-    where
-        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
-    {
-        let is_local = {
-            let ctx = crate::runtime::context::current();
-            ctx.handle.id == owner_id
-        };
-
-        if is_local {
-            self.submit_local().into_thread_bound().await
-        } else {
-            self.submit_remote::<PlatformDriver>(injector).await
-        }
+        LocalOp::new(self.data, driver)
     }
 }
 
@@ -220,64 +197,19 @@ enum State {
 pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
+    driver: std::rc::Rc<std::cell::RefCell<PlatformDriver>>,
     user_data: usize,
-    _marker: PhantomData<std::rc::Rc<T>>,
 }
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
     /// Create a new local operation future.
-    pub fn new(data: T) -> Self {
+    pub fn new(data: T, driver: std::rc::Rc<std::cell::RefCell<PlatformDriver>>) -> Self {
         Self {
             state: State::Defined,
             data: Some(data),
+            driver,
             user_data: 0,
-            _marker: Default::default(),
         }
-    }
-
-    /// Wraps this LocalOp to be `Send`, allowing it to be used in futures that require `Send`.
-    ///
-    /// # Panics
-    ///
-    /// The returned future MUST be polled on the same thread where this method is called.
-    /// Polling it on a different thread will cause a panic.
-    pub fn into_thread_bound(self) -> ThreadBoundOp<T> {
-        ThreadBoundOp {
-            inner: self,
-            origin_id: crate::runtime::context::current().handle.id(),
-        }
-    }
-}
-
-/// A wrapper that mechanically implements `Send` for `LocalOp`,
-/// but dynamically enforces thread-affinity at runtime.
-///
-/// This allows `LocalOp` to be used in `alloc::Box::pin` or `spawn_future` which requires `Send`,
-/// while ensuring safety by panicking if moved to another thread.
-pub struct ThreadBoundOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
-    inner: LocalOp<T>,
-    origin_id: usize,
-}
-
-// SAFETY: We enforce thread-affinity via runtime checks in poll().
-unsafe impl<T: IntoPlatformOp<PlatformDriver>> std::marker::Send for ThreadBoundOp<T> {}
-
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for ThreadBoundOp<T> {
-    type Output = (std::io::Result<usize>, T);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Runtime safety check
-        if !crate::runtime::context::is_current_worker(self.origin_id) {
-            panic!("ThreadBoundOp polled on a different thread! This is unsafe for LocalOp.");
-        }
-
-        // SAFETY: We are just polling the inner field, structure is pinned projected.
-        // LocalOp does not have Unpin fields that need special handling here?
-        // LocalOp is Unpin as long as T is Unpin (which it is).
-        // Actually, we can just use map_unchecked_mut logic or simple matching since field is private.
-        // Or simpler:
-        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
-        inner.poll(cx)
     }
 }
 
@@ -289,9 +221,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 
         match op.state {
             State::Defined => {
-                let ctx = crate::runtime::context::current();
-                let driver_rc = ctx.driver().upgrade().expect("Driver has been dropped");
-                let mut driver = driver_rc.borrow_mut();
+                let mut driver = op.driver.borrow_mut();
 
                 // Submit to driver
                 let data = op.data.take().expect("Op started without data");
@@ -323,9 +253,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 }
             }
             State::Submitted => {
-                let ctx = crate::runtime::context::current();
-                let driver_rc = ctx.driver().upgrade().expect("Driver has been dropped");
-                let mut driver = driver_rc.borrow_mut();
+                let mut driver = op.driver.borrow_mut();
 
                 match driver.poll_op(op.user_data, cx) {
                     Poll::Ready((res, driver_op)) => {
@@ -345,57 +273,87 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
-            // Try to get current driver to cancel
-            if let Some(ctx) = crate::runtime::context::try_current() {
-                if let Some(driver_rc) = ctx.driver().upgrade() {
-                    driver_rc.borrow_mut().cancel_op(self.user_data);
-                }
-            }
+            self.driver.borrow_mut().cancel_op(self.user_data);
         }
     }
 }
 
 // ============================================================================
-// Op Submission Strategy
+// OpSubmitter Trait
 // ============================================================================
 
-/// Trait to abstract the strategy for submitting operations to the driver.
 pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
-    fn submit<T>(
-        &self,
-        op: Op<T>,
-    ) -> impl Future<Output = (std::io::Result<usize>, T)> + std::marker::Send
+    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static>: Future<
+        Output = (std::io::Result<usize>, T),
+    >;
+
+    fn submit<T>(&self, op: Op<T>) -> Self::Future<T>
     where
         T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static;
+
+    fn from_current_context() -> std::io::Result<Self>;
 }
 
-/// Strategy for purely local operations (thread-bound, high-performance).
+// ============================================================================
+// LocalSubmitter
+// ============================================================================
+
 #[derive(Clone, Copy)]
 pub struct LocalSubmitter;
 
 impl OpSubmitter for LocalSubmitter {
-    async fn submit<T>(&self, op: Op<T>) -> (std::io::Result<usize>, T)
+    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> = LocalOp<T>;
+
+    fn submit<T>(&self, op: Op<T>) -> Self::Future<T>
     where
         T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
     {
-        op.submit_local().into_thread_bound().await
+        let driver = crate::runtime::context::current()
+            .driver()
+            .upgrade()
+            .expect("Driver dropped");
+        op.submit_local(driver)
+    }
+
+    fn from_current_context() -> std::io::Result<Self> {
+        Ok(Self)
     }
 }
 
-/// Strategy for shared operations (Send + Sync, smart routing).
+// ============================================================================
+// RemoteSubmitter
+// ============================================================================
+
 #[derive(Clone)]
-pub struct SharedSubmitter {
-    pub owner_id: usize,
-    pub injector: std::sync::Arc<<PlatformDriver as Driver>::RemoteInjector>,
+pub struct RemoteSubmitter {
+    injector: std::sync::Arc<<PlatformDriver as Driver>::RemoteInjector>,
 }
 
-impl OpSubmitter for SharedSubmitter {
-    async fn submit<T>(&self, op: Op<T>) -> (std::io::Result<usize>, T)
+impl RemoteSubmitter {
+    pub fn new() -> std::io::Result<Self> {
+        let ctx = crate::runtime::context::current();
+        let driver_weak = ctx.driver();
+        let driver_rc = driver_weak.upgrade().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Runtime driver dropped")
+        })?;
+        let injector = driver_rc.borrow().injector();
+        Ok(Self { injector })
+    }
+}
+
+impl OpSubmitter for RemoteSubmitter {
+    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> =
+        RemoteOpFuture<T>;
+
+    fn submit<T>(&self, op: Op<T>) -> Self::Future<T>
     where
         T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
     {
-        // Uses the smart routing logic implemented in generic Op::submit_auto
-        op.submit_auto(self.owner_id, &self.injector).await
+        op.submit_remote::<PlatformDriver>(&self.injector)
+    }
+
+    fn from_current_context() -> std::io::Result<Self> {
+        Self::new()
     }
 }
 
