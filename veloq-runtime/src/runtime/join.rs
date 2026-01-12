@@ -95,6 +95,7 @@ pub struct JoinHandle<T> {
 const IDLE: u8 = 0;
 const WAITING: u8 = 1;
 const READY: u8 = 2;
+const ABORTED: u8 = 3;
 
 struct JoinState<T> {
     state: AtomicU8,
@@ -137,9 +138,10 @@ impl<T> Future for JoinHandle<T> {
                 if let Some(v) = val {
                     return Poll::Ready(v);
                 } else {
-                    // Task already consumed or empty. Mimics original behavior of hanging/pending.
-                    return Poll::Pending;
+                    panic!("JoinHandle: polled after completion");
                 }
+            } else if current == ABORTED {
+                panic!("JoinHandle: task failed");
             }
 
             // If we are currently WAITING, try to reset to IDLE to update the waker.
@@ -150,7 +152,7 @@ impl<T> Future for JoinHandle<T> {
                     .compare_exchange(WAITING, IDLE, Ordering::Acquire, Ordering::Relaxed)
                     .is_err()
                 {
-                    // State changed (likely to READY), retry loop
+                    // State changed (likely to READY or ABORTED), retry loop
                     continue;
                 }
             }
@@ -164,7 +166,7 @@ impl<T> Future for JoinHandle<T> {
             }
 
             // Publish our waiting state.
-            // We use compare_exchange because Producer might have transitioned IDLE -> READY while we were working.
+            // We use compare_exchange because Producer might have transitioned IDLE -> READY/ABORTED while we were working.
             if state
                 .state
                 .compare_exchange(IDLE, WAITING, Ordering::Release, Ordering::Relaxed)
@@ -173,7 +175,7 @@ impl<T> Future for JoinHandle<T> {
                 return Poll::Pending;
             }
 
-            // If CAS failed, state must have changed to READY. Loop will handle it.
+            // If CAS failed, state must have changed to READY/ABORTED. Loop will handle it.
         }
     }
 }
@@ -198,6 +200,26 @@ impl<T> JoinProducer<T> {
             // Consumer was waiting, wake them up.
             // SAFETY: We observed WAITING, so Consumer has finished writing waker.
             // We transitioned to READY, so Consumer will not touch waker again until they see READY.
+            let waker = unsafe { (*state.waker.get()).take() };
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+
+        // Prevent Drop from running to avoid double-state-change logic (though set consumes self so Drop not called on it)
+        // However, we must ensure we don't accidentally fall into Drop if we are using ManuallyDrop or something later.
+        // Currently self is consumed, so Drop is NOT called. Correct.
+    }
+}
+
+impl<T> Drop for JoinProducer<T> {
+    fn drop(&mut self) {
+        // If we drop, it means we didn't call set(). The task likely panicked.
+        let state = &self.state;
+
+        let old_state = state.state.swap(ABORTED, Ordering::AcqRel);
+
+        if old_state == WAITING {
             let waker = unsafe { (*state.waker.get()).take() };
             if let Some(w) = waker {
                 w.wake();
