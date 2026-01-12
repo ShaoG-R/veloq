@@ -1,5 +1,6 @@
 pub mod mpmc;
 pub mod mpsc;
+pub mod oneshot;
 pub(crate) mod shim;
 
 use std::fmt;
