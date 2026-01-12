@@ -38,7 +38,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install nextest
-        uses: taiki-e/install-action@ne xtest
+        uses: taiki-e/install-action@nextest
 
       - name: Cache cargo registry
         uses: actions/cache@v4
