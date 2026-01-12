@@ -64,6 +64,12 @@ pub trait OpLifecycle: Sized {
 
     /// Convert the completed operation result to the final output type.
     fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output>;
+
+    /// Helper: Pre-allocate and construct the operation in one step.
+    fn prepare_op(fd: RawHandle) -> std::io::Result<Self> {
+        let pre = Self::pre_alloc(fd)?;
+        Ok(Self::into_op(fd, pre))
+    }
 }
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
@@ -167,13 +173,33 @@ impl<T> Future for RemoteOpFuture<T> {
 impl<T> Op<T> {
     /// Submit this operation to a local IO driver.
     /// Returns a `LocalOp` future that resolves when the operation completes.
-    /// Submit this operation to a local IO driver.
-    /// Returns a `LocalOp` future that resolves when the operation completes.
     pub fn submit_local(self) -> LocalOp<T>
     where
         T: IntoPlatformOp<PlatformDriver> + 'static,
     {
         LocalOp::new(self.data)
+    }
+
+    /// Submit the operation automatically to either the local driver or a remote driver
+    /// based on the current runtime context and the object's owner ID.
+    pub async fn submit_auto(
+        self,
+        owner_id: usize,
+        injector: &std::sync::Arc<<PlatformDriver as Driver>::RemoteInjector>,
+    ) -> (std::io::Result<usize>, T)
+    where
+        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
+    {
+        let is_local = {
+            let ctx = crate::runtime::context::current();
+            ctx.handle.id == owner_id
+        };
+
+        if is_local {
+            self.submit_local().into_thread_bound().await
+        } else {
+            self.submit_remote::<PlatformDriver>(injector).await
+        }
     }
 }
 
@@ -328,6 +354,50 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Op Submission Strategy
+// ============================================================================
+
+/// Trait to abstract the strategy for submitting operations to the driver.
+pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
+    fn submit<T>(
+        &self,
+        op: Op<T>,
+    ) -> impl Future<Output = (std::io::Result<usize>, T)> + std::marker::Send
+    where
+        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static;
+}
+
+/// Strategy for purely local operations (thread-bound, high-performance).
+#[derive(Clone, Copy)]
+pub struct LocalSubmitter;
+
+impl OpSubmitter for LocalSubmitter {
+    async fn submit<T>(&self, op: Op<T>) -> (std::io::Result<usize>, T)
+    where
+        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
+    {
+        op.submit_local().into_thread_bound().await
+    }
+}
+
+/// Strategy for shared operations (Send + Sync, smart routing).
+#[derive(Clone)]
+pub struct SharedSubmitter {
+    pub owner_id: usize,
+    pub injector: std::sync::Arc<<PlatformDriver as Driver>::RemoteInjector>,
+}
+
+impl OpSubmitter for SharedSubmitter {
+    async fn submit<T>(&self, op: Op<T>) -> (std::io::Result<usize>, T)
+    where
+        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
+    {
+        // Uses the smart routing logic implemented in generic Op::submit_auto
+        op.submit_auto(self.owner_id, &self.injector).await
     }
 }
 

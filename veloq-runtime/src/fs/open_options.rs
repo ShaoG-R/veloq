@@ -95,24 +95,63 @@ impl OpenOptions {
         self
     }
 
-    /// 对外的公共 API：清晰、线性、无平台噪音
-    pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
+    /// Open the file with local thread binding (optimized, non-Send/Sync).
+    pub async fn open_local(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<super::file::LocalFile> {
         let pool = crate::runtime::context::current_pool()
             .ok_or_else(|| std::io::Error::other("No buffer pool bound to current thread"))?;
 
         // 1. 根据不同平台生成对应的 Op 参数
         let op = self.build_op(path.as_ref(), &pool).await?;
 
-        // 2. 提交给 runtime (隐式获取 driver)
+        // 2. 提交给 runtime (local)
         let (res, _) = Op::new(op).submit_local().await;
 
         // 3. 转换结果
         let fd = crate::io::RawHandle::from(res?);
-        use crate::io::op::IoFd;
-        let driver = crate::runtime::context::current().driver();
+        use super::file::InnerFile;
+        use crate::io::op::LocalSubmitter;
+
+        Ok(super::file::LocalFile {
+            inner: InnerFile(fd),
+            submitter: LocalSubmitter,
+            pos: std::cell::RefCell::new(0),
+        })
+    }
+
+    /// Open the file with shared submission support (Send, capable of being offloaded).
+    pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
+        let pool = crate::runtime::context::current_pool()
+            .ok_or_else(|| std::io::Error::other("No buffer pool bound to current thread"))?;
+
+        // 1. 构造 Op
+        let op = self.build_op(path.as_ref(), &pool).await?;
+
+        // 2. 初始 open 必须依然在本地提交 (register handle)
+        // 但返回的文件对象将持有 SharedSubmitter
+        let (res, _) = Op::new(op).submit_local().await;
+        let fd = crate::io::RawHandle::from(res?);
+
+        // 3. 构建 SharedSubmitter
+        let ctx = crate::runtime::context::current();
+        let driver_weak = ctx.driver();
+        let driver_rc = driver_weak.upgrade().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Runtime driver dropped")
+        })?;
+        let injector = driver_rc.borrow().injector();
+
+        use super::file::InnerFile;
+        use crate::io::driver::Driver;
+        use crate::io::op::SharedSubmitter;
+
         Ok(super::file::File {
-            fd: IoFd::Raw(fd),
-            driver,
+            inner: InnerFile(fd),
+            submitter: SharedSubmitter {
+                owner_id: ctx.handle.id,
+                injector,
+            },
             pos: std::cell::RefCell::new(0),
         })
     }

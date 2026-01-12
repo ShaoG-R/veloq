@@ -1,25 +1,36 @@
 use crate::io::RawHandle;
 use crate::io::buffer::FixedBuf;
-use crate::io::op::{Connect, IoFd, Op, ReadFixed, RecvFrom, SendTo, WriteFixed};
+use crate::io::driver::Driver;
+use crate::io::op::{
+    Connect, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RecvFrom, SendTo, SharedSubmitter,
+    WriteFixed,
+};
 use crate::io::socket::Socket;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-pub struct UdpSocket {
-    fd: RawHandle,
-}
+// ============================================================================
+// Internal Helper: InnerSocket (RAII Wrapper)
+// ============================================================================
 
-impl Drop for UdpSocket {
+struct InnerSocket(RawHandle);
+
+impl Drop for InnerSocket {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = unsafe { Socket::from_raw(*self.fd) };
+        let _ = unsafe { Socket::from_raw(*self.0) };
         #[cfg(windows)]
-        let _ = unsafe { Socket::from_raw(*self.fd) };
+        let _ = unsafe { Socket::from_raw(*self.0) };
     }
 }
 
-impl UdpSocket {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+impl InnerSocket {
+    fn raw(&self) -> RawHandle {
+        self.0
+    }
+
+    fn from_bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let addr = addr
             .to_socket_addrs()?
             .next()
@@ -33,34 +44,55 @@ impl UdpSocket {
 
         socket.bind(addr)?;
 
-        Ok(Self {
-            fd: socket.into_raw().into(),
-        })
+        Ok(Self(socket.into_raw().into()))
     }
 
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        #[cfg(unix)]
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(*self.0)) };
+        #[cfg(windows)]
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(*self.0)) };
+        socket.local_addr()
+    }
+}
+
+// ============================================================================
+// Generic UDP Components
+// ============================================================================
+
+pub struct GenericUdpSocket<S: OpSubmitter> {
+    inner: InnerSocket,
+    submitter: S,
+}
+
+// Type Aliases
+pub type LocalUdpSocket = GenericUdpSocket<LocalSubmitter>;
+pub type UdpSocket = GenericUdpSocket<SharedSubmitter>;
+
+// --- Common Implementation ---
+
+impl<S: OpSubmitter> GenericUdpSocket<S> {
     pub async fn send_to(
         &self,
         buf: FixedBuf,
         target: SocketAddr,
     ) -> (io::Result<usize>, FixedBuf) {
         let op = SendTo {
-            fd: IoFd::Raw(self.fd),
+            fd: IoFd::Raw(self.inner.raw()),
             buf,
             addr: target,
         };
-        let future = Op::new(op).submit_local();
-        let (res, op_back): (io::Result<usize>, SendTo) = future.await;
+        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
         (res, op_back.buf)
     }
 
     pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
         let op = RecvFrom {
-            fd: IoFd::Raw(self.fd),
+            fd: IoFd::Raw(self.inner.raw()),
             buf,
             addr: None,
         };
-        let future = Op::new(op).submit_local();
-        let (res, op_back): (io::Result<usize>, RecvFrom) = future.await;
+        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
 
         match res {
             Ok(n) => {
@@ -72,52 +104,44 @@ impl UdpSocket {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        use std::mem::ManuallyDrop;
-
-        #[cfg(unix)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(*self.fd)) };
-        #[cfg(windows)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(*self.fd)) };
-        socket.local_addr()
+        self.inner.local_addr()
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
         let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
-            fd: IoFd::Raw(self.fd),
+            fd: IoFd::Raw(self.inner.raw()),
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
 
-        let (res, _) = Op::new(op).submit_local().await;
+        let (res, _) = self.submitter.submit(Op::new(op)).await;
         res.map(|_| ())
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = WriteFixed {
-            fd: IoFd::Raw(self.fd),
+            fd: IoFd::Raw(self.inner.raw()),
             buf,
             offset: 0,
         };
-        let future = Op::new(op).submit_local();
-        let (res, op_back) = future.await;
+        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
         (res, op_back.buf)
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = ReadFixed {
-            fd: IoFd::Raw(self.fd),
+            fd: IoFd::Raw(self.inner.raw()),
             buf,
             offset: 0,
         };
-        let future = Op::new(op).submit_local();
-        let (res, op_back) = future.await;
+        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
         (res, op_back.buf)
     }
 }
 
-impl crate::io::AsyncBufRead for UdpSocket {
+impl<S: OpSubmitter> crate::io::AsyncBufRead for GenericUdpSocket<S> {
     fn read(
         &self,
         buf: FixedBuf,
@@ -126,7 +150,7 @@ impl crate::io::AsyncBufRead for UdpSocket {
     }
 }
 
-impl crate::io::AsyncBufWrite for UdpSocket {
+impl<S: OpSubmitter> crate::io::AsyncBufWrite for GenericUdpSocket<S> {
     fn write(
         &self,
         buf: FixedBuf,
@@ -140,5 +164,41 @@ impl crate::io::AsyncBufWrite for UdpSocket {
 
     fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
         std::future::ready(Ok(()))
+    }
+}
+
+// ============================================================================
+// Specific Construction Logic
+// ============================================================================
+
+// --- Local Implementations ---
+impl LocalUdpSocket {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        Ok(Self {
+            inner: InnerSocket::from_bind(addr)?,
+            submitter: LocalSubmitter,
+        })
+    }
+}
+
+// --- Shared (Remote-Capable) Implementations ---
+impl UdpSocket {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let inner = InnerSocket::from_bind(addr)?;
+
+        let ctx = crate::runtime::context::current();
+        let driver_weak = ctx.driver();
+        let driver_rc = driver_weak
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Runtime driver dropped"))?;
+        let injector = driver_rc.borrow().injector();
+
+        Ok(Self {
+            inner,
+            submitter: SharedSubmitter {
+                owner_id: ctx.handle.id,
+                injector,
+            },
+        })
     }
 }

@@ -1,14 +1,16 @@
 use super::open_options::OpenOptions; // Use generic OpenOptions
+use crate::io::RawHandle;
 use crate::io::buffer::FixedBuf;
-use crate::io::driver::PlatformDriver;
-use crate::io::op::{Fallocate, Fsync, IoFd, Op, ReadFixed, SyncFileRange, WriteFixed};
+use crate::io::op::{
+    Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, SharedSubmitter,
+    SyncFileRange, WriteFixed,
+};
 
 use std::cell::RefCell;
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::rc::Weak;
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -19,21 +21,47 @@ macro_rules! ignore {
     };
 }
 
-pub struct File {
-    pub(crate) fd: IoFd,
-    pub(crate) driver: Weak<RefCell<PlatformDriver>>,
+// ============================================================================
+// Internal Helper: InnerFile (RAII Wrapper)
+// ============================================================================
+
+pub(crate) struct InnerFile(pub(crate) RawHandle);
+
+impl Drop for InnerFile {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::close(self.0.fd);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0.handle);
+        }
+    }
+}
+
+// ============================================================================
+// Generic File Components
+// ============================================================================
+
+pub struct GenericFile<S: OpSubmitter> {
+    pub(crate) inner: InnerFile,
+    pub(crate) submitter: S,
     pub(crate) pos: RefCell<u64>,
 }
 
-pub struct SyncRangeBuilder<'a> {
-    file: &'a File,
+pub type LocalFile = GenericFile<LocalSubmitter>;
+pub type File = GenericFile<SharedSubmitter>;
+
+pub struct SyncRangeBuilder<'a, S: OpSubmitter> {
+    file: &'a GenericFile<S>,
     offset: u64,
     nbytes: u64,
     flags: u32,
 }
 
-impl<'a> SyncRangeBuilder<'a> {
-    fn new(file: &'a File, offset: u64, nbytes: u64) -> Self {
+impl<'a, S: OpSubmitter> SyncRangeBuilder<'a, S> {
+    fn new(file: &'a GenericFile<S>, offset: u64, nbytes: u64) -> Self {
         #[cfg(unix)]
         let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
             | libc::SYNC_FILE_RANGE_WRITE
@@ -86,39 +114,27 @@ impl<'a> SyncRangeBuilder<'a> {
     }
 }
 
-impl<'a> IntoFuture for SyncRangeBuilder<'a> {
+impl<'a, S: OpSubmitter> IntoFuture for SyncRangeBuilder<'a, S> {
     type Output = io::Result<()>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         let op = SyncFileRange {
-            fd: self.file.fd,
+            fd: IoFd::Raw(self.file.inner.0),
             offset: self.offset,
             nbytes: self.nbytes,
             flags: self.flags,
         };
 
+        let submitter = self.file.submitter.clone();
         Box::pin(async move {
-            let (res, _) = Op::new(op).submit_local().await;
+            let (res, _) = submitter.submit(Op::new(op)).await;
             res.map(|_| ())
         })
     }
 }
 
-impl File {
-    pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
-        OpenOptions::new().read(true).open(path).await
-    }
-
-    pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .await
-    }
-
+impl<S: OpSubmitter> GenericFile<S> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -133,43 +149,43 @@ impl File {
 
     pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
         let op = ReadFixed {
-            fd: self.fd,
+            fd: IoFd::Raw(self.inner.0),
             buf,
             offset,
         };
 
-        let (res, op) = Op::new(op).submit_local().await;
+        let (res, op) = self.submitter.submit(Op::new(op)).await;
         (res, op.buf)
     }
 
     pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
         let op = WriteFixed {
-            fd: self.fd,
+            fd: IoFd::Raw(self.inner.0),
             buf,
             offset,
         };
 
-        let (res, op) = Op::new(op).submit_local().await;
+        let (res, op) = self.submitter.submit(Op::new(op)).await;
         (res, op.buf)
     }
 
     pub async fn sync_all(&self) -> io::Result<()> {
         let op = Fsync {
-            fd: self.fd,
+            fd: IoFd::Raw(self.inner.0),
             datasync: false,
         };
 
-        let (res, _) = Op::new(op).submit_local().await;
+        let (res, _) = self.submitter.submit(Op::new(op)).await;
         res.map(|_| ())
     }
 
     pub async fn sync_data(&self) -> io::Result<()> {
         let op = Fsync {
-            fd: self.fd,
+            fd: IoFd::Raw(self.inner.0),
             datasync: true,
         };
 
-        let (res, _) = Op::new(op).submit_local().await;
+        let (res, _) = self.submitter.submit(Op::new(op)).await;
         res.map(|_| ())
     }
 
@@ -179,24 +195,24 @@ impl File {
     ///
     /// Returns a specific Future (Builder) that allows configuring flags.
     /// Usage: `file.sync_range(0, 100).wait_before(false).write(true).await`
-    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_> {
+    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, S> {
         SyncRangeBuilder::new(self, offset, nbytes)
     }
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> io::Result<()> {
         let op = Fallocate {
-            fd: self.fd,
+            fd: IoFd::Raw(self.inner.0),
             mode: 0, // Default mode
             offset,
             len,
         };
 
-        let (res, _) = Op::new(op).submit_local().await;
+        let (res, _) = self.submitter.submit(Op::new(op)).await;
         res.map(|_| ())
     }
 }
 
-impl crate::io::AsyncBufRead for File {
+impl<S: OpSubmitter> crate::io::AsyncBufRead for GenericFile<S> {
     async fn read(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let offset = *self.pos.borrow();
         let (res, buf) = self.read_at(buf, offset).await;
@@ -207,7 +223,7 @@ impl crate::io::AsyncBufRead for File {
     }
 }
 
-impl crate::io::AsyncBufWrite for File {
+impl<S: OpSubmitter> crate::io::AsyncBufWrite for GenericFile<S> {
     async fn write(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let offset = *self.pos.borrow();
         let (res, buf) = self.write_at(buf, offset).await;
@@ -226,41 +242,34 @@ impl crate::io::AsyncBufWrite for File {
     }
 }
 
-impl Drop for File {
-    fn drop(&mut self) {
-        use crate::io::driver::Driver;
-        use crate::io::op::IntoPlatformOp;
+// --- Specific Implementations ---
 
-        // Try to submit a background close op
-        let submitted = {
-            let driver_weak = self.driver.clone();
-            if let Some(driver_rc) = driver_weak.upgrade() {
-                let close = crate::io::op::Close { fd: self.fd };
-                let op: <PlatformDriver as Driver>::Op =
-                    IntoPlatformOp::<PlatformDriver>::into_platform_op(close);
+impl LocalFile {
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<LocalFile> {
+        OpenOptions::new().read(true).open_local(path).await
+    }
 
-                if let Ok(mut driver) = driver_rc.try_borrow_mut() {
-                    driver.submit_background(op).is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
+    pub async fn create(path: impl AsRef<Path>) -> io::Result<LocalFile> {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open_local(path)
+            .await
+    }
+}
 
-        if !submitted {
-            // Fallback to synchronous close
-            if let Some(fd) = self.fd.raw() {
-                #[cfg(unix)]
-                unsafe {
-                    libc::close(fd.fd);
-                }
-                #[cfg(windows)]
-                unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(fd.handle as _);
-                }
-            }
-        }
+impl File {
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
+        OpenOptions::new().read(true).open(path).await
+    }
+
+    pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .await
     }
 }
