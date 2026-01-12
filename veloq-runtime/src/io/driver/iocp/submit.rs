@@ -120,7 +120,7 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
 }
 
 // ============================================================================
-// Read/Write/Recv/Send
+// Read/Write
 // ============================================================================
 
 macro_rules! submit_io_op {
@@ -150,43 +150,6 @@ macro_rules! submit_io_op {
                     handle,
                     ptr as _,
                     val.buf.len() as u32, // using len() which is common for buf/slice
-                    &mut bytes,
-                    ctx.overlapped,
-                )
-            };
-
-            if ret == 0 {
-                let err = unsafe { GetLastError() };
-                if err != ERROR_IO_PENDING {
-                    return Err(io::Error::from_raw_os_error(err as i32));
-                }
-            }
-            Ok(SubmissionResult::Pending)
-        }
-    };
-    ($fn_name:ident, $field:ident, $win_api:ident, no_offset, $ptr_fn:expr) => {
-        pub(crate) unsafe fn $fn_name(
-            op: &mut IocpOp,
-            ctx: &mut SubmitContext,
-        ) -> io::Result<SubmissionResult> {
-            let val = unsafe { &mut *op.payload.$field };
-            op.header.inner.Anonymous.Anonymous.Offset = 0;
-            op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
-
-            let handle = resolve_fd(val.fd, ctx.registered_files)?;
-            unsafe {
-                CreateIoCompletionPort(handle, ctx.port, 0, 0);
-            }
-
-            let mut bytes = 0;
-            let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
-            let ptr = get_ptr(&mut val.buf);
-
-            let ret = unsafe {
-                $win_api(
-                    handle,
-                    ptr as _,
-                    val.buf.len() as u32,
                     &mut bytes,
                     ctx.overlapped,
                 )

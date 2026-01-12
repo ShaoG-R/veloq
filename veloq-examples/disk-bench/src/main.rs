@@ -103,10 +103,6 @@ struct Args {
     /// Block size (chunk size) for I/O operations
     #[arg(long, value_enum, default_value_t = BlockSize::M1)]
     block_size: BlockSize,
-
-    /// Number of files per thread
-    #[arg(long, default_value_t = 1)]
-    files_per_thread: usize,
 }
 
 // 1GB data per thread for benchmarking
@@ -120,67 +116,60 @@ struct IterationResult {
 /// Single write operation definition
 #[derive(Clone, Debug, Copy)]
 struct WriteOp {
-    file_index: usize,
     offset: u64,
 }
 
 /// Workload configuration for a thread
 struct ThreadConfig {
     thread_index: usize,
-    file_paths: Vec<PathBuf>,
+    file_path: PathBuf,
     ops: Vec<WriteOp>,
     block_size: usize,
-    #[allow(dead_code)]
-    file_size_per_file: u64,
 }
 
 /// Helper to generate filenames
-fn get_file_path(t_idx: usize, f_idx: usize) -> PathBuf {
-    PathBuf::from(format!("bench_test_{}_{}.data", t_idx, f_idx))
+fn get_file_path(t_idx: usize) -> PathBuf {
+    PathBuf::from(format!("bench_test_{}.data", t_idx))
 }
 
 /// Prepare files Phase: Create and fallocate files
 /// This runs effectively in parallel per thread, but outside the measurement loop.
-async fn prepare_files_for_thread(files_per_thread: usize, file_size_per_file: u64, t_idx: usize) {
-    for f_idx in 0..files_per_thread {
-        let path = get_file_path(t_idx, f_idx);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .buffering(BufferingMode::DirectSync)
-            .open(&path)
-            .await
-            .expect("Failed to create file during preparation");
-
-        // Fallocate is slow, so we do it here.
-        file.fallocate(0, file_size_per_file)
-            .await
-            .expect("Fallocate failed");
-
-        // We close the file after preparation
+async fn prepare_files_for_thread(file_size: u64, t_idx: usize) {
+    let path = get_file_path(t_idx);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
     }
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .buffering(BufferingMode::DirectSync)
+        .open(&path)
+        .await
+        .expect("Failed to create file during preparation");
+
+    // Fallocate is slow, so we do it here.
+    file.fallocate(0, file_size)
+        .await
+        .expect("Fallocate failed");
+
+    // We close the file after preparation
 }
 
 /// Cleanup Phase
-fn cleanup_files(threads: usize, files_per_thread: usize) {
+fn cleanup_files(threads: usize) {
     for t_idx in 0..threads {
-        for f_idx in 0..files_per_thread {
-            let path = get_file_path(t_idx, f_idx);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
+        let path = get_file_path(t_idx);
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
 
 async fn run_iteration_measured(
     qdepth: usize,
-    files: &[Rc<File>],
+    file: Rc<File>,
     ops: &[WriteOp],
     block_size: usize,
     initial_buffers: &mut Vec<FixedBuf>, // Take buffers to reuse
@@ -192,7 +181,7 @@ async fn run_iteration_measured(
     // We will collect them back as tasks finish.
 
     // Safety check
-    if files.is_empty() || ops.is_empty() {
+    if ops.is_empty() {
         return (
             IterationResult {
                 bytes: 0,
@@ -231,10 +220,10 @@ async fn run_iteration_measured(
             };
 
             let op = ops[current_op_idx];
-            let file = files[op.file_index].clone();
+            let file_clone = file.clone();
 
             // Spawn task
-            let fut = async move { file.write_at(buf, op.offset).await };
+            let fut = async move { file_clone.write_at(buf, op.offset).await };
             pending_tasks.push_back(spawn_local(fut));
 
             current_op_idx += 1;
@@ -251,12 +240,7 @@ async fn run_iteration_measured(
             }
         }
 
-        // 3. Wait for ONE task (Work Stealing runtime might complete out of order,
-        // but pop_front forces order for *checking*, any is fine for progress)
-        // Ideally `FuturesUnordered` would be better, but we are in a simple loop.
-        // For simple queue depth maintenance, popping the oldest is a reasonable approximation
-        // or just `await` the front.
-        // Optimization: In a real high-perf bench we might want to poll all, here we await head.
+        // 3. Wait for ONE task
         let handle = pending_tasks.pop_front().unwrap();
         let (res, buf) = handle.await;
 
@@ -292,18 +276,15 @@ async fn run_worker(
 ) -> std::io::Result<Vec<IterationResult>> {
     let pool = veloq_runtime::runtime::context::current_pool().expect("No pool");
 
-    // 1. Open Files (Persistent handles for benchmarking)
-    let mut files = Vec::with_capacity(config.file_paths.len());
-    for path in &config.file_paths {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(false) // already created
-            .buffering(BufferingMode::DirectSync)
-            .open(path)
-            .await
-            .expect("Failed to open file in worker");
-        files.push(Rc::new(file));
-    }
+    // 1. Open File (Persistent handle for benchmarking)
+    let file = OpenOptions::new()
+        .write(true)
+        .create(false) // already created
+        .buffering(BufferingMode::DirectSync)
+        .open(&config.file_path)
+        .await
+        .expect("Failed to open file in worker");
+    let file = Rc::new(file);
 
     // 2. Pre-allocate Buffers
     // We allocate QDEPTH buffers once and reuse them across ALL iterations.
@@ -329,7 +310,7 @@ async fn run_worker(
 
         let (res, buffers) = run_iteration_measured(
             qdepth,
-            &files,
+            file.clone(),
             &config.ops,
             config.block_size,
             &mut reuse_buffers,
@@ -363,7 +344,7 @@ fn main() {
     let args = Args::parse();
     let block_size_bytes = args.block_size.as_bytes();
 
-    println!("Starting Disk Benchmark (Standardized Mode)");
+    println!("Starting Disk Benchmark");
     println!(
         "Mode: {:?}, Threads: {}, QD: {}",
         args.mode, args.threads, args.qdepth
@@ -375,56 +356,33 @@ fn main() {
     println!("Pre-allocating files...");
 
     // Setup filenames and configs
-    let files_per_thread = args.files_per_thread;
-    let file_size_per_file = if files_per_thread > 0 {
-        FILE_SIZE_PER_THREAD / files_per_thread as u64
-    } else {
-        0
-    };
+    let file_size_per_file = FILE_SIZE_PER_THREAD;
 
-    // Calculate Workloads (Offsets) BEFORE starting runtime to keep main clean
-    // But we need to do it.
     let mut configs = Vec::with_capacity(args.threads);
     for t_idx in 0..args.threads {
-        let mut file_paths = Vec::new();
-        for f_idx in 0..files_per_thread {
-            file_paths.push(get_file_path(t_idx, f_idx));
-        }
+        let file_path = get_file_path(t_idx);
 
         // Generate Ops
-        let mut ops = Vec::new();
-        if files_per_thread > 0 {
-            let num_blocks_per_file = file_size_per_file / block_size_bytes as u64;
+        let num_blocks = file_size_per_file / block_size_bytes as u64;
+        let mut ops = Vec::with_capacity(num_blocks as usize);
+        let mut offsets: Vec<u64> = (0..num_blocks)
+            .map(|i| i * block_size_bytes as u64)
+            .collect();
+
+        if matches!(args.mode, WriteMode::Rand) {
             let mut rng = rand::thread_rng();
-            let mut file_offsets: Vec<Vec<u64>> = Vec::with_capacity(files_per_thread);
+            offsets.shuffle(&mut rng);
+        }
 
-            for _ in 0..files_per_thread {
-                let mut offsets: Vec<u64> = (0..num_blocks_per_file)
-                    .map(|i| i * block_size_bytes as u64)
-                    .collect();
-                if let WriteMode::Rand = args.mode {
-                    offsets.shuffle(&mut rng);
-                }
-                file_offsets.push(offsets);
-            }
-
-            // Interleave
-            for i in 0..num_blocks_per_file as usize {
-                for f in 0..files_per_thread {
-                    ops.push(WriteOp {
-                        file_index: f,
-                        offset: file_offsets[f][i],
-                    });
-                }
-            }
+        for offset in offsets {
+            ops.push(WriteOp { offset });
         }
 
         configs.push(ThreadConfig {
             thread_index: t_idx,
-            file_paths,
+            file_path,
             ops,
             block_size: block_size_bytes,
-            file_size_per_file,
         });
     }
 
@@ -448,11 +406,9 @@ fn main() {
         println!("Initializing disk files (creating & fallocating)... This may take a while.");
         let mut handles = Vec::new();
         for t_idx in 0..args.threads {
-            let fpt = files_per_thread;
-            let fsz = file_size_per_file;
             // Spawn to workers to do it in parallel
             handles.push(spawn_local(async move {
-                prepare_files_for_thread(fpt, fsz, t_idx).await;
+                prepare_files_for_thread(FILE_SIZE_PER_THREAD, t_idx).await;
             }));
         }
         for h in handles {
@@ -484,11 +440,6 @@ fn main() {
         let mut total_bytes_all = 0;
         let bench_start = Instant::now(); // Approx wall time for throughput calc if we want system-wide
 
-        // Collecting results
-        // Note: The "System Throughput" calculation here is a bit tricky if threads start/end at different times.
-        // But assuming they run for roughly same duration, we can sum bytes and divide by max duration or similar.
-        // A better approach for "System Throughput" is sum(avg_thread_throughput).
-
         for _ in 0..args.threads {
             let worker_results = rx.recv().await.expect("Failed to receive");
 
@@ -511,11 +462,17 @@ fn main() {
 
         let elapsed = bench_start.elapsed();
         let total_mb = total_bytes_all as f64 / 1024.0 / 1024.0;
+        let system_throughput = if elapsed.as_secs_f64() > 0.0 {
+            total_mb / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
 
         println!("--------------------------------------------------");
         println!("Benchmark Completed.");
         println!("Total Data Measured: {:.2} MB", total_mb);
         println!("Wall Time (Approx):  {:.2} s", elapsed.as_secs_f64());
+        println!("System Throughput:   {:.2} MB/s", system_throughput);
         println!("--------------------------------------------------");
 
         if !all_throughputs.is_empty() {
@@ -534,6 +491,6 @@ fn main() {
 
     // 4. Cleanup Phase
     println!("Cleaning up files...");
-    cleanup_files(args.threads, files_per_thread);
+    cleanup_files(args.threads);
     println!("Done.");
 }
