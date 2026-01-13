@@ -353,11 +353,6 @@ fn test_udp_ipv6() {
 /// Test UDP across multiple worker threads
 #[test]
 fn test_multithread_udp_no_echo() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::Level::TRACE)
-        .try_init();
-
     for size in [8192, 16384] {
         std::thread::spawn(move || {
             let message_count = Arc::new(AtomicUsize::new(0));

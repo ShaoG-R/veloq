@@ -10,6 +10,7 @@
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -347,6 +348,10 @@ impl RemoteSubmitter {
         })?;
         let injector = driver_rc.borrow().injector();
         Ok(Self { injector })
+    }
+
+    pub fn from_injector(injector: Arc<<PlatformDriver as Driver>::RemoteInjector>) -> Self {
+        Self { injector }
     }
 }
 

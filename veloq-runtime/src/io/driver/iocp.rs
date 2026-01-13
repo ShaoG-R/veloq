@@ -275,18 +275,18 @@ impl IocpDriver {
                     if let PlatformData::Remote(completer) = data {
                         // We must take the resources (op) out
                         let resources = op_entry.resources.take();
-                        if let Some(iocp_op) = resources {
+                        if let Some(mut iocp_op) = resources {
                             // Extract result
-                            let result = if res == 0 {
+                            let mut result = if res == 0 {
                                 Err(io::Error::last_os_error())
                             } else {
                                 Ok(bytes_transferred as usize)
                             };
 
-                            // The result in op.result might be set if we used blocking offload?
-                            // But usually Remote op is just pure IO submit.
-                            // However, we should respect if result was already present?
-                            // For IOCP, standard completion path just gives us bytes_transferred.
+                            // Check for blocking result override (e.g. from Open/Close/Fsync offload)
+                            if let Some(blocking_res) = iocp_op.header.blocking_result.take() {
+                                result = blocking_res;
+                            }
 
                             completer.complete(result, iocp_op);
                             self.ops.remove(user_data);

@@ -145,7 +145,7 @@ async fn prepare_files_for_thread(file_size: u64, t_idx: usize) {
         .create(true)
         .truncate(true)
         .buffering(BufferingMode::DirectSync)
-        .open(&path)
+        .open_local(&path)
         .await
         .expect("Failed to create file during preparation");
 

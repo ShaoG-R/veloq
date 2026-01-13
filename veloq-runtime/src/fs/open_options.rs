@@ -1,4 +1,4 @@
-use crate::io::{buffer::BufPool, op::Open};
+use crate::io::op::{OpSubmitter, Open};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,11 +97,8 @@ impl OpenOptions {
         &self,
         path: impl AsRef<Path>,
     ) -> std::io::Result<super::file::LocalFile> {
-        let pool = crate::runtime::context::current_pool()
-            .ok_or_else(|| std::io::Error::other("No buffer pool bound to current thread"))?;
-
         // 1. 根据不同平台生成对应的 Op 参数
-        let op = self.build_op(path.as_ref(), &pool).await?;
+        let op = self.build_op(path.as_ref())?;
 
         // 2. 提交给 runtime (local)
         use crate::io::op::{LocalSubmitter, Op, OpSubmitter};
@@ -122,24 +119,25 @@ impl OpenOptions {
 
     /// Open the file with shared submission support (Send, capable of being offloaded).
     pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
-        let pool = crate::runtime::context::current_pool()
-            .ok_or_else(|| std::io::Error::other("No buffer pool bound to current thread"))?;
-
         // 1. 构造 Op
-        let op = self.build_op(path.as_ref(), &pool).await?;
+        let op = self.build_op(path.as_ref())?;
 
-        // 2. 初始 open 必须依然在本地提交 (register handle)
-        // 但返回的文件对象将持有 RemoteSubmitter
-        use crate::io::op::{LocalSubmitter, Op, OpSubmitter};
-        let (res, _) = LocalSubmitter.submit(Op::new(op)).await;
+        // 2. 使用 RemoteSubmitter 提交
+        // 注意：RemoteSubmitter::new() 必须在 Runtime 环境下调用，它会捕获当前线程的 Injector。
+        // 这确保了 Open 操作被分发回“最初调用线程”的 Driver 执行（如果那是 Remote 的逻辑），
+        // 或者至少我们持有正确的 Injector 供 File 后续使用。
+        use crate::io::op::{Op, RemoteSubmitter};
+
+        // 捕获 SubmitContext (Injector)
+        let submitter = RemoteSubmitter::new()?;
+
+        // 提交执行 (Result, Op) — Op 的所有权被返还
+        let (res, _) = submitter.submit(Op::new(op)).await;
+
         let fd = crate::io::RawHandle::from(res?);
 
-        // 3. 构建 RemoteSubmitter
         use super::file::InnerFile;
-        use crate::io::op::RemoteSubmitter;
         use std::sync::atomic::AtomicU64;
-
-        let submitter = RemoteSubmitter::new()?;
 
         Ok(super::file::File {
             inner: InnerFile(fd),
@@ -152,22 +150,16 @@ impl OpenOptions {
     // Unix 平台实现
     // ==========================================
     #[cfg(unix)]
-    async fn build_op(&self, path: &Path, pool: &dyn BufPool) -> std::io::Result<Open> {
+    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
         use std::os::unix::ffi::OsStrExt;
 
         let path_bytes = path.as_os_str().as_bytes();
         // ensure null termination
         let len = path_bytes.len() + 1;
 
-        let mut buf = match pool.alloc(len) {
-            Some(buf) => buf,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    "buf pool exhausted",
-                ));
-            }
-        };
+        let mut buf = crate::runtime::context::try_alloc(len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "buf pool exhausted")
+        })?;
 
         // Write path + null
         let slice = buf.as_slice_mut();
@@ -227,7 +219,7 @@ impl OpenOptions {
     // Windows 平台实现
     // ==========================================
     #[cfg(windows)]
-    async fn build_op(&self, path: &Path, pool: &dyn BufPool) -> std::io::Result<Open> {
+    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
@@ -245,15 +237,9 @@ impl OpenOptions {
             .collect();
         let len_bytes = path_w.len() * 2;
 
-        let mut buf = match pool.alloc(len_bytes) {
-            Some(buf) => buf,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    "buf pool exhausted",
-                ));
-            }
-        };
+        let mut buf = crate::runtime::context::try_alloc(len_bytes).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "buf pool exhausted")
+        })?;
 
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes {

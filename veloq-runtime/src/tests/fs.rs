@@ -1,8 +1,12 @@
-use crate::fs::File;
-use crate::io::buffer::{BufPool, RegisteredPool};
+use crate::fs::{File, LocalFile};
+use crate::io::buffer::{AnyBufPool, HybridPool, RegisteredPool};
+use crate::runtime::Runtime;
+use crate::runtime::context::alloc;
 use crate::runtime::executor::LocalExecutor;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn test_file_integrity() {
@@ -15,11 +19,8 @@ fn test_file_integrity() {
                         .expect("Failed to register buffer pool"),
                 )
             });
-            let pool_clone = exec.pool();
 
             exec.block_on(async move {
-                let pool = pool_clone.clone();
-
                 let file_path_string = format!("test_file_integrity_{:?}.tmp", size);
                 let file_path = Path::new(&file_path_string);
                 // Remove file if exists
@@ -29,9 +30,11 @@ fn test_file_integrity() {
 
                 // 1. Create and Write
                 {
-                    let file = File::create(&file_path).await.expect("Failed to create");
+                    let file = LocalFile::create(&file_path)
+                        .await
+                        .expect("Failed to create");
 
-                    let mut write_buf = pool.alloc(size).unwrap();
+                    let mut write_buf = alloc(size);
                     let data = b"Hello World!";
                     write_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
 
@@ -44,9 +47,9 @@ fn test_file_integrity() {
 
                 // 2. Open and Read
                 {
-                    let file = File::open(&file_path).await.expect("Failed to open");
+                    let file = LocalFile::open(&file_path).await.expect("Failed to open");
 
-                    let read_buf = pool.alloc(size).unwrap();
+                    let read_buf = alloc(size);
 
                     let (res, read_buf) = file.read_at(read_buf, 0).await;
                     let n = res.expect("Read failed");
@@ -63,4 +66,86 @@ fn test_file_integrity() {
         .join()
         .unwrap();
     }
+}
+
+#[test]
+fn test_multithread_file_ops() {
+    let completion_count = Arc::new(AtomicUsize::new(0));
+    const NUM_TASKS: usize = 10;
+    const NUM_WORKERS: usize = 3;
+
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(NUM_WORKERS),
+            ..Default::default()
+        })
+        .pool_constructor(|_, registrar| {
+            let pool = HybridPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
+        .build()
+        .unwrap();
+
+    let (tx, mut rx) = crate::sync::mpsc::unbounded();
+    let completion_count_clone = completion_count.clone();
+
+    runtime.block_on(async move {
+        for i in 0..NUM_TASKS {
+            let tx_done = tx.clone();
+            let counter = completion_count_clone.clone();
+
+            crate::runtime::context::spawn(async move {
+                let file_name = format!("test_mt_fs_{}.tmp", i);
+                let path = Path::new(&file_name);
+
+                // Ensure clean start
+                if path.exists() {
+                    let _ = fs::remove_file(path);
+                }
+
+                let content = format!("Task {} content", i);
+                let len = content.len();
+
+                // 1. Create and Write
+                {
+                    let file = File::create(path).await.expect("Failed to create file");
+                    let mut write_buf = alloc(len);
+                    write_buf.set_len(len);
+                    write_buf.as_slice_mut().copy_from_slice(content.as_bytes());
+
+                    let (res, _) = file.write_at(write_buf, 0).await;
+                    let wrote = res.expect("Write failed");
+                    assert_eq!(wrote, len);
+
+                    file.sync_all().await.expect("Sync failed");
+                }
+
+                // 2. Open and Read
+                {
+                    let file = File::open(path).await.expect("Failed to open file");
+                    let read_buf = alloc(len);
+
+                    let (res, read_buf) = file.read_at(read_buf, 0).await;
+                    let n = res.expect("Read failed");
+                    assert_eq!(n, len);
+                    assert_eq!(&read_buf.as_slice()[..n], content.as_bytes());
+                }
+
+                // Cleanup
+                if path.exists() {
+                    let _ = fs::remove_file(path);
+                }
+
+                counter.fetch_add(1, Ordering::SeqCst);
+                tx_done.send(()).unwrap();
+            });
+        }
+
+        for _ in 0..NUM_TASKS {
+            rx.recv().await.unwrap();
+        }
+    });
+
+    assert_eq!(completion_count.load(Ordering::SeqCst), NUM_TASKS);
 }

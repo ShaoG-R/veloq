@@ -106,6 +106,7 @@ pub struct UringDriver {
 
     // Injector support
     queue: Arc<SegQueue<Box<dyn FnOnce(&mut UringDriver) + Send>>>,
+    injector: Arc<UringInjector>,
 }
 
 impl UringDriver {
@@ -141,6 +142,12 @@ impl UringDriver {
 
         debug!("Initalized UringDriver with {} entries", entries);
 
+        let queue = Arc::new(SegQueue::new());
+        let injector = Arc::new(UringInjector {
+            queue: queue.clone(),
+            waker_fd,
+        });
+
         let mut driver = Self {
             ring,
             ops,
@@ -150,7 +157,8 @@ impl UringDriver {
             waker_fd,
             waker_token: None,
             buffers_registered: false,
-            queue: Arc::new(SegQueue::new()),
+            queue,
+            injector,
         };
 
         driver.submit_waker();
@@ -526,10 +534,7 @@ impl Driver for UringDriver {
     type RemoteInjector = UringInjector;
 
     fn injector(&self) -> Arc<Self::RemoteInjector> {
-        Arc::new(UringInjector {
-            queue: self.queue.clone(),
-            waker_fd: self.waker_fd,
-        })
+        self.injector.clone()
     }
 
     fn reserve_op(&mut self) -> usize {

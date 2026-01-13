@@ -10,7 +10,7 @@ use std::rc::{Rc, Weak};
 
 use crossbeam_deque::Worker;
 
-use crate::io::buffer::AnyBufPool;
+use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf};
 use crate::io::driver::PlatformDriver;
 use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
@@ -66,6 +66,23 @@ pub fn current() -> RuntimeContext {
 /// Try to retrieve the current runtime context.
 pub fn try_current() -> Option<RuntimeContext> {
     CONTEXT.with(|ctx| ctx.borrow().clone())
+}
+
+/// Try to allocate a buffer from the current runtime context.
+pub fn try_alloc(size: usize) -> Option<FixedBuf> {
+    try_current()
+        .expect("Runtime context not set. Are you running inside an executor?")
+        .buf_pool
+        .alloc(size)
+}
+
+/// Allocate a buffer from the current runtime context.
+///
+/// # Panics
+/// Panics when called outside a runtime context or when the buffer pool is full.
+pub fn alloc(size: usize) -> FixedBuf {
+    let ctx = current();
+    ctx.buf_pool.alloc(size).expect("Buffer pool is full")
 }
 
 /// Context passed to runtime tasks.
