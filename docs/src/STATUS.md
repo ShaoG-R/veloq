@@ -26,7 +26,6 @@ pie title 核心模块完成度估算
 
 - [x] **Local Executor**: 主循环、Budget 机制、Park/Unpark 状态机。
 - [x] **Task System**: 手动 VTable 实现的轻量级 Task，支持 `Waker` 唤醒。
-- [x] **Mesh Network**: 基于 RingBuffer 的 Worker 间无锁通信 (SPSC)。
 - [x] **调度算法**:
     - [x] **P2C (Power of Two Choices)**: 发送端负载均衡。
     - [x] **Work Stealing**: 接收端负载均衡。
