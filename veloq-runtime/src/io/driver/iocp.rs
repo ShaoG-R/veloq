@@ -674,6 +674,10 @@ impl Driver for IocpDriver {
     fn injector(&self) -> std::sync::Arc<Self::RemoteInjector> {
         self.injector.clone()
     }
+
+    fn driver_id(&self) -> usize {
+        0
+    }
 }
 
 impl IocpDriver {}

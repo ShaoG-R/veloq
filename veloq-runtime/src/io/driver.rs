@@ -84,6 +84,9 @@ pub trait Driver: 'static {
 
     /// Get the injector for this driver
     fn injector(&self) -> std::sync::Arc<Self::RemoteInjector>;
+
+    /// Get the unique identifier of the driver.
+    fn driver_id(&self) -> usize;
 }
 
 pub trait RemoteWaker: Send + Sync {

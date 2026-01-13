@@ -186,7 +186,10 @@ impl UringDriver {
         // Generate SQE
         let sqe = if let Some(entry) = self.ops.get_mut(user_data) {
             if let Some(ref mut resources) = entry.resources {
-                Some(unsafe { (resources.vtable.make_sqe)(resources).user_data(user_data as u64) })
+                Some(unsafe {
+                    (resources.vtable.make_sqe)(resources, self.waker_fd as usize)
+                        .user_data(user_data as u64)
+                })
             } else {
                 None
             }
@@ -409,7 +412,9 @@ impl UringDriver {
             let sqe = {
                 let entry = self.ops.get_mut(user_data).unwrap();
                 let res = entry.resources.as_mut().unwrap();
-                unsafe { (res.vtable.make_sqe)(res).user_data(user_data as u64) }
+                unsafe {
+                    (res.vtable.make_sqe)(res, self.waker_fd as usize).user_data(user_data as u64)
+                }
             };
 
             // 3. Push
@@ -567,7 +572,7 @@ impl Driver for UringDriver {
         let sqe = {
             let entry = self.ops.get_mut(user_data).expect("invalid user_data");
             let op = entry.resources.as_mut().expect("resources missing");
-            unsafe { (op.vtable.make_sqe)(op).user_data(user_data as u64) }
+            unsafe { (op.vtable.make_sqe)(op, self.waker_fd as usize).user_data(user_data as u64) }
         };
 
         // 3. Push
@@ -590,7 +595,10 @@ impl Driver for UringDriver {
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
         if op.vtable.make_sqe as usize == submit::make_sqe_close as usize {
-            let sqe = unsafe { (op.vtable.make_sqe)(&mut op).user_data(BACKGROUND_USER_DATA) };
+            let sqe = unsafe {
+                (op.vtable.make_sqe)(&mut op, self.waker_fd as usize)
+                    .user_data(BACKGROUND_USER_DATA)
+            };
 
             if !self.push_entry(sqe) {
                 return Err(io::Error::other("sq full"));
@@ -704,6 +712,10 @@ impl Driver for UringDriver {
             panic!("Failed to dup waker fd");
         }
         Arc::new(UringWaker(new_fd))
+    }
+
+    fn driver_id(&self) -> usize {
+        self.waker_fd as usize
     }
 }
 

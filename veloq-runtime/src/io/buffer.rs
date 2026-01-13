@@ -99,6 +99,7 @@ impl AllocResult {
                     pool.pool_data(),
                     pool.vtable(),
                     context,
+                    0, // registry_id 0 means unregistered or generic
                 ))
             },
             AllocResult::Failed => None,
@@ -121,6 +122,10 @@ pub trait BufferRegistrar {
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
     fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>>;
+
+    /// Get the unique identifier of the driver associated with this registrar.
+    /// This is used to verify affinity of FixedBufs.
+    fn driver_id(&self) -> usize;
 }
 
 /// Memory pool implementation providing raw memory allocation.
@@ -173,16 +178,19 @@ pub struct RegisteredPool<P> {
     #[allow(dead_code)]
     registrar: std::rc::Rc<dyn BufferRegistrar>,
     registration_ids: std::rc::Rc<Vec<usize>>,
+    registry_id: usize,
 }
 
 impl<P: BackingPool> RegisteredPool<P> {
     pub fn new(pool: P, registrar: Box<dyn BufferRegistrar>) -> std::io::Result<Self> {
         let regions = pool.get_memory_regions();
         let ids = registrar.register(&regions)?;
+        let registry_id = registrar.driver_id();
         Ok(Self {
             pool,
             registrar: std::rc::Rc::from(registrar),
             registration_ids: std::rc::Rc::new(ids),
+            registry_id,
         })
     }
 }
@@ -192,6 +200,7 @@ impl<P: BackingPool> std::fmt::Debug for RegisteredPool<P> {
         f.debug_struct("RegisteredPool")
             .field("pool", &self.pool)
             .field("registration_ids", &self.registration_ids)
+            .field("registry_id", &self.registry_id)
             .finish()
     }
 }
@@ -219,6 +228,7 @@ impl<P: BackingPool> BufPool for RegisteredPool<P> {
                         self.pool.pool_data(),
                         self.pool.vtable(),
                         context,
+                        self.registry_id,
                     );
                     buf.set_len(len);
                     Some(buf)
@@ -239,6 +249,7 @@ pub struct FixedBuf {
     pool_data: NonNull<()>,
     vtable: &'static PoolVTable,
     context: usize,
+    registry_id: usize,
 }
 
 // Safety: FixedBuf 拥有其底层内存的所有权。
@@ -260,6 +271,7 @@ impl FixedBuf {
         pool_data: NonNull<()>,
         vtable: &'static PoolVTable,
         context: usize,
+        registry_id: usize,
     ) -> Self {
         Self {
             ptr,
@@ -269,12 +281,18 @@ impl FixedBuf {
             pool_data,
             vtable,
             context,
+            registry_id,
         }
     }
 
     #[inline(always)]
     pub fn buf_index(&self) -> u16 {
         self.global_index
+    }
+
+    #[inline(always)]
+    pub fn registry_id(&self) -> usize {
+        self.registry_id
     }
 
     /// Resolve which region this buffer belongs to and its offset.

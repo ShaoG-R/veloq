@@ -68,13 +68,16 @@ macro_rules! impl_default_completion {
 
 macro_rules! make_rw_fixed {
     ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver_id: usize) -> squeue::Entry {
             let rw_op = unsafe { &mut *op.payload.$field };
             let buf_index = rw_op.buf.buf_index();
             let ptr = rw_op.buf.as_mut_ptr();
             let len = rw_op.buf.capacity() as u32;
 
-            if buf_index == NO_REGISTRATION_INDEX {
+            let use_fixed =
+                buf_index != NO_REGISTRATION_INDEX && rw_op.buf.registry_id() == driver_id;
+
+            if !use_fixed {
                 match rw_op.fd {
                     IoFd::Raw(fd) => $type_raw(types::Fd(fd.fd), ptr, len)
                         .offset(rw_op.offset)
@@ -96,13 +99,16 @@ macro_rules! make_rw_fixed {
         }
     };
     ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path, write) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver_id: usize) -> squeue::Entry {
             let rw_op = unsafe { &mut *op.payload.$field };
             let buf_index = rw_op.buf.buf_index();
             let ptr = rw_op.buf.as_slice().as_ptr();
             let len = rw_op.buf.len() as u32;
 
-            if buf_index == NO_REGISTRATION_INDEX {
+            let use_fixed =
+                buf_index != NO_REGISTRATION_INDEX && rw_op.buf.registry_id() == driver_id;
+
+            if !use_fixed {
                 match rw_op.fd {
                     IoFd::Raw(fd) => $type_raw(types::Fd(fd.fd), ptr, len)
                         .offset(rw_op.offset)
@@ -151,7 +157,7 @@ impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
 
 macro_rules! make_buf_op {
     ($fn_name:ident, $field:ident, $opcode:path, recv_args) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
             let val = unsafe { &mut *op.payload.$field };
             match val.fd {
                 IoFd::Raw(fd) => $opcode(
@@ -170,7 +176,7 @@ macro_rules! make_buf_op {
         }
     };
     ($fn_name:ident, $field:ident, $opcode:path, send_args) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp) -> squeue::Entry {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
             let val = unsafe { &mut *op.payload.$field };
             match val.fd {
                 IoFd::Raw(fd) => $opcode(
@@ -198,7 +204,7 @@ make_buf_op!(make_sqe_send, send, opcode::Send::new, send_args);
 impl_default_completion!(on_complete_send);
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
-pub(crate) unsafe fn make_sqe_connect(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_connect(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let val = unsafe { &mut *op.payload.connect };
     match val.fd {
         IoFd::Raw(fd) => opcode::Connect::new(
@@ -218,7 +224,7 @@ pub(crate) unsafe fn make_sqe_connect(op: &mut UringOp) -> squeue::Entry {
 impl_default_completion!(on_complete_connect);
 impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
 
-pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let val = unsafe { &mut (*op.payload.accept).op };
     match val.fd {
         IoFd::Raw(fd) => opcode::Accept::new(
@@ -261,7 +267,7 @@ impl_lifecycle!(drop_accept, get_fd_accept, accept, nested_fd);
 // SendTo
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.send_to };
 
     // Initialize internal pointers
@@ -291,7 +297,7 @@ impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 // RecvFrom
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.recv_from };
 
     // Initialize internal pointers
@@ -334,7 +340,7 @@ impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
 // Close
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_close(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let close_op = unsafe { &mut *op.payload.close };
     match close_op.fd {
         IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd.fd)).build(),
@@ -349,7 +355,7 @@ impl_lifecycle!(drop_close, get_fd_close, close, direct_fd);
 // Fsync
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let fsync_op = unsafe { &mut *op.payload.fsync };
     let flags = if fsync_op.datasync {
         io_uring::types::FsyncFlags::DATASYNC
@@ -370,7 +376,7 @@ impl_lifecycle!(drop_fsync, get_fd_fsync, fsync, direct_fd);
 // SyncFileRange
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_sync_range(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_sync_range(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let sync_op = unsafe { &mut *op.payload.sync_range };
     match sync_op.fd {
         IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd.fd), sync_op.nbytes as u32)
@@ -391,7 +397,7 @@ impl_lifecycle!(drop_sync_range, get_fd_sync_range, sync_range, direct_fd);
 // Fallocate
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_fallocate(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_fallocate(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let fallocate_op = unsafe { &mut *op.payload.fallocate };
     match fallocate_op.fd {
         IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd.fd), fallocate_op.len)
@@ -412,7 +418,7 @@ impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
 // Open
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_open(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_open(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.open };
     let path_ptr = payload.op.path.as_slice().as_ptr() as *const _;
     opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
@@ -428,7 +434,7 @@ impl_lifecycle!(drop_open, get_fd_open, open, no_fd);
 // Timeout
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_timeout(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_timeout(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.timeout };
 
     payload.ts[0] = payload.op.duration.as_secs() as i64;
@@ -445,7 +451,7 @@ impl_lifecycle!(drop_timeout, get_fd_timeout, timeout, no_fd);
 // Wakeup
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.wakeup };
     match payload.op.fd {
         IoFd::Raw(fd) => opcode::Read::new(types::Fd(fd.fd), payload.buf.as_mut_ptr(), 8).build(),
