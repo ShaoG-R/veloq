@@ -1,6 +1,6 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool, RegisteredPool};
+use crate::io::buffer::{AnyBufPool, HybridPool, RegisteredPool};
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::Runtime;
 use std::net::SocketAddr;
@@ -8,13 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
-
-/// Helper function to allocate a buffer from a pool
-fn alloc_buf(size: usize) -> FixedBuf {
-    let pool = crate::runtime::context::current_pool().unwrap();
-    pool.alloc(size)
-        .expect("Failed to allocate buffer from pool")
-}
 
 // ============ Single-Thread TCP Tests (using Runtime/spawn) ============
 
@@ -93,7 +86,7 @@ fn test_tcp_send_recv() {
                     let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
                     loop {
-                        let buf = alloc_buf(size);
+                        let buf = crate::runtime::context::alloc(size);
                         let (result, mut buf) = stream.recv(buf).await;
                         let bytes_read = match result {
                             Ok(n) if n > 0 => n as usize,
@@ -115,7 +108,7 @@ fn test_tcp_send_recv() {
                     .expect("Failed to connect");
 
                 // Prepare data
-                let mut send_buf = alloc_buf(size);
+                let mut send_buf = crate::runtime::context::alloc(size);
                 let test_data = b"Hello, TCP!";
                 send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
                 // Buffer is full length (clamped) by default, containing test_data + zeros
@@ -131,7 +124,7 @@ fn test_tcp_send_recv() {
                 let mut total_received = 0;
 
                 while total_received < bytes_sent {
-                    let recv_buf = alloc_buf(size);
+                    let recv_buf = crate::runtime::context::alloc(size);
                     let (result, recv_buf) = stream.recv(recv_buf).await;
                     let n = result.expect("Client recv failed") as usize;
                     if n == 0 {
@@ -244,7 +237,7 @@ fn test_tcp_large_data_transfer() {
 
                     let mut total_received = 0;
                     while total_received < DATA_SIZE {
-                        let buf = alloc_buf(size);
+                        let buf = crate::runtime::context::alloc(size);
                         // buf.set_len(buf.capacity());
                         let (result, _buf) = stream.recv(buf).await;
                         let bytes = result.expect("Recv failed") as usize;
@@ -271,7 +264,7 @@ fn test_tcp_large_data_transfer() {
                 while total_sent < DATA_SIZE {
                     let chunk_size = std::cmp::min(CHUNK_SIZE, DATA_SIZE - total_sent);
 
-                    let mut buf = alloc_buf(size);
+                    let mut buf = crate::runtime::context::alloc(size);
 
                     for i in 0..chunk_size {
                         buf.spare_capacity_mut()[i] = (i % 256) as u8;
@@ -384,7 +377,7 @@ fn test_tcp_recv_zero_bytes() {
                     .await
                     .expect("Failed to connect");
 
-                let buf = alloc_buf(size);
+                let buf = crate::runtime::context::alloc(size);
                 let (result, _buf) = stream.recv(buf).await;
 
                 if let Ok(bytes) = result {
@@ -559,15 +552,13 @@ fn test_multithread_tcp_echo() {
 
                     // Accept and echo
                     let (stream, _) = Arc::new(listener).accept().await.expect("Accept failed");
-                    let pool = crate::runtime::context::current_pool().unwrap(); // Get thread pool
-
-                    let buf = pool.alloc(size).unwrap();
+                    let buf = crate::runtime::context::alloc(size);
 
                     let (result, buf) = stream.recv(buf).await;
                     let bytes = result.expect("Recv failed") as usize;
 
                     // Echo back
-                    let mut echo_buf = pool.alloc(size).unwrap();
+                    let mut echo_buf = crate::runtime::context::alloc(size);
                     echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
 
                     let (result, _) = stream.send(echo_buf).await;
@@ -585,10 +576,8 @@ fn test_multithread_tcp_echo() {
                         .await
                         .expect("Failed to connect");
 
-                    let pool = crate::runtime::context::current_pool().unwrap();
-
                     // Send data
-                    let mut send_buf = pool.alloc(size).unwrap();
+                    let mut send_buf = crate::runtime::context::alloc(size);
                     let data = b"Hello from worker 1!";
                     send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
 
@@ -596,7 +585,7 @@ fn test_multithread_tcp_echo() {
                     let _sent = result.expect("Send failed");
 
                     // Receive echo
-                    let recv_buf = pool.alloc(size).unwrap();
+                    let recv_buf = crate::runtime::context::alloc(size);
                     let (result, recv_buf) = stream.recv(recv_buf).await;
                     let _received = result.expect("Recv failed") as usize;
 

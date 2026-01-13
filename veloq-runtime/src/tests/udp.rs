@@ -1,6 +1,6 @@
 //! UDP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool, RegisteredPool};
+use crate::io::buffer::{AnyBufPool, HybridPool, RegisteredPool};
 use crate::net::udp::UdpSocket;
 use crate::runtime::Runtime;
 use std::net::SocketAddr;
@@ -8,13 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
-
-/// Helper function to allocate a buffer from a pool
-fn alloc_buf(size: usize) -> FixedBuf {
-    let pool = crate::runtime::context::current_pool().unwrap();
-    pool.alloc(size)
-        .expect("Failed to allocate buffer from pool")
-}
 
 // ============ Single-Thread UDP Tests (using Runtime/spawn) ============
 
@@ -81,7 +74,7 @@ fn test_udp_send_receive() {
 
                 // Receiver task: socket1 waits for data
                 let handler = crate::runtime::context::spawn(async move {
-                    let buf = alloc_buf(size);
+                    let buf = crate::runtime::context::alloc(size);
                     // buf.set_len(buf.capacity());
                     let (result, _buf) = socket1_clone.recv_from(buf).await;
                     let (bytes_read, from_addr) = result.expect("recv_from failed");
@@ -90,7 +83,7 @@ fn test_udp_send_receive() {
                 });
 
                 // Sender: socket2 sends data to socket1
-                let mut send_buf = alloc_buf(size);
+                let mut send_buf = crate::runtime::context::alloc(size);
                 let test_data = b"Hello, UDP!";
                 send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
 
@@ -142,13 +135,13 @@ fn test_udp_echo() {
                 // Server task: receive and echo back
                 let server_h = crate::runtime::context::spawn(async move {
                     // Receive data
-                    let buf = alloc_buf(size);
+                    let buf = crate::runtime::context::alloc(size);
                     let (result, buf) = server_clone.recv_from(buf).await;
                     let (bytes_read, from_addr) = result.expect("Server recv_from failed");
                     println!("Server received {} bytes from {}", bytes_read, from_addr);
 
                     // Echo back
-                    let mut echo_buf = alloc_buf(size);
+                    let mut echo_buf = crate::runtime::context::alloc(size);
                     echo_buf.spare_capacity_mut()[..bytes_read as usize]
                         .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
 
@@ -158,7 +151,7 @@ fn test_udp_echo() {
                 });
 
                 // Client: send data to server
-                let mut send_buf = alloc_buf(size);
+                let mut send_buf = crate::runtime::context::alloc(size);
                 let test_data = b"Echo this message!";
                 send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
 
@@ -167,7 +160,7 @@ fn test_udp_echo() {
                 println!("Client sent {} bytes", bytes_sent);
 
                 // Receive echo response
-                let recv_buf = alloc_buf(size);
+                let recv_buf = crate::runtime::context::alloc(size);
                 let (result, recv_buf) = client_arc.recv_from(recv_buf).await;
                 let (bytes_received, from_addr) = result.expect("Client recv_from failed");
 
@@ -223,7 +216,7 @@ fn test_udp_multiple_messages() {
                 // Receiver task
                 let h_recv = crate::runtime::context::spawn(async move {
                     for i in 0..NUM_MESSAGES {
-                        let buf = alloc_buf(size);
+                        let buf = crate::runtime::context::alloc(size);
                         let (result, _buf) = socket1_clone.recv_from(buf).await;
                         let (bytes, from) = result.expect("recv_from failed");
                         println!("Received message {} ({} bytes) from {}", i, bytes, from);
@@ -233,7 +226,7 @@ fn test_udp_multiple_messages() {
 
                 // Sender
                 for i in 0..NUM_MESSAGES {
-                    let mut buf = alloc_buf(size);
+                    let mut buf = crate::runtime::context::alloc(size);
                     let msg = format!("Message {}", i);
                     buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
 
@@ -284,7 +277,7 @@ fn test_udp_large_data() {
 
                 // Receiver task
                 let h_recv = crate::runtime::context::spawn(async move {
-                    let buf = alloc_buf(size);
+                    let buf = crate::runtime::context::alloc(size);
                     let (result, buf) = socket1_clone.recv_from(buf).await;
                     let (bytes, _from) = result.expect("recv_from failed");
                     println!("Received {} bytes", bytes);
@@ -297,7 +290,7 @@ fn test_udp_large_data() {
                 });
 
                 // Sender
-                let mut buf = alloc_buf(size);
+                let mut buf = crate::runtime::context::alloc(size);
                 for i in 0..DATA_SIZE {
                     buf.spare_capacity_mut()[i] = (i % 256) as u8;
                 }
@@ -396,7 +389,7 @@ fn test_multithread_udp_no_echo() {
 
                         // Receiver task via crate::context::spawn
                         let h_recv = crate::runtime::context::spawn(async move {
-                            let buf = alloc_buf(size);
+                            let buf = crate::runtime::context::alloc(size);
                             let (result, buf) = socket1_clone.recv_from(buf).await;
                             match result {
                                 Ok((_bytes, _from)) => {
@@ -418,7 +411,7 @@ fn test_multithread_udp_no_echo() {
                         });
 
                         // Sender
-                        let mut buf = alloc_buf(size);
+                        let mut buf = crate::runtime::context::alloc(size);
                         let msg = format!("Hello from worker {}", worker_id);
                         buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
 
@@ -486,14 +479,14 @@ fn test_multithread_udp_echo() {
                     // let pool = crate::runtime::context::current_pool().unwrap();
 
                     // Receive and echo
-                    let buf = alloc_buf(size);
+                    let buf = crate::runtime::context::alloc(size);
 
                     let (result, buf) = socket.recv_from(buf).await;
                     let (bytes, from_addr) = result.expect("Server recv_from failed");
                     println!("Server received {} bytes from {}", bytes, from_addr);
 
                     // Echo back
-                    let mut echo_buf = alloc_buf(size);
+                    let mut echo_buf = crate::runtime::context::alloc(size);
                     echo_buf.spare_capacity_mut()[..bytes as usize]
                         .copy_from_slice(&buf.as_slice()[..bytes as usize]);
 
@@ -517,7 +510,7 @@ fn test_multithread_udp_echo() {
                     // let pool = crate::runtime::context::current_pool().unwrap();
 
                     // Send data
-                    let mut send_buf = alloc_buf(size);
+                    let mut send_buf = crate::runtime::context::alloc(size);
                     let data = b"Hello from worker 2!";
                     send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
 
@@ -526,7 +519,7 @@ fn test_multithread_udp_echo() {
                     println!("Client sent {} bytes", sent);
 
                     // Receive echo
-                    let recv_buf = alloc_buf(size);
+                    let recv_buf = crate::runtime::context::alloc(size);
                     let (result, recv_buf) = client.recv_from(recv_buf).await;
                     let (_received, from) = result.expect("Client recv_from failed");
 
@@ -597,7 +590,7 @@ fn test_multithread_concurrent_udp_clients() {
 
                     // Receive messages from all clients
                     for i in 0..NUM_CLIENTS {
-                        let buf = alloc_buf(size);
+                        let buf = crate::runtime::context::alloc(size);
                         let (result, _buf) = socket.recv_from(buf).await;
                         let (bytes, from) = result.expect("Server recv_from failed");
                         println!(
@@ -627,7 +620,7 @@ fn test_multithread_concurrent_udp_clients() {
                             UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
                         // let pool = crate::runtime::context::current_pool().unwrap();
 
-                        let mut buf = alloc_buf(size);
+                        let mut buf = crate::runtime::context::alloc(size);
                         let msg = format!("Hello from client {}", client_id);
                         buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
 
