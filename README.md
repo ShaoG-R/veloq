@@ -32,16 +32,14 @@ Veloq Runtime 基于 `io_uring` 构建高性能异步运行时。由于使用了
 
 | 特性 (Feature) | 机制/标志 | 最低内核版本 | 必须性 |
 | :--- | :--- | :--- | :--- |
-| **Mesh 通信** | `IORING_OP_MSG_RING` | **5.18** | **必须** (多线程模式) |
 | **协作式调度** | `IORING_SETUP_COOP_TASKRUN` | **5.19** | 可选 (性能优化) |
 | **单提交者模式** | `IORING_SETUP_SINGLE_ISSUER` | **6.0** | 可选 (性能优化) |
 | **延迟任务运行** | `IORING_SETUP_DEFER_TASKRUN` | **6.1** | 可选 (性能优化) |
 
 ## 3. 版本建议 (Recommendation)
 
-*   **最低运行版本 (Minimum)**: **Linux 5.18**
-    *   必须支持 `IORING_OP_MSG_RING` 才能正常运行多线程 Mesh运行时。
-    *   如果仅运行在单线程模式且不使用 Mesh 功能，理论上可降级至 5.6。
+*   **最低运行版本 (Minimum)**: **Linux 5.6**
+    *   需要支持 `IORING_OP_SEND` / `IORING_OP_RECV` 等基础网络操作。
 
 *   **推荐生产版本 (Recommended)**: **Linux 6.1+**
     *   为了获得最佳的吞吐量和最低的延迟，建议使用 6.1 或更高版本，以启用 `DEFER_TASKRUN` 等关键优化。

@@ -649,16 +649,6 @@ impl Driver for IocpDriver {
         self.port.into()
     }
 
-    fn notify_mesh(&mut self, handle: crate::io::RawHandle) -> io::Result<()> {
-        let port = handle.handle;
-        let res =
-            unsafe { PostQueuedCompletionStatus(port, 0, WAKEUP_USER_DATA, std::ptr::null_mut()) };
-        if res == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {
         let process = unsafe { GetCurrentProcess() };
         let mut new_handle = INVALID_HANDLE_VALUE;

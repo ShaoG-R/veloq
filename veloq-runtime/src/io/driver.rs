@@ -69,9 +69,6 @@ pub trait Driver: 'static {
     /// The driver takes ownership of resources and ensures cleanup.
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
 
-    /// Notify another driver instance (Mesh Wakeup).
-    fn notify_mesh(&mut self, handle: crate::io::RawHandle) -> io::Result<()>;
-
     /// Wake up the driver from blocking wait.
     fn wake(&mut self) -> io::Result<()>;
 

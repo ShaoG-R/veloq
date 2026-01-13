@@ -693,21 +693,6 @@ impl Driver for UringDriver {
         }
     }
 
-    fn notify_mesh(&mut self, handle: crate::io::RawHandle) -> io::Result<()> {
-        let fd = handle.fd;
-        // Send a MsgRing to the target ring. (Kernel 5.18+)
-        // We set data to BACKGROUND_USER_DATA so the target treats it as a wake-up (and ignores the CQE).
-        // We set our user_data to BACKGROUND_USER_DATA so we also ignore the completion of the MsgRing op itself.
-        let sqe = opcode::MsgRingData::new(io_uring::types::Fd(fd), 0, BACKGROUND_USER_DATA, None)
-            .build()
-            .user_data(BACKGROUND_USER_DATA);
-
-        if !self.push_entry(sqe) {
-            return Err(io::Error::new(io::ErrorKind::Other, "SQ full"));
-        }
-        Ok(())
-    }
-
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
         let new_fd = unsafe { libc::dup(self.waker_fd) };
         if new_fd < 0 {
