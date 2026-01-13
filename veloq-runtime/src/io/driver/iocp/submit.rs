@@ -4,10 +4,11 @@
 //! and accessing FDs, exposed as static functions for VTable construction.
 
 use crate::io::buffer::FixedBuf;
-use crate::io::driver::iocp::blocking::{BlockingTask, CompletionInfo};
+use crate::io::driver::iocp::blocking_ops::{self, CompletionInfo};
 use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::op::{IocpOp, SubmitContext};
 use crate::io::op::IoFd;
+use crate::runtime::blocking::BlockingTask;
 use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -62,7 +63,7 @@ macro_rules! impl_lifecycle {
 }
 
 macro_rules! impl_blocking_offload {
-    ($fn_name:ident, $variant:ident, $task_variant:ident) => {
+    ($fn_name:ident, $variant:ident, $enum_variant:ident) => {
         pub(crate) unsafe fn $fn_name(
             op: &mut IocpOp,
             ctx: &mut SubmitContext,
@@ -79,11 +80,11 @@ macro_rules! impl_blocking_offload {
                 overlapped: ctx.overlapped as usize,
             };
 
-            let task = BlockingTask::$task_variant {
+            let op = blocking_ops::BlockingOps::$enum_variant {
                 handle: handle as usize,
                 completion,
             };
-            Ok(SubmissionResult::Offload(task))
+            Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
         }
     };
 }
@@ -635,13 +636,13 @@ pub(crate) unsafe fn submit_open(
         overlapped: ctx.overlapped as usize,
     };
 
-    let task = BlockingTask::Open {
+    let op = blocking_ops::BlockingOps::Open {
         path_ptr,
         flags: payload.op.flags,
         mode: payload.op.mode,
         completion,
     };
-    Ok(SubmissionResult::Offload(task))
+    Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 
 impl_lifecycle!(drop_open, get_fd_open, open, no_fd);
@@ -687,14 +688,14 @@ pub(crate) unsafe fn submit_fallocate(
         overlapped: ctx.overlapped as usize,
     };
 
-    let task = BlockingTask::Fallocate {
+    let op = blocking_ops::BlockingOps::Fallocate {
         handle: handle as usize,
-        completion,
         mode: payload.mode,
         offset: payload.offset,
         len: payload.len,
+        completion,
     };
-    Ok(SubmissionResult::Offload(task))
+    Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
 

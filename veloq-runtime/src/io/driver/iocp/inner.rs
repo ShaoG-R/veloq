@@ -1,4 +1,3 @@
-use super::blocking::ThreadPool;
 use super::ext::Extensions;
 use super::op::{IocpOp, OverlappedEntry};
 use super::rio::RioState;
@@ -8,7 +7,7 @@ use crate::io::driver::{Injector, RemoteCompleter, RemoteWaker};
 
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, trace};
 
 use windows_sys::Win32::Foundation::{
@@ -68,7 +67,6 @@ pub struct IocpDriver {
     pub(crate) wheel: Wheel<usize>,
     pub(crate) registered_files: Vec<Option<HANDLE>>,
     pub(crate) free_slots: Vec<usize>,
-    pub(crate) pool: ThreadPool,
     pub(crate) injector: Arc<IocpInjector>,
 
     // RIO Support (Decoupled)
@@ -151,7 +149,6 @@ impl IocpDriver {
             wheel: Wheel::new(WheelConfig::default()),
             registered_files: Vec::new(),
             free_slots: Vec::new(),
-            pool: ThreadPool::new(16, 128, 1024, Duration::from_secs(30)),
             injector: Arc::new(IocpInjector { port }),
             rio_state,
         })

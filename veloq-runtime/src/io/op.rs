@@ -19,6 +19,11 @@ use crate::io::driver::{Driver, PlatformDriver};
 use crate::io::socket::SockAddrStorage;
 use crate::io::{RawHandle, buffer::FixedBuf};
 
+#[cfg(target_os = "windows")]
+pub type SysBlockingOps = crate::io::driver::iocp::blocking_ops::BlockingOps;
+#[cfg(target_os = "linux")]
+pub type SysBlockingOps = ();
+
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoFd {

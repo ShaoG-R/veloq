@@ -1,4 +1,4 @@
-mod blocking;
+pub mod blocking_ops;
 mod ext;
 mod inner;
 pub mod op;
@@ -91,7 +91,8 @@ impl Driver for IocpDriver {
                     };
                 }
                 Ok(SubmissionResult::Offload(task)) => {
-                    if self.pool.execute(task).is_err() {
+                    use crate::runtime::blocking::get_blocking_pool;
+                    if get_blocking_pool().execute(task).is_err() {
                         op_entry.result = Some(Err(io::Error::other("Thread pool overloaded")));
                         if let Some(waker) = op_entry.waker.take() {
                             waker.wake();
@@ -160,7 +161,8 @@ impl Driver for IocpDriver {
 
             match result {
                 Ok(SubmissionResult::Offload(task)) => {
-                    if self.pool.execute(task).is_err() {
+                    use crate::runtime::blocking::get_blocking_pool;
+                    if get_blocking_pool().execute(task).is_err() {
                         // Failed to submit background task
                         self.ops.remove(user_data);
                         return Err(io::Error::other("Thread pool overloaded"));
