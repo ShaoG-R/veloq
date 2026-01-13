@@ -39,18 +39,25 @@ src/
 ## 4. 代码详细分析 (Detailed Analysis)
 
 ### 4.1 `OpenOptions::open`
-这是文件打开的入口。
-1.  **Buffer 获取**: 打开文件时，如果是 Windows 平台或需要将路径传给内核，需要分配内存。这里使用了当前线程绑定的 `BufPool`。
+这是文件打开的入口，采用了 **Remote IO** 架构以支持跨线程操作。
+
+1.  **Buffer 获取**: 打开文件时，需要分配内存存储路径。这里使用了当前线程绑定的 `BufPool`。
 2.  **Op 构建**: 调用 `build_op`，根据 `BufferingMode` 设置标志位。
-    *   *Windows 特殊处理*: 利用位掩码 (`FAKE_NO_BUFFERING`) 将 Direct I/O 标志传递给底层的阻塞线程池或原生 API。
-3.  **驱动绑定**: 文件句柄创建后，会捕获当前上下文的 `Driver`，用于后续的 I/O 操作提交。
+3.  **Remote Submission**: 
+    *   使用 `RemoteSubmitter` 提交 `Open` 操作。
+    *   操作会被注入（Inject）到当前 Runtime 线程的 Driver 中执行。
+    *   **关键点**: 返回的 `File` 对象会持有指向该 Driver 的 `Injector`。这意味着该文件后续的所有 I/O 操作都会被“路由”回最初打开它的那个 Driver（线程）上执行。这保证了文件句柄（特别是 Windows Handle 或 io_uring 注册资源）的线程安全性。
 
-### 4.2 `File` 的异步读写
-`File` 实现了 `AsyncBufRead` 和 `AsyncBufWrite`，这意味着它可以无缝集成到 `veloq` 的异步生态中。
-此外，它提供了原子偏移量的 I/O：
-*   **`read_at` / `write_at`**: 这对实现数据库至关重要，允许并发地读写文件的不同部分而无需修改文件指针 (`seek`)。底层对应 `pread` / `pwrite` (or equivalent)。
+### 4.2 `File` 的异步读写与跨线程安全
+`File` 结构体持有 `RemoteSubmitter`，因此它是 `Send` 的，可以在线程间传递。
 
-### 4.3 `SyncRangeBuilder`
+*   **路由机制**: 当在一个新的线程上调用 `file.read_at(...)` 时，操作并不是在当前线程执行，而是通过 `RemoteSubmitter` 发送回该文件绑定的源 Driver 执行。
+
+### 4.3 `File` 接口
+`File` 实现了原子偏移量的 I/O：
+*   **`read_at` / `write_at`**: 这对实现数据库至关重要，允许并发地读写文件的不同部分而无需修改文件指针 (`seek`)。底层对应 `pread` / `pwrite`。
+
+### 4.4 `SyncRangeBuilder`
 提供了细粒度的刷盘控制：
 ```rust
 file.sync_range(0, 1024)
