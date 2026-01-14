@@ -511,11 +511,27 @@ impl OpLifecycle for Accept {
     type Output = (RawHandle, std::net::SocketAddr);
 
     #[cfg(windows)]
-    fn pre_alloc(_fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
+    fn pre_alloc(fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
         // On Windows, we need to pre-create a socket for AcceptEx
         use crate::io::socket::Socket;
+
+        // Determine the address family of the listener to create a matching accept socket.
+        // We temporarily wrap the raw handle to use helper methods.
+        let listener = unsafe { Socket::from_raw(fd.handle) };
+        let addr_res = listener.local_addr();
+        // IMPORTANT: Release ownership back to raw handle so the listener isn't closed when dropped
+        let _ = listener.into_raw();
+
+        let addr = addr_res?;
+
+        let socket = if addr.is_ipv4() {
+            Socket::new_tcp_v4()?
+        } else {
+            Socket::new_tcp_v6()?
+        };
+
         Ok(RawHandle {
-            handle: Socket::new_tcp_v4()?.into_raw(),
+            handle: socket.into_raw(),
         })
     }
 
